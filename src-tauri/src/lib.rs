@@ -82,6 +82,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::edit::edit_snap,
             commands::edit::edit_eq_curve,
             commands::edit::edit_measure,
+            commands::edit::edit_spec_average,
             commands::edit::edit_formats,
             commands::edit::edit_close,
             commands::edit::edit_cancel_open,

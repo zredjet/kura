@@ -220,10 +220,22 @@ impl SpecParams {
 
     /// チャンク [c0, c1) のタイルを作るのに要る標本の区間（長さ `len` の内。前後に長い窓の半分 2N）。
     pub fn needed_span(&self, c0: u64, c1: u64, len: u64) -> (u64, u64) {
-        let c = AUDIO_CHUNK as u64;
+        let per = self.frames_per_chunk();
+        self.frames_span(c0.saturating_mul(per), c1.saturating_mul(per), len)
+    }
+
+    /// フレーム [j0, j1) の帯の値（[`Self::frame_bands`]）に要る標本の区間（長さ `len` の内）：長い窓をとる 4 の倍数の
+    /// フレーム ⌊j0/4⌋·4 〜 ⌈j1/4⌉·4 の中心の前後 2N。
+    pub fn frames_span(&self, j0: u64, j1: u64, len: u64) -> (u64, u64) {
+        let (hop, l) = (self.hop as u64, LONG as u64);
         let half = (self.n * LONG / 2) as u64;
-        let a = (c0 * c).saturating_sub(half);
-        let b = c1.saturating_mul(c).saturating_add(half).min(len);
+        let a = (j0 / l * l).saturating_mul(hop).saturating_sub(half);
+        let b = j1
+            .div_ceil(l)
+            .saturating_mul(l)
+            .saturating_mul(hop)
+            .saturating_add(half)
+            .min(len);
         (a.min(len), b)
     }
 
@@ -321,7 +333,7 @@ impl SpecParams {
         }
     }
 
-    /// フレーム [j0, j1) の帯の値（P。フレーム × 帯）を求める。`input` は [j0·hop − 2N, j1·hop + 2N)（長さの内）を持つこと。
+    /// フレーム [j0, j1) の帯の値（P。フレーム × 帯）を求める。`input` は [`Self::frames_span`] の区間を持つこと。
     /// 長い窓は 4 の倍数のフレーム（j1 の次の 4 の倍数まで）でとり、間を直線で補う。フレームは `par_blocks` で並べる。
     pub fn frame_bands(
         &self,
@@ -716,6 +728,31 @@ mod tests {
             assert_eq!(all[1].sum[k].to_bits(), s.to_bits(), "帯 {k}");
             assert_eq!(all[1].max[k].to_bits(), m.to_bits(), "帯 {k}");
             assert_eq!(all[1].data[k], quantize(rows[0][k]));
+        }
+        // 4 の倍数でないフレームの区間も、frames_span の区間だけで同じ値（長い窓の補いが区切りによらない）
+        for (j0, j1) in [
+            (3u64, 9u64),
+            (65, 66),
+            (130, 199),
+            (190, p.frames(len as u64)),
+        ] {
+            let (a, b) = p.frames_span(j0, j1, len as u64);
+            let part: Vec<Vec<f32>> = full
+                .iter()
+                .map(|ch| ch[a as usize..b as usize].to_vec())
+                .collect();
+            let input = SpecInput {
+                start: a,
+                len: len as u64,
+                planes: &part,
+            };
+            let some = p
+                .frame_bands(&input, SpecChannel::Sum, j0, j1, &NoMonitor)
+                .unwrap();
+            let want = p
+                .frame_bands(&whole, SpecChannel::Sum, j0, j1, &NoMonitor)
+                .unwrap();
+            assert_eq!(some, want, "{j0}..{j1}");
         }
     }
 

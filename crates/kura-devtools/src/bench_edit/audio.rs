@@ -158,6 +158,7 @@ pub(crate) fn viewport(frames: u64, work: bool) -> AudioViewport {
         interacting: false,
         focus: None,
         work,
+        spec: Vec::new(),
     }
 }
 

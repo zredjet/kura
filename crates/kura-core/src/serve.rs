@@ -103,6 +103,14 @@ pub enum Route {
         bin: u32,
         tile: u32,
     },
+    /// 音声のエディタのスペクトルのタイル（M17 段 4）：ポートの鍵（32 字の 16 進）・チャンネル（`0` から・`m`・`s`・`sum`）・
+    /// チャンク。(セッション, 鍵, チャンネル, チャンク) の中身は変わらない。
+    EditSpec {
+        session: String,
+        key: String,
+        channel: String,
+        chunk: u64,
+    },
 }
 
 /// 中身が変わらないものの `Cache-Control`。
@@ -121,6 +129,7 @@ impl Route {
                 | Self::Wave { .. }
                 | Self::Edit { .. }
                 | Self::EditPeaks { .. }
+                | Self::EditSpec { .. }
         )
     }
 
@@ -133,7 +142,8 @@ impl Route {
             | Self::Anim { .. }
             | Self::Wave { .. }
             | Self::Edit { .. }
-            | Self::EditPeaks { .. } => Some(IMMUTABLE),
+            | Self::EditPeaks { .. }
+            | Self::EditSpec { .. } => Some(IMMUTABLE),
             Self::Pcm { .. } | Self::EditPcm { .. } | Self::EditInputPcm { .. } => Some("no-store"),
             Self::File { .. } | Self::Play { .. } => None,
         }
@@ -184,6 +194,22 @@ pub fn parse_route(path: &str) -> Option<Route> {
 fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
     let session = parts.next().filter(|s| is_session_id(s))?.to_string();
     let second = parts.next()?;
+    if second == "spec" {
+        let key = parts.next()?;
+        crate::edit::editor::audio::spec::parse_key_hex(key)?;
+        let channel = parts.next()?;
+        crate::edit::editor::audio::spec::parse_chan_token(channel)?;
+        let chunk = parse_decimal(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(Route::EditSpec {
+            session,
+            key: key.to_string(),
+            channel: channel.to_string(),
+            chunk,
+        });
+    }
     if second == "input" {
         let (start, end) = match (parts.next()?, parts.next()?, parts.next()) {
             ("pcm", span, None) => parse_span(span)?,
@@ -291,7 +317,8 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         | Route::Edit { .. }
         | Route::EditPcm { .. }
         | Route::EditInputPcm { .. }
-        | Route::EditPeaks { .. } => {
+        | Route::EditPeaks { .. }
+        | Route::EditSpec { .. } => {
             return None;
         }
         Route::Play { hash } => {
@@ -646,6 +673,34 @@ mod tests {
             "/edit/3fa9c0de/input/peaks/256/0",
         ] {
             assert_eq!(parse_route(bad), None, "{bad}");
+        }
+        // スペクトルのタイル（M17 段 4）：鍵は小文字の 16 進 32 字、チャンネルは番号・m・s・sum
+        let key = "0123456789abcdef0123456789abcdef";
+        for (ch, chunk) in [("0", 0), ("17", 3), ("m", 12), ("s", 1), ("sum", 99)] {
+            let route = parse_route(&format!("/edit/3fa9c0de/spec/{key}/{ch}/{chunk}")).unwrap();
+            assert_eq!(
+                route,
+                Route::EditSpec {
+                    session: "3fa9c0de".into(),
+                    key: key.into(),
+                    channel: ch.into(),
+                    chunk,
+                }
+            );
+            assert!(route.immutable());
+            assert_eq!(resolve(&Layout::new(Path::new("/x")), &route), None);
+        }
+        for bad in [
+            format!("/edit/3fa9c0de/spec/{key}/0"),
+            format!("/edit/3fa9c0de/spec/{key}/0/1/2"),
+            format!("/edit/3fa9c0de/spec/{key}/01/1"),
+            format!("/edit/3fa9c0de/spec/{key}/M/1"),
+            format!("/edit/3fa9c0de/spec/{key}/sum/-1"),
+            format!("/edit/3fa9c0de/spec/{}/0/1", key.to_uppercase()),
+            format!("/edit/3fa9c0de/spec/{}/0/1", &key[..30]),
+            format!("/edit/3fa9c0de/7/spec/{key}/0/1"),
+        ] {
+            assert_eq!(parse_route(&bad), None, "{bad}");
         }
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::new(dir.path());

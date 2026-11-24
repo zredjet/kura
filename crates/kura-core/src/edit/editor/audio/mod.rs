@@ -39,6 +39,10 @@ pub(crate) mod solve;
 #[cfg(test)]
 mod solve_tests;
 pub(crate) mod source;
+pub mod spec;
+pub mod spec_average;
+#[cfg(test)]
+mod spec_tests;
 pub mod timeline;
 #[cfg(test)]
 mod work_tests;
@@ -128,6 +132,10 @@ pub struct AudioViewInfo {
     /// 流し解きの進み（0〜1）。頭の文書の流し解きを裏で進めていて、この表示は最後に公開した rev（`rev`）の計画で描いた
     /// もの（頭より古い）。解き終えると新しい rev の表示になる（M17 段 3。docs/editing.md §18.3）。
     pub solving: Option<f64>,
+    /// 頼んだスペクトルのポートの状態（M17 段 4。`/edit/{s}/spec/{key}/{ch}/{chunk}` で取る）。
+    pub spec: Vec<spec::SpecPortInfo>,
+    /// 最後に頼んだスペクトルの区間の平均の状態（`edit_spec_average`。値は載せない）。
+    pub spec_average: Vec<spec_average::SpecAverageStatus>,
 }
 
 /// 開いている音声のエディタの状態（`State::audio`）。
@@ -148,6 +156,8 @@ pub(crate) struct AudioState {
     pub(crate) stale: bool,
     /// 誤りが続いて捨てた流し解きの要る鍵の列（その間は錠の中で解く道で描いて誤りを知らせる）。
     pub(crate) solve_failed: Option<Vec<kura_engine::render::cache::Fingerprint>>,
+    /// スペクトルのタイルの仕事（M17 段 4）。
+    pub(crate) spec: spec::SpecJob,
     /// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数で区切る（`slice::Limit::Chunks`）。
     #[cfg(test)]
     pub(crate) script: Option<u64>,
@@ -393,12 +403,13 @@ impl Editor {
                 fps.outputs
                     .iter()
                     .find(|(o, _)| *o == st.output)
-                    .map(|(_, fp)| samples_id(fp))
+                    .map(|(_, fp)| (samples_id(fp), *fp))
                     .ok_or_else(|| EditorError::Failed("出力の指紋がありません".into()))
             }) {
             Ok(id) => id,
             Err(e) => return failed(e),
         };
+        let (id, out_fp) = id;
         let rev = st.session.rev().0;
         let value = vr.view.value().clone();
         let meta = value.audio_meta().cloned().unwrap_or_default();
@@ -408,6 +419,27 @@ impl Editor {
         // 公開した計画の申告した解析の結果を握る（次に重い手が来たら、この計画で描き続ける。M17 段 3）
         self.drop_solve(st);
         self.hold_published(st, rev, &id);
+        // スペクトル（M17 段 4）：出力の鍵の移りを覚え、頼まれたタイルを作る（流し解きのあと、波形の段の前）
+        if let Some(a) = st.audio.as_mut() {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&out_fp.0.0[..16]);
+            a.spec.note_output(key, (rate, channels, frames), &changed);
+        }
+        let spec = self.advance_spec(
+            st,
+            &plan,
+            &value,
+            &avp,
+            limit.as_mut(),
+            &mut progress,
+            ticket,
+        );
+        // 区間の平均の予約（タイルのあと。操作中は進めない）
+        if let Some(l) = limit.as_mut().filter(|_| !avp.interacting) {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&out_fp.0.0[..16]);
+            self.advance_spec_average(st, &plan, key, l, &mut progress, ticket);
+        }
         let settled = !avp.interacting && !st.session.is_provisional();
         if let Some(a) = st.audio.as_mut() {
             a.peaks.note(rev, (rate, channels, frames), &changed);
@@ -439,7 +471,10 @@ impl Editor {
         let (peaks, work, loudness) = match st.audio.as_mut() {
             Some(a) => {
                 let info = a.peaks.report();
-                let work = info.pending || a.measure.running(&id);
+                let work = info.pending
+                    || a.measure.running(&id)
+                    || spec.iter().any(|s| s.pending)
+                    || a.spec.average.running();
                 (info, work, a.measure.state(&id))
             }
             None => return failed(EditorError::Failed("音声の状態がありません".into())),
@@ -479,6 +514,12 @@ impl Editor {
             drawn_nodes: vr.drawn_nodes(),
             ms: started.elapsed().as_secs_f64() * 1000.0,
             solving: None,
+            spec,
+            spec_average: st
+                .audio
+                .as_ref()
+                .map(|a| a.spec.average.statuses())
+                .unwrap_or_default(),
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
@@ -557,6 +598,16 @@ impl Editor {
         let changed = ChangedSpans::of(&vr.changed);
         self.publish_audio(rev, vr.view.clone(), id.clone());
         st.view = Some(vr.view.clone());
+        // スペクトル（握る計画で。手・表示の頼みの分だけ）
+        let spec = self.advance_spec(
+            st,
+            &plan,
+            &value,
+            avp,
+            None,
+            &mut slice::WorkProgress::default(),
+            ticket,
+        );
         let solving = st
             .audio
             .as_ref()
@@ -606,6 +657,12 @@ impl Editor {
             drawn_nodes: vr.drawn_nodes(),
             ms: started.elapsed().as_secs_f64() * 1000.0,
             solving: Some(solving),
+            spec,
+            spec_average: st
+                .audio
+                .as_ref()
+                .map(|a| a.spec.average.statuses())
+                .unwrap_or_default(),
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
@@ -655,9 +712,13 @@ impl Editor {
                 .flatten()
                 .map(|(_, p)| peak_bytes(p))
                 .fold(0u64, u64::saturating_add);
-            views.saturating_add(peaks)
+            // スペクトルのタイルの置き場（M17 段 4）
+            views.saturating_add(peaks).saturating_add(p.spec.bytes())
         };
-        let run = st.audio.as_ref().map_or(0, |a| a.peaks.run_bytes());
+        // 波形の段の作りかけと、スペクトルのチャンクの要約（M17 段 4）
+        let run = st.audio.as_ref().map_or(0, |a| {
+            a.peaks.run_bytes().saturating_add(a.spec.summaries.bytes())
+        });
         // 流し解きの作りかけ（進めている仕事の結果の見積もり）と、解けた結果のうちキャッシュにないもの（仕事だけが持つ。
         // キャッシュにあるものはキャッシュが数える）
         let solving = st

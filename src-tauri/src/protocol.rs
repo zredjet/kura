@@ -174,6 +174,33 @@ fn answer(
         let body = edit_audio::serve_pcm(engine, session, *rev, *start, *end);
         return pcm_body_response(body, route.cache_control(), head);
     }
+    if let Route::EditSpec {
+        session,
+        key,
+        channel,
+        chunk,
+    } = &route
+    {
+        let Some(engine) = served.engine else {
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        return match kura_core::edit::editor::audio::spec::serve_spec(
+            engine, session, key, channel, *chunk,
+        ) {
+            Ok(body) => bytes_response(
+                body.as_ref().clone(),
+                "application/octet-stream",
+                route.cache_control(),
+                head,
+            ),
+            Err(err) => {
+                tracing::debug!(%err, "kura:// のエディタのスペクトルのタイルを返せません");
+                empty(
+                    StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                )
+            }
+        };
+    }
     if let Route::EditPeaks {
         session,
         rev,

@@ -82,6 +82,82 @@ pub struct EditAudioViewportDto {
     pub focus: Option<u32>,
     /// 裏の仕事（波形の段の作り直し・ラウドネスの計り）を少し進める。
     pub work: bool,
+    /// スペクトルの頼み（2 つまで：前と後。M17 段 4。省けば頼まない）。
+    #[serde(default)]
+    pub spec: Vec<EditSpecRequestDto>,
+}
+
+/// スペクトルのチャンネル（M17 段 4）：番号（0 から）・M・S・和（各チャンネルのパワーの和）。中身のない変種も `{}` の形に
+/// する（内部のタグの単位の変種は知らない項目を拒まない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum EditSpecChannelDto {
+    Index { index: u16 },
+    Mid {},
+    Side {},
+    Sum {},
+}
+
+impl From<EditSpecChannelDto> for kura_engine::audio::spec::SpecChannel {
+    fn from(c: EditSpecChannelDto) -> Self {
+        match c {
+            EditSpecChannelDto::Index { index } => Self::Index(index),
+            EditSpecChannelDto::Mid {} => Self::Mid,
+            EditSpecChannelDto::Side {} => Self::Side,
+            EditSpecChannelDto::Sum {} => Self::Sum,
+        }
+    }
+}
+
+impl From<kura_engine::audio::spec::SpecChannel> for EditSpecChannelDto {
+    fn from(c: kura_engine::audio::spec::SpecChannel) -> Self {
+        use kura_engine::audio::spec::SpecChannel;
+        match c {
+            SpecChannel::Index(index) => Self::Index { index },
+            SpecChannel::Mid => Self::Mid {},
+            SpecChannel::Side => Self::Side {},
+            SpecChannel::Sum => Self::Sum {},
+        }
+    }
+}
+
+/// スペクトルのポートの向き（ノードの入力＝前・出力＝後）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum EditSpecSideDto {
+    Input,
+    Output,
+}
+
+impl From<EditSpecSideDto> for kura_core::edit::editor::audio::spec::SpecSide {
+    fn from(s: EditSpecSideDto) -> Self {
+        match s {
+            EditSpecSideDto::Input => Self::Input,
+            EditSpecSideDto::Output => Self::Output,
+        }
+    }
+}
+
+impl From<kura_core::edit::editor::audio::spec::SpecSide> for EditSpecSideDto {
+    fn from(s: kura_core::edit::editor::audio::spec::SpecSide) -> Self {
+        use kura_core::edit::editor::audio::spec::SpecSide;
+        match s {
+            SpecSide::Input => Self::Input,
+            SpecSide::Output => Self::Output,
+        }
+    }
+}
+
+/// スペクトルの頼み 1 つ（M17 段 4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditSpecRequestDto {
+    /// ノード（null は文書の出力。今は出力だけ）。
+    pub node: Option<u32>,
+    pub side: EditSpecSideDto,
+    pub channel: EditSpecChannelDto,
+    /// 出力のフレームの区間（先のものほど先に作る）。
+    pub spans: Vec<EditSpanDto>,
 }
 
 /// 画像の表示の要求。
@@ -116,6 +192,16 @@ impl From<EditViewportDto> for Viewport {
                 interacting: v.interacting,
                 focus: v.focus.map(NodeId),
                 work: v.work,
+                spec: v
+                    .spec
+                    .into_iter()
+                    .map(|r| kura_core::edit::editor::audio::spec::SpecRequest {
+                        node: r.node.map(NodeId),
+                        side: r.side.into(),
+                        channel: r.channel.into(),
+                        spans: r.spans.into_iter().map(|s| (s.start, s.end)).collect(),
+                    })
+                    .collect(),
             }),
         }
     }
@@ -703,6 +789,169 @@ pub struct EditAudioViewDto {
     /// 公開した rev の計画で描いた頭より古いもの。フロントは古い表示として当て（手元の値・枠を戻さない）、`work: true` を
     /// 頼み続ける（ドラッグ中も手が止まったら）。解き終えると新しい rev の表示になる。
     pub solving: Option<f64>,
+    /// 頼んだスペクトルのポートの状態（M17 段 4。`/edit/{session}/spec/{key}/{channel}/{chunk}` でタイルを取る）。
+    pub spec: Vec<EditSpecPortDto>,
+    /// 最後に頼んだスペクトルの区間の平均（向きごとに 1 つ）の状態（値は載せない。`ready` になったら `edit_spec_average` を
+    /// 頼み直すと覚えた値が返る。`idle` は出力が変わって予約を捨てたので、頼み直す）。
+    pub spec_average: Vec<EditSpecAverageStatusDto>,
+}
+
+/// スペクトルの区間の平均の頼み（M17 段 4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditSpecAverageRequestDto {
+    /// ノード（null は文書の出力。今は出力だけ）。
+    pub node: Option<u32>,
+    pub side: EditSpecSideDto,
+    pub channel: EditSpecChannelDto,
+    /// 出力のフレームの区間（中心がこの中に入るフレームを数える）。
+    pub start: u64,
+    pub end: u64,
+}
+
+impl From<EditSpecAverageRequestDto>
+    for kura_core::edit::editor::audio::spec_average::SpecAverageRequest
+{
+    fn from(r: EditSpecAverageRequestDto) -> Self {
+        Self {
+            node: r.node.map(NodeId),
+            side: r.side.into(),
+            channel: r.channel.into(),
+            start: r.start,
+            end: r.end,
+        }
+    }
+}
+
+impl From<kura_core::edit::editor::audio::spec_average::SpecAverageRequest>
+    for EditSpecAverageRequestDto
+{
+    fn from(r: kura_core::edit::editor::audio::spec_average::SpecAverageRequest) -> Self {
+        Self {
+            node: r.node.map(|n| n.0),
+            side: r.side.into(),
+            channel: r.channel.into(),
+            start: r.start,
+            end: r.end,
+        }
+    }
+}
+
+/// スペクトルの区間の平均の状態（M17 段 4）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EditSpecAverageDto {
+    /// 予約した（裏の仕事で求める。フロントは `work: true` を頼み続ける）。
+    Measuring {
+        progress: f64,
+    },
+    /// 帯ごとの平均（パワーの領域）と最大（dB。−120 で止める）。`frames` が 0 なら空。
+    Ready {
+        frames: u64,
+        mean: Vec<f32>,
+        max: Vec<f32>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl From<kura_core::edit::editor::audio::spec_average::SpecAverageState> for EditSpecAverageDto {
+    fn from(s: kura_core::edit::editor::audio::spec_average::SpecAverageState) -> Self {
+        use kura_core::edit::editor::audio::spec_average::SpecAverageState;
+        match s {
+            SpecAverageState::Measuring { progress } => Self::Measuring { progress },
+            SpecAverageState::Ready(v) => Self::Ready {
+                frames: v.frames,
+                mean: v.mean,
+                max: v.max,
+            },
+            SpecAverageState::Failed { message } => Self::Failed { message },
+        }
+    }
+}
+
+/// 表示の情報に載せるスペクトルの区間の平均の状態（値は載せない）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EditSpecAveragePhaseDto {
+    Idle,
+    Measuring { progress: f64 },
+    Ready,
+    Failed { message: String },
+}
+
+/// 最後に頼んだ区間の状態。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSpecAverageStatusDto {
+    pub request: EditSpecAverageRequestDto,
+    /// 求めているポートの鍵（スペクトルのポートの `key` と同じ）。
+    pub key: String,
+    pub phase: EditSpecAveragePhaseDto,
+}
+
+impl From<kura_core::edit::editor::audio::spec_average::SpecAverageStatus>
+    for EditSpecAverageStatusDto
+{
+    fn from(s: kura_core::edit::editor::audio::spec_average::SpecAverageStatus) -> Self {
+        use kura_core::edit::editor::audio::spec_average::SpecAveragePhase;
+        Self {
+            request: s.request.into(),
+            key: s.key,
+            phase: match s.phase {
+                SpecAveragePhase::Idle => EditSpecAveragePhaseDto::Idle,
+                SpecAveragePhase::Measuring { progress } => {
+                    EditSpecAveragePhaseDto::Measuring { progress }
+                }
+                SpecAveragePhase::Ready => EditSpecAveragePhaseDto::Ready,
+                SpecAveragePhase::Failed { message } => EditSpecAveragePhaseDto::Failed { message },
+            },
+        }
+    }
+}
+
+/// スペクトルのポート 1 つの状態（M17 段 4）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSpecPortDto {
+    pub node: Option<u32>,
+    pub side: EditSpecSideDto,
+    pub channel: EditSpecChannelDto,
+    /// ポートの鍵（32 字の 16 進。URL に入れる）。
+    pub key: String,
+    /// ポートのレート・長さ（フレーム）。
+    pub rate: u32,
+    pub frames: u64,
+    /// 式 `kura-spec/1` の窓の大きさ・hop・帯の数。
+    pub n: u32,
+    pub hop: u32,
+    pub bands: u32,
+    /// 出力のフレーム → ポートのフレームの写しの区分（`in` がポート）。
+    pub map: Vec<EditSourcePieceDto>,
+    /// 置き場にあるチャンクの番号の区間（半開）。
+    pub ready: Vec<EditSpanDto>,
+    /// まだ作っていないチャンクがある（フロントは `work: true` を頼む）。
+    pub pending: bool,
+}
+
+impl From<kura_core::edit::editor::audio::spec::SpecPortInfo> for EditSpecPortDto {
+    fn from(p: kura_core::edit::editor::audio::spec::SpecPortInfo) -> Self {
+        Self {
+            node: p.node.map(|n| n.0),
+            side: p.side.into(),
+            channel: p.channel.into(),
+            key: p.key,
+            rate: p.rate,
+            frames: p.frames,
+            n: p.n,
+            hop: p.hop,
+            bands: p.bands,
+            map: p.map.into_iter().map(Into::into).collect(),
+            ready: p.ready.into_iter().map(span).collect(),
+            pending: p.pending,
+        }
+    }
 }
 
 impl From<AudioViewInfo> for EditAudioViewDto {
@@ -734,6 +983,8 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             drawn_nodes: v.drawn_nodes,
             ms: v.ms,
             solving: v.solving,
+            spec: v.spec.into_iter().map(Into::into).collect(),
+            spec_average: v.spec_average.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1293,6 +1544,24 @@ pub async fn edit_measure(
     .await
 }
 
+/// 音声のエディタ：今の rev の出力の区間のスペクトルの帯ごとの平均と最大（M17 段 4。`kura-spec/1`）。求めるチャンクが少なければ
+/// その場で `ready` を返し、多ければ予約して `measuring` を返す（`edit_view { work: true }` の裏の仕事で求める。表示の情報の
+/// `specAverage` が `ready` になったら頼み直す）。描いている途中の表示を止めない。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_spec_average(
+    state: State<'_, AppState>,
+    session: String,
+    request: EditSpecAverageRequestDto,
+) -> Result<EditSpecAverageDto, AppError> {
+    let lib = state.session()?;
+    blocking(move || {
+        let env = EditorEnv::of(&lib)?;
+        Ok(editor::audio::spec_average::spec_average(&env, &session, &request.into())?.into())
+    })
+    .await
+}
+
 /// ゼロ交差に寄せた位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 pub struct EditSnapDto {
@@ -1612,6 +1881,12 @@ pub async fn edit_draft_discard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kura_core::edit::editor::audio::spec::{SpecPortInfo, SpecRequest, SpecSide};
+    use kura_core::edit::editor::audio::spec_average::{
+        SpecAveragePhase, SpecAverageRequest, SpecAverageState, SpecAverageStatus,
+        SpecAverageValues,
+    };
+    use kura_engine::audio::spec::SpecChannel;
     use serde_json::json;
 
     /// フロントが送る手の JSON を読める（手は kura-engine の `Edit`。種は文字列）。知らない種類・項目は断る。
@@ -1714,7 +1989,80 @@ mod tests {
                 interacting: false,
                 focus: None,
                 work: true,
+                spec: Vec::new(),
             })
+        );
+        // スペクトルの頼み（M17 段 4）
+        let vp: EditViewportDto = serde_json::from_value(json!({
+            "type": "audio", "visible": null, "spans": [], "interacting": false, "focus": null, "work": false,
+            "spec": [
+                { "node": null, "side": "output", "channel": { "type": "sum" }, "spans": [{ "start": 5, "end": 9 }] },
+                { "node": 3, "side": "input", "channel": { "type": "index", "index": 1 }, "spans": [] }
+            ]
+        }))
+        .unwrap();
+        let Viewport::Audio(a) = Viewport::from(vp) else {
+            panic!("音声の頼みではありません");
+        };
+        assert_eq!(
+            a.spec,
+            vec![
+                SpecRequest {
+                    node: None,
+                    side: SpecSide::Output,
+                    channel: SpecChannel::Sum,
+                    spans: vec![(5, 9)],
+                },
+                SpecRequest {
+                    node: Some(NodeId(3)),
+                    side: SpecSide::Input,
+                    channel: SpecChannel::Index(1),
+                    spans: Vec::new(),
+                },
+            ]
+        );
+        for bad in [
+            json!({ "node": null, "side": "output", "channel": { "type": "index" }, "spans": [] }),
+            json!({ "node": null, "side": "after", "channel": { "type": "sum" }, "spans": [] }),
+            json!({ "node": null, "side": "output", "channel": { "type": "sum", "x": 1 }, "spans": [] }),
+            json!({ "node": null, "side": "output", "channel": { "type": "sum" }, "spans": [], "x": 1 }),
+        ] {
+            assert!(
+                serde_json::from_value::<EditSpecRequestDto>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        let avg: EditSpecAverageRequestDto = serde_json::from_value(json!({
+            "node": null, "side": "output", "channel": { "type": "mid" }, "start": 10, "end": 20
+        }))
+        .unwrap();
+        assert_eq!(
+            SpecAverageRequest::from(avg),
+            SpecAverageRequest {
+                node: None,
+                side: SpecSide::Output,
+                channel: SpecChannel::Mid,
+                start: 10,
+                end: 20,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(EditSpecAverageDto::from(SpecAverageState::Ready(
+                SpecAverageValues {
+                    frames: 3,
+                    mean: vec![-6.5],
+                    max: vec![-1.0],
+                }
+            )))
+            .unwrap(),
+            json!({ "type": "ready", "frames": 3, "mean": [-6.5], "max": [-1.0] })
+        );
+        assert_eq!(
+            serde_json::to_value(EditSpecAverageDto::from(SpecAverageState::Measuring {
+                progress: 0.5
+            }))
+            .unwrap(),
+            json!({ "type": "measuring", "progress": 0.5 })
         );
         for bad in [
             json!({ "frame": 0, "rect": null, "scale": 1.0, "interacting": false, "focus": null }),
@@ -1899,12 +2247,50 @@ mod tests {
                 drawn_nodes: 1,
                 ms: 2.0,
                 solving: Some(0.25),
+                spec: vec![SpecPortInfo {
+                    node: None,
+                    side: SpecSide::Output,
+                    channel: SpecChannel::Side,
+                    key: "00112233445566778899aabbccddeeff".into(),
+                    rate: 48_000,
+                    frames: 96_000,
+                    n: 4096,
+                    hop: 1024,
+                    bands: 491,
+                    map: Vec::new(),
+                    ready: vec![(0, 2)],
+                    pending: false,
+                }],
+                spec_average: vec![SpecAverageStatus {
+                    request: SpecAverageRequest {
+                        node: None,
+                        side: SpecSide::Output,
+                        channel: SpecChannel::Index(0),
+                        start: 0,
+                        end: 100,
+                    },
+                    key: "00112233445566778899aabbccddeeff".into(),
+                    phase: SpecAveragePhase::Measuring { progress: 0.25 },
+                }],
             },
         ))));
         let json = serde_json::to_value(audio).unwrap();
         assert_eq!(json["view"]["type"], json!("audio"));
         assert_eq!(json["view"]["loop"], json!({ "start": 10, "end": 90000 }));
         assert_eq!(json["view"]["solving"], json!(0.25));
+        assert_eq!(
+            json["view"]["spec"],
+            json!([{ "node": null, "side": "output", "channel": { "type": "side" },
+                     "key": "00112233445566778899aabbccddeeff", "rate": 48000, "frames": 96000, "n": 4096,
+                     "hop": 1024, "bands": 491, "map": [], "ready": [{ "start": 0, "end": 2 }], "pending": false }])
+        );
+        assert_eq!(
+            json["view"]["specAverage"],
+            json!([{ "request": { "node": null, "side": "output", "channel": { "type": "index", "index": 0 },
+                                  "start": 0, "end": 100 },
+                     "key": "00112233445566778899aabbccddeeff",
+                     "phase": { "type": "measuring", "progress": 0.25 } }])
+        );
         assert_eq!(json["view"]["samplesId"], json!("0123456789abcdef"));
         assert_eq!(json["view"]["workStalled"], json!(true));
         assert_eq!(

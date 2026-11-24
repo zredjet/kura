@@ -116,6 +116,12 @@ export const commands = {
 	 */
 	editMeasure: (session: string) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session })),
 	/**
+	 *  音声のエディタ：今の rev の出力の区間のスペクトルの帯ごとの平均と最大（M17 段 4。`kura-spec/1`）。求めるチャンクが少なければ
+	 *  その場で `ready` を返し、多ければ予約して `measuring` を返す（`edit_view { work: true }` の裏の仕事で求める。表示の情報の
+	 *  `specAverage` が `ready` になったら頼み直す）。描いている途中の表示を止めない。
+	 */
+	editSpecAverage: (session: string, request: EditSpecAverageRequestDto) => typedError<EditSpecAverageDto, AppError>(__TAURI_INVOKE("edit_spec_average", { session, request })),
+	/**
 	 *  書ける形式の一覧（確定した頭の出力の形で、保存のジョブと同じ今のコーデックの組で確かめる）。保存が `FormatUnavailable` で
 	 *  断られたときに、フロントが形式を選ぶシートに使う。
 	 */
@@ -1388,6 +1394,13 @@ export type EditAudioViewDto = {
 	 *  頼み続ける（ドラッグ中も手が止まったら）。解き終えると新しい rev の表示になる。
 	 */
 	solving: number | null,
+	/**  頼んだスペクトルのポートの状態（M17 段 4。`/edit/{session}/spec/{key}/{channel}/{chunk}` でタイルを取る）。 */
+	spec: EditSpecPortDto[],
+	/**
+	 *  最後に頼んだスペクトルの区間の平均（向きごとに 1 つ）の状態（値は載せない。`ready` になったら `edit_spec_average` を
+	 *  頼み直すと覚えた値が返る。`idle` は出力が変わって予約を捨てたので、頼み直す）。
+	 */
+	specAverage: EditSpecAverageStatusDto[],
 };
 
 /**  音声の表示の要求。区間はどれも出力のフレーム。 */
@@ -1402,6 +1415,8 @@ export type EditAudioViewportDto = {
 	focus: number | null,
 	/**  裏の仕事（波形の段の作り直し・ラウドネスの計り）を少し進める。 */
 	work: boolean,
+	/**  スペクトルの頼み（2 つまで：前と後。M17 段 4。省けば頼まない）。 */
+	spec?: EditSpecRequestDto[],
 };
 
 /**  変わったタイル。 */
@@ -1832,6 +1847,76 @@ export type EditSpansChangeDto =
 { type: "all" } | 
 /**  この区間だけ取り直す（空なら何も変わっていない）。 */
 { type: "spans"; spans: EditSpanDto[] };
+
+/**  スペクトルの区間の平均の状態（M17 段 4）。 */
+export type EditSpecAverageDto = 
+/**  予約した（裏の仕事で求める。フロントは `work: true` を頼み続ける）。 */
+{ type: "measuring"; progress: number | null } | 
+/**  帯ごとの平均（パワーの領域）と最大（dB。−120 で止める）。`frames` が 0 なら空。 */
+{ type: "ready"; frames: number; mean: (number | null)[]; max: (number | null)[] } | { type: "failed"; message: string };
+
+/**  表示の情報に載せるスペクトルの区間の平均の状態（値は載せない）。 */
+export type EditSpecAveragePhaseDto = { type: "idle" } | { type: "measuring"; progress: number | null } | { type: "ready" } | { type: "failed"; message: string };
+
+/**  スペクトルの区間の平均の頼み（M17 段 4）。 */
+export type EditSpecAverageRequestDto = {
+	/**  ノード（null は文書の出力。今は出力だけ）。 */
+	node: number | null,
+	side: EditSpecSideDto,
+	channel: EditSpecChannelDto,
+	/**  出力のフレームの区間（中心がこの中に入るフレームを数える）。 */
+	start: number,
+	end: number,
+};
+
+/**  最後に頼んだ区間の状態。 */
+export type EditSpecAverageStatusDto = {
+	request: EditSpecAverageRequestDto,
+	/**  求めているポートの鍵（スペクトルのポートの `key` と同じ）。 */
+	key: string,
+	phase: EditSpecAveragePhaseDto,
+};
+
+/**
+ *  スペクトルのチャンネル（M17 段 4）：番号（0 から）・M・S・和（各チャンネルのパワーの和）。中身のない変種も `{}` の形に
+ *  する（内部のタグの単位の変種は知らない項目を拒まない）。
+ */
+export type EditSpecChannelDto = { type: "index"; index: number } | { type: "mid" } | { type: "side" } | { type: "sum" };
+
+/**  スペクトルのポート 1 つの状態（M17 段 4）。 */
+export type EditSpecPortDto = {
+	node: number | null,
+	side: EditSpecSideDto,
+	channel: EditSpecChannelDto,
+	/**  ポートの鍵（32 字の 16 進。URL に入れる）。 */
+	key: string,
+	/**  ポートのレート・長さ（フレーム）。 */
+	rate: number,
+	frames: number,
+	/**  式 `kura-spec/1` の窓の大きさ・hop・帯の数。 */
+	n: number,
+	hop: number,
+	bands: number,
+	/**  出力のフレーム → ポートのフレームの写しの区分（`in` がポート）。 */
+	map: EditSourcePieceDto[],
+	/**  置き場にあるチャンクの番号の区間（半開）。 */
+	ready: EditSpanDto[],
+	/**  まだ作っていないチャンクがある（フロントは `work: true` を頼む）。 */
+	pending: boolean,
+};
+
+/**  スペクトルの頼み 1 つ（M17 段 4）。 */
+export type EditSpecRequestDto = {
+	/**  ノード（null は文書の出力。今は出力だけ）。 */
+	node: number | null,
+	side: EditSpecSideDto,
+	channel: EditSpecChannelDto,
+	/**  出力のフレームの区間（先のものほど先に作る）。 */
+	spans: EditSpanDto[],
+};
+
+/**  スペクトルのポートの向き（ノードの入力＝前・出力＝後）。 */
+export type EditSpecSideDto = "input" | "output";
 
 /**  エディタの状態。 */
 export type EditStatusDto = {

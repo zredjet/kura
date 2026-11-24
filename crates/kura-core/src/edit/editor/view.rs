@@ -90,6 +90,8 @@ pub struct AudioViewport {
     pub focus: Option<NodeId>,
     /// 裏の仕事（波形の段の作り直し・計り）を少し進める。
     pub work: bool,
+    /// スペクトルの頼み（2 つまで：前と後。M17 段 4）。
+    pub spec: Vec<super::audio::spec::SpecRequest>,
 }
 
 impl AudioViewport {
@@ -101,6 +103,7 @@ impl AudioViewport {
             interacting: false,
             focus: None,
             work: true,
+            spec: Vec::new(),
         }
     }
 }

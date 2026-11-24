@@ -495,6 +495,8 @@ struct Published {
     /// 公開した今と直前の波形の段（段の世代と段。`/edit/{s}/{世代}/peaks/…` が読む。同じ世代の中身は変わらない）。
     peaks_now: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
     peaks_before: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
+    /// スペクトルのタイルの置き場（M17 段 4。`/edit/{s}/spec/…` が読む。中身は変わらない）。
+    spec: audio::spec::SpecStore,
 }
 
 /// 開いているエディタの状態（`Editor::state` の錠の中）。
@@ -2041,6 +2043,7 @@ fn finish_open(
             solve: None,
             stale: false,
             solve_failed: None,
+            spec: Default::default(),
             #[cfg(test)]
             script: None,
         }
