@@ -117,20 +117,24 @@ pub fn poles(w0: f64, q_res: f64) -> (f64, f64) {
 }
 
 /// 極の対（`poles` と同じ a1・a2）と、桁落ちしない形の量（1 − r は expm1 で）。
+///
+/// 閉じた形の B（バンドパス・ベル）が使う量は、複素の対・実の対で同じ形に書く：r = e^{−qω0}（= √a2）、`omr` = 1 − r、
+/// `h` = sin²(θ/2)（実の対は θ = i·ω0√(q²−1) として −sinh²(ω0√(q²−1)/2)）、`s` = sin²(ω0/2) − h（複素の対は
+/// sin((ω0−θ)/2)·sin((ω0+θ)/2)、実の対は sin²(ω0/2) + sinh²(…)。どちらも打ち消しなしで）。1 + a1 + a2 = (1−r)² + 4r·h、
+/// 1 − a1 + a2 = (1−r)² + 4r·(1 − h)。
 struct Pair {
     a1: f64,
     a2: f64,
     roots: Roots,
+    r: f64,
+    omr: f64,
+    h: f64,
+    s: f64,
 }
 
 enum Roots {
-    /// 複素の対 r·e^{±iθ}（q ≤ 1）。`omr` = 1 − r、`gap` = (ω0 − θ)/2（θ = ω0√(1−q²)）。
-    Complex {
-        r: f64,
-        omr: f64,
-        theta: f64,
-        gap: f64,
-    },
+    /// 複素の対 r·e^{±iθ}（q ≤ 1。θ = ω0√(1−q²)）。`omr` = 1 − r。
+    Complex { r: f64, omr: f64, theta: f64 },
     /// 実の対 r_i = e^{−ω0·e_i}（q > 1。e = q ∓ √(q²−1)）。`omr` = 1 − r_i。
     Real { r: [f64; 2], omr: [f64; 2] },
 }
@@ -140,23 +144,40 @@ impl Pair {
     fn new(w0: f64, q_res: f64) -> Self {
         let (a1, a2) = poles(w0, q_res);
         let q = 0.5 / q_res;
-        let roots = if q <= 1.0 {
+        let r = math::exp(-q * w0);
+        let omr = -math::expm1(-q * w0);
+        let (roots, h, s) = if q <= 1.0 {
             let c = (1.0 - q * q).sqrt();
-            Roots::Complex {
-                r: math::exp(-q * w0),
-                omr: -math::expm1(-q * w0),
-                theta: c * w0,
-                gap: 0.5 * w0 * q * q / (1.0 + c),
-            }
+            let theta = c * w0;
+            let gap = 0.5 * w0 * q * q / (1.0 + c);
+            (
+                Roots::Complex { r, omr, theta },
+                sq(math::sin(0.5 * theta)),
+                math::sin(gap) * math::sin(0.5 * (w0 + theta)),
+            )
         } else {
-            let s = (q * q - 1.0).sqrt();
-            let e = [1.0 / (q + s), q + s];
-            Roots::Real {
-                r: [math::exp(-w0 * e[0]), math::exp(-w0 * e[1])],
-                omr: [-math::expm1(-w0 * e[0]), -math::expm1(-w0 * e[1])],
-            }
+            let c = (q * q - 1.0).sqrt();
+            let e = [1.0 / (q + c), q + c];
+            let half = 0.5 * c * w0;
+            let sh2 = sq(0.5 * (math::expm1(half) - math::expm1(-half)));
+            (
+                Roots::Real {
+                    r: [math::exp(-w0 * e[0]), math::exp(-w0 * e[1])],
+                    omr: [-math::expm1(-w0 * e[0]), -math::expm1(-w0 * e[1])],
+                },
+                -sh2,
+                sq(math::sin(0.5 * w0)) + sh2,
+            )
         };
-        Self { a1, a2, roots }
+        Self {
+            a1,
+            a2,
+            roots,
+            r,
+            omr,
+            h,
+            s,
+        }
     }
 
     /// 1 + a1 + a2（= |1 − p|² の積）。
@@ -240,35 +261,24 @@ pub fn highpass(w0: f64, q: f64) -> Section {
     }
 }
 
-/// バンドパス（4.3 の条件：中心の利得 1・中心で極値）。B2 = (A0/φ1² − 16a2)/4 = (X − 4√a2)(X + 4√a2)/4
-/// （X = (1+a1+a2)/φ1）、B1 = A1 − A0·(φ0/φ1)² = D·((1−a1+a2) + (1+a1+a2)·φ0/φ1)（D = (1−a1+a2) − (1+a1+a2)·φ0/φ1）。
-/// 複素の対では X − 4r = ((1−r)² − 4r·S)/φ1・D = (4r·S − (1−r)²·cos ω0)/φ1（S = sin((ω0−θ)/2)·sin((ω0+θ)/2)）で、
-/// 打ち消し合う大きな項を作らない。B1 < 0 なら B1 = 0・B2 = |A(e^{iω0})|²/φ2（中心の利得 1 だけ）。
+/// バンドパス（4.3 の条件：中心の利得 1・中心で極値）。B2 = (A0/φ1² − 16a2)/4 = (X − 4r)(X + 4r)/4
+/// （X = (1+a1+a2)/φ1）、B1 = A1 − A0·(φ0/φ1)² = D·((1−a1+a2) + X·φ0)（D = (1−a1+a2) − X·φ0）。
+/// X − 4r = ((1−r)² − 4r·s)/φ1・D = (4r·s − (1−r)²·cos ω0)/φ1（`Pair` の s）で、約 16 の大きな項どうしの打ち消しを
+/// 作らない（残る打ち消しは先頭の q²ω0² の桁で、768 kHz・10 Hz でも相対 4e-7）。B1 < 0 なら B1 = 0・
+/// B2 = |A(e^{iω0})|²/φ2（中心の利得 1 だけ。今の式では高い精度の格子で起きないが、守りとして残す）。
 pub fn bandpass(w0: f64, q: f64) -> Section {
     let pair = Pair::new(w0, q);
     let (a1, a2) = (pair.a1, pair.a2);
     let (p0, p1, p2) = phis(w0);
     let (dc, ny) = (pair.at_dc(), pair.at_nyquist());
+    let (r, o) = (pair.r, sq(pair.omr));
     let x = dc / p1;
-    let (xm, xp, d) = match pair.roots {
-        Roots::Complex { r, omr, theta, gap } => {
-            let s = math::sin(gap) * math::sin(0.5 * (w0 + theta));
-            let o = sq(omr);
-            (
-                (o - 4.0 * r * s) / p1,
-                x + 4.0 * r,
-                (4.0 * r * s - o * math::cos(w0)) / p1,
-            )
-        }
-        Roots::Real { .. } => {
-            let rg = math::exp(-0.5 / q * w0);
-            (x - 4.0 * rg, x + 4.0 * rg, ny - dc * p0 / p1)
-        }
-    };
+    let xm = (o - 4.0 * r * pair.s) / p1;
+    let d = (4.0 * r * pair.s - o * math::cos(w0)) / p1;
     let (bb1, bb2) = {
         let bb1 = d * (ny + dc * p0 / p1);
         if bb1 >= 0.0 {
-            (bb1, 0.25 * xm * xp)
+            (bb1, 0.25 * xm * (x + 4.0 * r))
         } else {
             (0.0, pair.den(w0) / p2)
         }
@@ -287,10 +297,10 @@ pub fn bandpass(w0: f64, q: f64) -> Section {
 /// ピーキング（ベル。4.4 の条件：直流 1・中心で G・中心で極値）：中心の利得 `db`。4.4 の R1・R2 を閉じた形に解いて
 /// B0 = A0、B1 = G²·A1 + (1 − G²)·A0·(φ0/φ1)²、B2 = (A0·(G² − 1)/φ1² − 16a2·G²)/4（A0・A1 は極の対の積の形で）。
 ///
-/// 低い周波数の狭いベルは零点が単位円に近く、式 29 の W² + B2 = (b0 − b2)² が大きな項の小さな差になる（192 kHz・10 Hz・
-/// Q 36・+30 dB で約 3e-9）。複素の極の対では、それを打ち消しのない形で求める（d0 = 1+a1+a2、n0 = 1−a1+a2、X = d0/φ1、
-/// m = n0 + X·φ0、D・X − 4r はバンドパスと同じ）：
-/// 4E = G²·(2·d0·D·m/(√B1 + X·φ0) + 2(1−r)²·m + 8r·sin²(θ/2)·(X − 4r))。
+/// 低い周波数の狭いベル（と、実の極の深いカット）は零点が単位円に近く、式 29 の W² + B2 = (b0 − b2)² が大きな項の
+/// 小さな差になる（192 kHz・10 Hz・Q 36・+30 dB で約 3e-9）。それを大きな項の打ち消しなしで求める（d0 = 1+a1+a2、
+/// n0 = 1−a1+a2、X = d0/φ1、m = n0 + X·φ0、D・X − 4r はバンドパスと同じ、h は `Pair` の h。複素の対・実の対で同じ式）：
+/// 4E = G²·(2·d0·D·m/(√B1 + X·φ0) + 2(1−r)²·m + 8r·h·(X − 4r))。
 pub fn peaking(w0: f64, q: f64, db: f64) -> Section {
     let g = math::db_to_gain(db);
     let pair = Pair::new(w0, q * g.sqrt());
@@ -300,23 +310,11 @@ pub fn peaking(w0: f64, q: f64, db: f64) -> Section {
     let (d0, n0) = (pair.at_dc(), pair.at_nyquist());
     let x = d0 / p1;
     let r1 = root(g2 * sq(n0) + (1.0 - g2) * sq(x * p0));
-    let e = match pair.roots {
-        Roots::Complex { r, omr, theta, gap } => {
-            let s = math::sin(gap) * math::sin(0.5 * (w0 + theta));
-            let o = sq(omr);
-            let xm = (o - 4.0 * r * s) / p1;
-            let d = (4.0 * r * s - o * math::cos(w0)) / p1;
-            let m = n0 + x * p0;
-            0.25 * g2
-                * (2.0 * d0 * d * m / (r1 + x * p0)
-                    + 2.0 * o * m
-                    + 8.0 * r * sq(math::sin(0.5 * theta)) * xm)
-        }
-        Roots::Real { .. } => {
-            let bb2 = 0.25 * (sq(x) * (g2 - 1.0) - 16.0 * a2 * g2);
-            sq(0.5 * (d0 + r1)) + bb2
-        }
-    };
+    let (r, o) = (pair.r, sq(pair.omr));
+    let xm = (o - 4.0 * r * pair.s) / p1;
+    let d = (4.0 * r * pair.s - o * math::cos(w0)) / p1;
+    let m = n0 + x * p0;
+    let e = 0.25 * g2 * (2.0 * d0 * d * m / (r1 + x * p0) + 2.0 * o * m + 8.0 * r * pair.h * xm);
     let (b0, b1, b2) = from_e(d0, r1, e);
     Section { b0, b1, b2, a1, a2 }
 }
@@ -369,7 +367,8 @@ pub const SHELF_POLE_MAX: f64 = SHELF_POLE_MAX_RATIO * std::f64::consts::PI;
 /// 同じ（π に対する比。凍結）。
 pub const SHELF_POLE_MAX_RATIO: f64 = 0.9;
 
-/// 2 列の最小二乗（行は (u, v, y)。y ≈ c1·u + c2·v の (c1, c2)）を、修正 Gram–Schmidt の QR で解く。列が 0 なら None。
+/// 2 列の最小二乗（行は (u, v, y)。y ≈ c1·u + c2·v の (c1, c2)）を、修正 Gram–Schmidt の QR で解く（右辺も q1 の成分を
+/// 引いてから q2 に写す）。列が 0 なら None。
 fn least_squares2(rows: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
     let mut nu = 0.0;
     for r in rows {
@@ -395,7 +394,7 @@ fn least_squares2(rows: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
     }
     let mut z2 = 0.0;
     for r in rows {
-        z2 += (r.1 - r12 * (r.0 / nu)) / nv * r.2;
+        z2 += (r.1 - r12 * (r.0 / nu)) / nv * (r.2 - z1 * (r.0 / nu));
     }
     let c2 = z2 / nv;
     Some(((z1 - r12 * c2) / nu, c2))
@@ -688,9 +687,23 @@ mod tests {
         }
     }
 
-    /// 合わせた点（44.1〜768 kHz、10 Hz から）：ベルは直流 0 dB・中心で利得、ローパスは直流 0 dB・中心で Q、ハイパスは
-    /// 中心で Q、バンドパスは中心で 0 dB、ノッチは中心で深い谷・直流 0 dB、シェルフ・チルトは直流の値、カットは切れ目で
-    /// −3.01 dB（Butterworth）。
+    /// 中心 `w0` が `s` の振幅の極値（`peak` なら最大、偽なら最小）か：前後（相対 1e-3）と比べる。
+    fn extremum_at(s: &Section, w0: f64, peak: bool) -> bool {
+        let c = s.power(w0);
+        [w0 * (1.0 - 1e-3), w0 * (1.0 + 1e-3)].iter().all(|&ww| {
+            let v = s.power(ww);
+            if peak {
+                v <= c * (1.0 + 1e-9)
+            } else {
+                v >= c * (1.0 - 1e-9)
+            }
+        })
+    }
+
+    /// 合わせた点（44.1〜768 kHz、10 Hz から）：ベルは直流 0 dB・中心で利得の極値、ローパスは直流 0 dB・中心で Q、
+    /// ハイパスは中心で Q、バンドパスは中心で 0 dB の極値、ノッチは中心で深い谷・直流 0 dB、シェルフ・チルトは直流の
+    /// 値、カットは切れ目で −3.01 dB（Butterworth）。直流は、丸めた係数の 1 + a1 + a2 と極の対の積の形の差（768 kHz・
+    /// 10 Hz で相対 5e-8）だけずれるので 1e-5 dB まで。Q 2.78・−30 dB のベルは極が実の対（Q·√G < 0.5）で零点が鋭い。
     #[test]
     fn matched_points_hold() {
         for fs in [
@@ -698,7 +711,7 @@ mod tests {
         ] {
             for f in [10.0, 11.0, 30.0, 1_000.0, 8_000.0] {
                 let w0 = w(f, fs);
-                for q in [0.1, 0.5, 1.0, 3.0, 36.4, 40.0] {
+                for q in [0.1, 0.5, 1.0, 2.78, 3.0, 36.4, 40.0] {
                     let at = format!("{fs} Hz・{f} Hz・Q {q}");
                     // 0 dB のベルは何もしない（零点が極に重なる。E = (1 − a2)² の閉じた形の確かめ）
                     let id = peaking(w0, q, 0.0);
@@ -707,27 +720,31 @@ mod tests {
                     }
                     for g in [-30.0, -0.1, 0.1, 9.0, 30.0] {
                         let b = peaking(w0, q, g);
-                        assert!(b.db(0.0).abs() < 1e-6, "{at}");
+                        assert!(b.db(0.0).abs() < 1e-5, "{at}・{g} dB: {}", b.db(0.0));
                         assert!((b.db(w0) - g).abs() < 1e-4, "{at}・{g} dB: {}", b.db(w0));
+                        assert!(extremum_at(&b, w0, g > 0.0), "{at}・{g} dB");
                     }
                     let lp = lowpass(w0, q);
-                    assert!(lp.db(0.0).abs() < 1e-6, "{at}");
-                    assert!((lp.power(w0) / (q * q) - 1.0).abs() < 1e-4, "{at}");
+                    assert!(lp.db(0.0).abs() < 1e-5, "{at}");
+                    assert!((lp.power(w0) / (q * q) - 1.0).abs() < 1e-6, "{at}");
                     let hp = highpass(w0, q);
-                    assert!((hp.power(w0) / (q * q) - 1.0).abs() < 1e-4, "{at}");
+                    assert!((hp.power(w0) / (q * q) - 1.0).abs() < 1e-6, "{at}");
                     let bp = bandpass(w0, q);
-                    assert!(bp.db(w0).abs() < 1e-3, "{at}: {}", bp.db(w0));
+                    assert!(bp.db(w0).abs() < 1e-5, "{at}: {}", bp.db(w0));
+                    assert!(extremum_at(&bp, w0, true), "{at}");
                     let n = notch(w0, q);
-                    assert!(n.db(0.0).abs() < 1e-6 && n.db(w0) < -100.0, "{at}");
+                    assert!(n.db(0.0).abs() < 1e-5 && n.db(w0) < -100.0, "{at}");
                     if q <= 4.0 {
-                        let ls = shelf(w0, q, 12.0, fs, false);
-                        assert!((ls.db(0.0) - 12.0).abs() < 1e-6, "{at}");
-                        let hs = shelf(w0, q, -12.0, fs, true);
-                        assert!(hs.db(0.0).abs() < 1e-6, "{at}");
+                        for g in [-30.0, -12.0, 12.0, 30.0] {
+                            let ls = shelf(w0, q, g, fs, false);
+                            assert!((ls.db(0.0) - g).abs() < 1e-5, "{at}・{g} dB");
+                            let hs = shelf(w0, q, g, fs, true);
+                            assert!(hs.db(0.0).abs() < 1e-5, "{at}・{g} dB");
+                        }
                     }
                 }
                 let t = tilt(w0, 12.0);
-                assert!((t.db(0.0) + 6.0).abs() < 1e-6, "{fs} {f}");
+                assert!((t.db(0.0) + 6.0).abs() < 1e-5, "{fs} {f}");
                 for slope in [6, 12, 18, 24, 36, 48, 72, 96] {
                     // 奇数次の 1 次の段は直流とナイキストで合わせるので、切れ目はナイキストよりずっと下でだけ
                     if (slope / 6) % 2 == 1 && f > 0.025 * fs {
@@ -833,9 +850,9 @@ mod tests {
     }
 
     /// シェルフ（48 kHz、0.9 × ナイキストまで）：中心が 0.1 × レート以下なら原型と 1.1 dB 以内。それより上（原型の肩や極が
-    /// ナイキストを超える）では合わせきれないが、原型より 3.5 dB を超えて持ち上げない（鋭い共振・折り返しを作らない）。
-    /// 44.1〜96 kHz・中心 81 点・Q 7 つ・利得 10 個で測った最大：0.1 × レート以下 1.04 dB、持ち上げすぎ +3.45 dB（Q 4・
-    /// −30 dB のローシェルフ・中心 0.23 × レート）、届かない分 −10.8 dB（+30 dB・Q 2 のハイシェルフ・中心 0.49 × レート）。
+    /// ナイキストを超える）では合わせきれないが、原型より 3.6 dB を超えて持ち上げない（鋭い共振・折り返しを作らない）。
+    /// 44.1〜96 kHz で測った最大：0.1 × レート以下 1.04 dB、持ち上げすぎ +3.50 dB（Q 4・−29 dB のローシェルフ・中心
+    /// 0.23 × レート）、届かない分 −10.8 dB（+30 dB・Q 2 のハイシェルフ・中心 0.49 × レート）。
     #[test]
     fn shelves_near_nyquist_stay_sane() {
         let fs = 48_000.0;
@@ -857,7 +874,7 @@ mod tests {
                             if f0 <= 0.1 * fs {
                                 assert!(d.abs() <= 1.1, "{at}");
                             }
-                            assert!(d <= 3.5, "{at}");
+                            assert!(d <= 3.6, "{at}");
                         }
                     }
                 }
