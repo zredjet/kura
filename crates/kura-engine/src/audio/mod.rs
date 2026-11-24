@@ -29,6 +29,28 @@ pub trait AudioKernel: Send + Sync {
     /// 同じ位置にはいつも同じ値を書く（呼び方・区間の切り方によらない）。範囲は `frames()` の中であること。
     /// 入力は `Audio::read` で読み、その誤り（範囲の描画で描かなかったチャンクを読んだ `Internal`、源の読みの `Io`）を返す。
     fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError>;
+    /// チャンネルの組の幅（M17 段 1。docs/editing.md §18.1）：組 k はチャンネル [k·w, (k+1)·w) で、同じ計算を分け合う
+    /// （M/S のバンド・ステレオのリンクでは、出力の各チャンネルが組のすべての入力に依る）。描き手（`render_all`・
+    /// `render_chunks`）は（組, チャンク）ごとに [`AudioKernel::render_lane`] で描く。1 以上で、チャンネルの数を割り切ること。
+    /// 既定は 1（各チャンネルが 1 組）。
+    fn lane_width(&self) -> usize {
+        1
+    }
+    /// 組 `lane` のチャンネルを、フレーム `start` から `outs[c].len()` フレームずつ一度に描く（`outs` は組のチャンネルの順で、
+    /// 長さは幅、どれも同じ長さ）。値は `render` をチャンネルごとに呼んだものと同じであること（E18）。既定は `render` を
+    /// チャンネルごとに呼ぶ。
+    fn render_lane(
+        &self,
+        lane: usize,
+        start: u64,
+        outs: &mut [&mut [f32]],
+    ) -> Result<(), EngineError> {
+        let w = self.lane_width();
+        for (c, out) in outs.iter_mut().enumerate() {
+            self.render(lane * w + c, start, out)?;
+        }
+        Ok(())
+    }
     /// 出力が入力 0 をずらして写したもの（出力のフレーム i ＝ 入力 0 の同じチャンネルのフレーム i + off）なら Some(off)。
     /// 実行器はずれと長さが合うチャンクを入力の実体で共有してよい。値は `render` と同じであること（E18）。既定は None。
     fn passthrough(&self) -> Option<u64> {
@@ -41,9 +63,36 @@ pub trait AudioKernel: Send + Sync {
     }
 }
 
+/// 核の組の幅と組の数（幅が 0・チャンネルの数を割り切らなければ内部の誤り）。
+fn lanes_of(k: &dyn AudioKernel) -> Result<(usize, usize), EngineError> {
+    let (w, c) = (k.lane_width(), k.channels());
+    if w == 0 || c % w != 0 {
+        return Err(EngineError::Internal(format!(
+            "核の組の幅 {w} が {c} チャンネルを割り切りません"
+        )));
+    }
+    Ok((w, c / w))
+}
+
+/// 組 `lane` のチャンネルを [start, end) だけ `render_lane` で描いて、チャンネルの順の中身にする。
+fn draw_lane(
+    k: &dyn AudioKernel,
+    w: usize,
+    lane: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<Chunk>, EngineError> {
+    let mut outs: Vec<Vec<f32>> = (0..w)
+        .map(|_| crate::codec::try_vec(end - start, 0f32))
+        .collect::<Result<_, _>>()?;
+    let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
+    k.render_lane(lane, start as u64, &mut refs)?;
+    Ok(outs.into_iter().map(|o| Chunk::Data(Arc::new(o))).collect())
+}
+
 /// 核の出力の全体を描いて値にする（メタデータは `meta` を付ける。写し方は実行器が当て直す）。
-/// （チャンネル, チャンク）の対ごとに、チャンク（`AUDIO_CHUNK` フレーム）を `par_blocks` で描いてそのまま表に入れる
-/// （平面へ写し直さない。持つ量は出力の値と、並列の仕事ごとの核の作業列だけ）。
+/// （組, チャンク）の対ごとに、チャンク（`AUDIO_CHUNK` フレーム）を `par_blocks` で描いてそのまま表に入れる
+/// （平面へ写し直さない。持つ量は出力の値と、並列の仕事ごとの核の作業列だけ）。組は [`AudioKernel::lane_width`]。
 pub fn render_all(
     k: &dyn AudioKernel,
     meta: AudioMeta,
@@ -52,22 +101,23 @@ pub fn render_all(
     let frames =
         usize::try_from(k.frames()).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
     let channels = k.channels();
+    let (w, lanes) = lanes_of(k)?;
     let count = frames.div_ceil(AUDIO_CHUNK);
-    let tasks = channels
+    let tasks = lanes
         .checked_mul(count)
         .ok_or_else(|| EngineError::Limit("音声が長すぎます".into()))?;
-    let chunks = par_blocks(tasks, mon, |t| {
-        let (ch, j) = (t / count, t % count);
+    let drawn = par_blocks(tasks, mon, |t| {
+        let (lane, j) = (t / count, t % count);
         let start = j * AUDIO_CHUNK;
         let end = start.saturating_add(AUDIO_CHUNK).min(frames);
-        let mut out = crate::codec::try_vec(end - start, 0f32)?;
-        k.render(ch, start as u64, &mut out)?;
-        Ok(Chunk::Data(Arc::new(out)))
+        draw_lane(k, w, lane, start, end)
     })?;
-    let mut table = Vec::with_capacity(channels);
-    let mut it = chunks.into_iter();
-    for _ in 0..channels {
-        table.push(it.by_ref().take(count).collect());
+    let mut table: Vec<Vec<Chunk>> = (0..channels).map(|_| Vec::with_capacity(count)).collect();
+    for (t, group) in drawn.into_iter().enumerate() {
+        let lane = t / count;
+        for (c, chunk) in group.into_iter().enumerate() {
+            table[lane * w + c].push(chunk);
+        }
     }
     Ok(Value::Audio(Arc::new(Audio::from_chunks(
         k.rate(),
@@ -80,7 +130,7 @@ pub fn render_all(
 /// 範囲の描画の部品（M13 段 1。docs/editing.md §12.5）：核の出力のうち `picks` のチャンクだけを描いた値と、そのうち
 /// 入力 0 の実体を共有したチャンクの数（チャンクの番号の数。チャンネルで数えない）。
 ///
-/// - `picks` の各（チャンネル, チャンク）を `par_blocks` で描く。核が入力 0 をずらして写したもの（`passthrough` が Some(off)）で、
+/// - `picks` の各（組, チャンク）を `par_blocks` で描く（組は [`AudioKernel::lane_width`]。M17 段 1）。核が入力 0 をずらして写したもの（`passthrough` が Some(off)）で、
 ///   off がチャンクの倍数・入力 0 のチャンク k + off/C の長さが出力のチャンク k と同じなら、その実体（中身・源の参照）を共有する
 ///   （無効なら読んだ印を立てて誤り）。そうでなければ核で描く。
 /// - `picks` の外は、`base`（前の値。レート・チャンネルが同じで、その番号のチャンクの長さが同じとき。長さの違う前の値も
@@ -117,19 +167,21 @@ pub fn render_chunks(
             && inp.chunk_range(jj).len() == span(j).len())
         .then_some((inp, jj))
     };
-    let tasks = channels
+    let (w, lanes) = lanes_of(k)?;
+    let tasks = lanes
         .checked_mul(list.len())
         .ok_or_else(|| EngineError::Limit("音声が長すぎます".into()))?;
     let per = list.len().max(1);
     let drawn = par_blocks(tasks, mon, |t| {
-        let (ch, j) = (t / per, list[t % per]);
+        let (lane, j) = (t / per, list[t % per]);
         if let Some((inp, jj)) = source_of(j) {
-            return Ok((inp.share_chunk(ch, jj)?, true));
+            let group = (0..w)
+                .map(|c| inp.share_chunk(lane * w + c, jj))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok((group, true));
         }
         let r = span(j);
-        let mut out = crate::codec::try_vec(r.len(), 0f32)?;
-        k.render(ch, r.start as u64, &mut out)?;
-        Ok((Chunk::Data(Arc::new(out)), false))
+        Ok((draw_lane(k, w, lane, r.start, r.end)?, false))
     })?;
     let from_base = |ch: usize, j: usize| -> Chunk {
         match base {
@@ -156,12 +208,14 @@ pub fn render_chunks(
         }
     }
     let mut shared = 0u64;
-    for (t, (c, from_input)) in drawn.into_iter().enumerate() {
-        let (ch, j) = (t / per, list[t % per]);
-        if from_input && ch == 0 {
+    for (t, (group, from_input)) in drawn.into_iter().enumerate() {
+        let (lane, j) = (t / per, list[t % per]);
+        if from_input && lane == 0 {
             shared += 1;
         }
-        table[ch][j] = c;
+        for (c, chunk) in group.into_iter().enumerate() {
+            table[lane * w + c][j] = chunk;
+        }
     }
     Ok((Audio::from_chunks(k.rate(), frames, table, meta)?, shared))
 }
@@ -391,6 +445,132 @@ mod tests {
                 assert_eq!(k, k.round(), "格子に乗っていない");
             }
         }
+    }
+
+    /// 組を一度に描く核（M17 段 1）：幅 2 の組で、L・R から和と差を出す。`render_lane` を呼んだ数を数える。
+    struct SumDiff {
+        audio: Arc<Audio>,
+        lanes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AudioKernel for SumDiff {
+        fn rate(&self) -> u32 {
+            self.audio.rate()
+        }
+        fn channels(&self) -> usize {
+            self.audio.channels()
+        }
+        fn frames(&self) -> u64 {
+            self.audio.frames() as u64
+        }
+        fn lane_width(&self) -> usize {
+            2
+        }
+        fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+            let lane = ch / 2;
+            let mut l = vec![0f32; out.len()];
+            let mut r = vec![0f32; out.len()];
+            self.audio.read(lane * 2, start, &mut l)?;
+            self.audio.read(lane * 2 + 1, start, &mut r)?;
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = if ch.is_multiple_of(2) {
+                    l[i] + r[i]
+                } else {
+                    l[i] - r[i]
+                };
+            }
+            Ok(())
+        }
+        fn render_lane(
+            &self,
+            lane: usize,
+            start: u64,
+            outs: &mut [&mut [f32]],
+        ) -> Result<(), EngineError> {
+            self.lanes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (c, out) in outs.iter_mut().enumerate() {
+                self.render(lane * 2 + c, start, out)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// 描き手（`render_all`・`render_chunks`）は（組, チャンク）ごとに `render_lane` で描き、値はチャンネルごとの `render` と
+    /// 同じ。前の値・選んだチャンクの扱いも幅 1 と同じ。幅がチャンネルの数を割り切らなければ内部の誤り。
+    #[test]
+    fn lanes_are_drawn_at_once() {
+        use std::sync::atomic::Ordering;
+        let v = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 4,
+            frames: 2 * AUDIO_CHUNK as u64 + 77,
+            seed: 5,
+        }
+        .generate()
+        .unwrap();
+        let Value::Audio(a) = v else { panic!() };
+        let k = SumDiff {
+            audio: a.clone(),
+            lanes: Default::default(),
+        };
+        let all = render_all(&k, AudioMeta::default(), &NoMonitor).unwrap();
+        // 2 組 × 3 チャンク
+        assert_eq!(k.lanes.load(Ordering::Relaxed), 6);
+        let Value::Audio(all) = all else { panic!() };
+        for ch in 0..4 {
+            let mut want = vec![0f32; a.frames()];
+            k.render(ch, 0, &mut want).unwrap();
+            let mut got = vec![0f32; a.frames()];
+            all.read(ch, 0, &mut got).unwrap();
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            );
+        }
+        // 選んだチャンクだけ（ほかは前の値か無効）
+        k.lanes.store(0, Ordering::Relaxed);
+        let mut picks = ChunkSet::empty(3);
+        picks.insert(1);
+        let (part, shared) = render_chunks(
+            &k,
+            Some(&a),
+            &picks,
+            Some(&all),
+            AudioMeta::default(),
+            &NoMonitor,
+        )
+        .unwrap();
+        assert_eq!((k.lanes.load(Ordering::Relaxed), shared), (2, 0));
+        assert!(part.is_complete());
+        assert_eq!(Value::Audio(Arc::new(part)), Value::Audio(all.clone()));
+        let (part, _) =
+            render_chunks(&k, Some(&a), &picks, None, AudioMeta::default(), &NoMonitor).unwrap();
+        assert!(!part.is_complete());
+        let mut got = vec![0f32; AUDIO_CHUNK];
+        part.read(3, AUDIO_CHUNK as u64, &mut got).unwrap();
+        let mut want = vec![0f32; AUDIO_CHUNK];
+        all.read(3, AUDIO_CHUNK as u64, &mut want).unwrap();
+        assert_eq!(got, want);
+        // 幅が割り切らない
+        let odd = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 3,
+            frames: 100,
+            seed: 6,
+        }
+        .generate()
+        .unwrap();
+        let Value::Audio(odd) = odd else { panic!() };
+        let k = SumDiff {
+            audio: odd,
+            lanes: Default::default(),
+        };
+        assert!(matches!(
+            render_all(&k, AudioMeta::default(), &NoMonitor),
+            Err(EngineError::Internal(_))
+        ));
     }
 
     /// 区間の始まりにシークして順に取った乱数は、標本ごとにシークしたものと同じ（区間の切り方によらない）。

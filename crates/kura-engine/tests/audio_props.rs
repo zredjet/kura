@@ -263,6 +263,33 @@ fn e18_chunked_rendering_matches() {
                     "{op} {name}：チャンク {chunk}・チャンネル {ch} で値が違う"
                 );
             }
+            // 組を一度に描く口（M17 段 1）も同じ値
+            let w = kernel.lane_width();
+            assert!(
+                w > 0 && kernel.channels() % w == 0,
+                "{op} {name}：組の幅 {w}"
+            );
+            for lane in 0..kernel.channels() / w {
+                let len = kernel.frames() as usize;
+                let mut got = vec![vec![0f32; len]; w];
+                let mut start = 0usize;
+                while start < len {
+                    let end = start.saturating_add(chunk).min(len);
+                    let mut refs: Vec<&mut [f32]> =
+                        got.iter_mut().map(|g| &mut g[start..end]).collect();
+                    kernel
+                        .render_lane(lane, start as u64, &mut refs)
+                        .unwrap_or_else(|e| panic!("{op} {name}: {e}"));
+                    start = end;
+                }
+                for (c, g) in got.iter().enumerate() {
+                    let want = &whole.to_planes().unwrap()[lane * w + c][..];
+                    assert!(
+                        g.iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{op} {name}：チャンク {chunk}・組 {lane} のチャンネル {c} で値が違う"
+                    );
+                }
+            }
         }
     });
     assert!(checked > 0);
