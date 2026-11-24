@@ -268,10 +268,13 @@ impl Engine {
             node_seed(node, &cx.source),
             cx.plan.rules,
         );
-        // 描くチャンクがない（継ぎはぎで前の値とすべて共有する・頼んだ区間がない）ノードは、申告した解析を解かず、核も作らない
-        // （上流の手で表の入力が変わっても、表示の外なら長い入力を流し直さない。M17 段 1）。メタデータを写す操作で、出力の形が
-        // 入力 0 と同じときだけ（メタデータは入力 0 のもの。警告は描いたノードの分だけなので出さない）
-        if let Some(blank) = blank_region(node, ins, rounded, draw) {
+        // 描くチャンクがない（継ぎはぎで前の値とすべて共有する・頼んだ区間がない）ノードで、申告した解析がこの描画の表にも
+        // キャッシュにもない（解くには入力を流すか値に当てる）ときは、解かず、核も作らない（上流の手で表の入力が変わっても、
+        // 表示の外なら長い入力を流し直さない。M17 段 1）。メタデータを写す操作で、出力の形が入力 0 と同じときだけ（メタデータは
+        // 入力 0 のもの。このノードの警告は出ない：警告は描いたノードの分だけ）。解析が手元にあれば、核を作って警告を出す
+        if let Some(blank) = blank_region(node, ins, rounded, draw)
+            && !self.needs_at_hand(cx, cache, node, presolved)?
+        {
             return self.blank_audio_region(cx, node, ins, blank, base, &mut acx);
         }
         if !node.needs.is_empty() {
@@ -439,6 +442,27 @@ pub(super) fn blank_region(
 }
 
 impl Engine {
+    /// 申告した解析がどれも、この描画の表かキャッシュにあるか（解かずに使えるか）。
+    fn needs_at_hand(
+        &self,
+        cx: &PassCx<'_>,
+        cache: &NodeCache,
+        node: &PlannedNode,
+        presolved: &Presolved,
+    ) -> Result<bool, EngineError> {
+        let in_fps = node_input_fingerprints(node, &cx.fps.nodes, &cx.input_fps)?;
+        for need in &node.needs {
+            let Some(fp) = in_fps.get(need.input) else {
+                return Ok(false);
+            };
+            let key = analysis_fingerprint(*fp, need.id, need.v, &need.params)?;
+            if !presolved.contains_key(&key) && !cache.contains_analysis(&key) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// [`blank_region`] のノードを描く（前の値のチャンクを共有し、ほかは無効。メタデータは入力 0 のものを写す）。
     fn blank_audio_region(
         &self,
@@ -991,7 +1015,8 @@ impl crate::audio::stream::AudioProducer for OutputStream<'_> {
 
 impl Engine {
     /// 計画の出力 `output` を、何度でも区間を選んで流せる生産者にする（M13 段 3。保存の `Encoder::encode_stream` が読む）。
-    /// 形とメタデータは空の範囲の窓を描いて求める（範囲を持つノードは標本を描かない。流し解きはここで済み、結果を持ち越す）。
+    /// 形とメタデータは空の範囲の窓を描いて求める（範囲を持つノードは標本を描かない。申告した解析が手元にないノードは解かずに
+    /// 通すので（M17 段 1）、流し解きは最初の窓を流すときに起き、結果は呼び出しをまたいで持ち越す）。
     /// 長さの分からない出力・縮小の段の計画は `Unsupported`（`stream_audio` と同じ）。
     pub fn output_stream<'a>(
         &'a self,

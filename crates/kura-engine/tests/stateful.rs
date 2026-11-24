@@ -435,19 +435,22 @@ fn non_finite_samples_follow_the_rule() {
     assert_eq!(codes, [kura_engine::IssueCode::NonFiniteSamples]);
 }
 
-/// 見積もりは、流し解きで解いた表を描画の終わりまで数える（表を持つ間の量が、表を数えない見積もりより大きい）。
+/// 見積もりは、範囲の描画の中で解いた表を描画の終わりまで数える：表を解くノードより後ろの段（gain）を描く間の量に、表の
+/// 大きさが入る（表は範囲の描画の中の表 `Presolved` が終わりまで持つ）。
 #[test]
 fn estimates_hold_the_tables() {
     use kura_engine::analysis::Analysis;
     use kura_engine::testing::stateful::Iir1State;
     let engine = engine();
-    // 状態の大きい表（先読み 4,000・格子 100）を、範囲の描画の流し解きで解く
+    // 状態の大きい表（先読み 4,000・格子 100）を、範囲の描画の流し解きで解き、後ろに gain を置く
     let input = noise(1, 2 * C, 10);
     let big = params(0.4, -0.6, 4_000, false, 100);
-    let g = chain(
+    let mut g = chain(
         &[("audio.gain", json!({ "db": -2.0 }))],
         std::slice::from_ref(&big),
     );
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 99)
+        .unwrap();
     let plan = compile(&engine, &g, &input);
     let table = Iir1State::estimate(&big.state(), &input.shape()).bytes;
     assert!(table > 40 << 20, "{table}");
@@ -455,8 +458,38 @@ fn estimates_hold_the_tables() {
         .all_inputs(&plan, Source::Held)
         .area(OutputId(0), Area::span(10, 20));
     let est = engine.estimate(&plan, &spec, None).unwrap();
-    assert!(est.peak >= table, "{} < {table}", est.peak);
-    let _ = AudioMeta::default();
+    let last = est.nodes.last().unwrap();
+    assert!(last.at >= table, "後ろの段 {} < 表 {table}", last.at);
+}
+
+/// 見積もりは、入れ子の流し解きで同じ表を何度も数えない：状態を運ぶ操作を k 段つないだ鎖（表 1 つ約 2.5 MB）の範囲の
+/// 描画の見積もりは、段の数にほぼ比例して増える（上流の表を下流の入れ子ごとに数え直すと、深さで倍々になる。見直しで
+/// 見つけた。M17 段 1）。
+#[test]
+fn nested_estimates_grow_linearly() {
+    use kura_engine::analysis::Analysis;
+    use kura_engine::testing::stateful::Iir1State;
+    let engine = engine();
+    let input = noise(1, 40 * C, 11);
+    let p = |i: usize| params(0.3 + i as f64 / 50.0, -0.6, 8_000, false, C);
+    let table = Iir1State::estimate(&p(0).state(), &input.shape()).bytes;
+    assert!(table > 2 << 20, "{table}");
+    let peaks: Vec<u64> = (1..=7)
+        .map(|k| {
+            let iirs: Vec<Iir1Params> = (0..k).map(p).collect();
+            let g = chain(&[("audio.gain", json!({ "db": -2.0 }))], &iirs);
+            let plan = compile(&engine, &g, &input);
+            let spec = EstimateSpec::new(4)
+                .all_inputs(&plan, Source::Held)
+                .area(OutputId(0), Area::span(20 * C, 21 * C));
+            engine.estimate(&plan, &spec, None).unwrap().peak
+        })
+        .collect();
+    // 1 段ふやすごとの増え方は、表 1 つと窓（16 チャンク）の値の分くらいで、深さによらない
+    let step = 2 * table + 2 * 16 * C * 4 * 4;
+    for w in peaks.windows(2) {
+        assert!(w[1] <= w[0] + step, "{peaks:?}（1 段で {step} まで）");
+    }
 }
 
 /// 測り（M17 段 1。`--release -- --ignored --nocapture`、長さは `KURA_STATEFUL_SECS`（既定 300 秒））：48 kHz ステレオの合成の

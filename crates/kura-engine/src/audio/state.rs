@@ -426,24 +426,31 @@ impl TableBuilder {
         let w = self.machine.lane_width();
         let flags = par_blocks(self.lanes.len(), cx.mon, |lane| {
             let chans = &planes[lane * w..(lane + 1) * w];
-            let mut clean: Vec<Vec<f32>> = Vec::with_capacity(w);
+            // 有限でない標本を 0 にした写しは BLOCK ずつ（窓まるごとは写さない）
+            let mut clean: Vec<Vec<f32>> = (0..w)
+                .map(|_| crate::codec::try_vec(m.min(BLOCK), 0f32))
+                .collect::<Result<_, _>>()?;
             let mut bad = false;
-            for p in chans {
-                let mut c = crate::codec::try_vec(p.len(), 0f32)?;
-                for (o, x) in c.iter_mut().zip(p.iter()) {
-                    if x.is_finite() {
-                        *o = *x;
-                    } else {
-                        bad = true;
-                    }
-                }
-                clean.push(c);
-            }
-            let refs: Vec<&[f32]> = clean.iter().map(Vec::as_slice).collect();
             let mut lb = self.lanes[lane]
                 .lock()
                 .map_err(|_| EngineError::Internal("状態の表の作りかけの錠が壊れました".into()))?;
-            self.consume(lane, &mut lb, start, Some(&refs), m)?;
+            let mut t = 0usize;
+            while t < m {
+                let n = (m - t).min(BLOCK);
+                for (c, p) in clean.iter_mut().zip(chans) {
+                    for (o, x) in c[..n].iter_mut().zip(&p[t..t + n]) {
+                        if x.is_finite() {
+                            *o = *x;
+                        } else {
+                            *o = 0.0;
+                            bad = true;
+                        }
+                    }
+                }
+                let refs: Vec<&[f32]> = clean.iter().map(|c| &c[..n]).collect();
+                self.consume(lane, &mut lb, start + t as u64, Some(&refs), n)?;
+                t += n;
+            }
             Ok(bad)
         })?;
         self.non_finite |= flags.into_iter().any(|b| b);
@@ -668,15 +675,17 @@ pub struct StatefulKernel {
 }
 
 impl StatefulKernel {
-    /// 核を作る。表の形（格子の数・組・状態の語・先読み・長さ）が処理と入力に合わなければ `Internal`（申告と使い方の
-    /// 食い違い・偽の値の誤り）。
+    /// 核を作る。表の形（格子・格子の数・組・状態の語・先読み・長さ）が、申告した格子 `grid`・処理・入力に合わなければ
+    /// `Internal`（申告と使い方の食い違い・偽の値の誤り。格子が違うと `Aligned` の申告の外を読むので断る）。
     pub fn new(
         machine: Arc<dyn Stateful>,
+        grid: u64,
         table: Arc<StateTable>,
         input: Arc<Audio>,
     ) -> Result<Self, EngineError> {
         let lanes = lane_count(machine.as_ref())?;
-        if input.channels() != machine.channels()
+        if table.grid() != grid.max(1)
+            || input.channels() != machine.channels()
             || table.frames() != input.frames() as u64
             || table.lanes() != lanes
             || table.state_len() != machine.state_len()
@@ -744,6 +753,15 @@ impl StatefulKernel {
     /// 組 `lane` の出力 [a, a + m) を描く（`outs` は組のチャンネルの順・長さ m）。
     fn draw(&self, lane: usize, a: u64, outs: &mut [&mut [f32]]) -> Result<(), EngineError> {
         let m = outs.first().map_or(0, |o| o.len());
+        let slot = self
+            .memo
+            .get(lane)
+            .ok_or_else(|| EngineError::Internal(format!("核に組 {lane} はありません")))?;
+        if outs.len() != self.machine.lane_width() || outs.iter().any(|o| o.len() != m) {
+            return Err(EngineError::Internal(
+                "組の出力の数が幅と違うか、長さがそろっていません".into(),
+            ));
+        }
         if m == 0 {
             return Ok(());
         }
@@ -753,7 +771,7 @@ impl StatefulKernel {
             .ok_or_else(|| EngineError::Internal("核の区間が長さを超えています".into()))?;
         let (g, after) = (self.table.grid(), self.table.after());
         // 覚えを取り出す（錠は計算の間は持たない。壊れていれば覚えなし）
-        let mut memo = match self.memo[lane].lock() {
+        let mut memo = match slot.lock() {
             Ok(mut slot) => slot.take(),
             Err(_) => None,
         };
@@ -804,7 +822,7 @@ impl StatefulKernel {
             }
         }
         if let Some((interval, end)) = last
-            && let Ok(mut slot) = self.memo[lane].lock()
+            && let Ok(mut slot) = slot.lock()
         {
             *slot = Some(Memo { interval, end, st });
         }
@@ -831,6 +849,11 @@ impl AudioKernel for StatefulKernel {
 
     fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
         let w = self.machine.lane_width();
+        if ch >= self.input.channels() {
+            return Err(EngineError::Internal(format!(
+                "核にチャンネル {ch} はありません"
+            )));
+        }
         let (lane, at) = (ch / w, ch % w);
         if w == 1 {
             return self.draw(lane, start, &mut [out]);
@@ -858,9 +881,6 @@ impl AudioKernel for StatefulKernel {
         start: u64,
         outs: &mut [&mut [f32]],
     ) -> Result<(), EngineError> {
-        if outs.len() != self.machine.lane_width() {
-            return Err(EngineError::Internal("組の出力の数が幅と違います".into()));
-        }
         self.draw(lane, start, outs)
     }
 }
@@ -936,7 +956,7 @@ mod tests {
             p.wet,
             crate::math::db_to_gain(p.gain_db),
         );
-        StatefulKernel::new(Arc::new(m), t, a.clone()).unwrap()
+        StatefulKernel::new(Arc::new(m), p.grid, t, a.clone()).unwrap()
     }
 
     /// 区間を `spans` の順に描いて、全体の平面にする（チャンネルごとに `render` で）。
@@ -1151,7 +1171,7 @@ mod tests {
             StateTable::from_canonical(&odd),
             Err(EngineError::Decode { .. })
         ));
-        let k = StatefulKernel::new(Arc::new(Poison), Arc::new(t), a.clone()).unwrap();
+        let k = StatefulKernel::new(Arc::new(Poison), 100, Arc::new(t), a.clone()).unwrap();
         let whole = bits(&draw(&k, &[(0, 300)]));
         let ones: Vec<(u64, u64)> = (0..300).map(|s| (s, s + 1)).collect();
         assert_eq!(bits(&draw(&k, &ones)), whole);
@@ -1272,9 +1292,24 @@ mod tests {
         assert_eq!(t.entries(), 1);
         let a = noise(8_000, 2, 21, 1);
         assert!(matches!(
-            StatefulKernel::new(m(), Arc::new(t), a),
+            StatefulKernel::new(m(), 100, Arc::new(t.clone()), a),
             Err(EngineError::Internal(_))
         ));
+        // 申告した格子と表の格子が違えば断る（Aligned の申告の外を読まない）
+        let a20 = noise(8_000, 2, 20, 1);
+        assert!(StatefulKernel::new(m(), 100, Arc::new(t.clone()), a20.clone()).is_ok());
+        assert!(matches!(
+            StatefulKernel::new(m(), 50, Arc::new(t), a20.clone()),
+            Err(EngineError::Internal(_))
+        ));
+        // 範囲の外の組・チャンネル、そろっていない出力は誤り（panic しない）
+        let p100 = params(0, false, 100);
+        let k = kernel(&p100, &a20, table(&p100, &a20));
+        let mut x = [0f32; 4];
+        let mut y = [0f32; 3];
+        assert!(k.render(2, 0, &mut x).is_err());
+        assert!(k.render_lane(5, 0, &mut [&mut x[..]]).is_err());
+        assert!(k.render_lane(0, 0, &mut [&mut x[..], &mut y[..]]).is_err());
         struct Odd;
         impl Stateful for Odd {
             fn channels(&self) -> usize {

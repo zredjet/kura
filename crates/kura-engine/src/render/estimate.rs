@@ -313,17 +313,20 @@ struct RegionCost {
     bytes: BTreeMap<NodeId, u64>,
     /// 流し解きの量（入力のポートを窓で描いて流す間の最大 ＋ 解析の結果。核で描く間の量との大きいほうを数える）。
     presolve: BTreeMap<NodeId, u64>,
-    /// 流し解きで解いた結果のうち、描画の終わりまで持つもの（`Presolved` が持つ。M17 段 1）：このノードの解析の結果と、
-    /// その流し解きの中で解いた上流の結果（入れ子）。このノードを描いたあとの段に足し続ける。
-    held: BTreeMap<NodeId, u64>,
-    /// 上のうち、上流の結果（入れ子）。このノードを描く間にも生きている（このノードの結果は作業領域に数える）。
-    held_inner: BTreeMap<NodeId, u64>,
+    /// 描いたノードが解いて、描画の終わりまで持つ解析の結果（範囲の描画の中の表 `Presolved` が持つ。M17 段 1）：このノードの
+    /// 申告の結果と、その流し解きの中で解いた上流の結果（入れ子）。`render_stage` は鍵ごとに 1 度だけ数え、このノードを
+    /// 描いたあとの段に足し続ける（上流の結果は、このノードを描く間にも生きている）。
+    held: BTreeMap<NodeId, Held>,
 }
 
-/// 流し解きの見積もりの覚え（上流のポートのノード, 長さ）→（窓を描いて流す間の最大, その中で解いた結果の和）。流し解きは
+/// 描画の終わりまで持つ解析の結果：（解析するノード, 申告の番号）→ 結果の見積もりのバイト数。同じ表は同じ鍵になるので、
+/// 入れ子の流し解きで何度出てきても 1 度だけ数える（M17 段 1）。
+type Held = BTreeMap<(NodeId, usize), u64>;
+
+/// 流し解きの見積もりの覚え（上流のポートのノード, 長さ）→（窓を描いて流す間の最大, その中で解いて持つ結果）。流し解きは
 /// 上流のポートの全体を流すので、外の窓によらない。入れ子の鎖で同じポートを何度も数えないようにする（k 段で 3^k 回に
 /// ならない。M17 段 1）。
-type PresolveMemo = BTreeMap<(NodeId, u64), (u64, u64)>;
+type PresolveMemo = BTreeMap<(NodeId, u64), (u64, Held)>;
 
 /// キャッシュに当たるもの（描かないノードと、量子化した出力の番号）。
 #[derive(Default)]
@@ -607,6 +610,8 @@ impl Engine {
         let mut shapes: BTreeMap<NodeId, Shape> = BTreeMap::new();
         let mut node_buf: BTreeMap<NodeId, usize> = BTreeMap::new();
         let mut nodes = Vec::with_capacity(plan.nodes.len());
+        // 描画の終わりまで持つ解析の結果のうち、もう数えたもの（同じ表を 2 度数えない）
+        let mut counted: BTreeSet<(NodeId, usize)> = BTreeSet::new();
         let buf_of = |node_buf: &BTreeMap<NodeId, usize>, r: &PortRef| match r {
             PortRef::Input { id } => input_buf.get(id).copied(),
             PortRef::Node { id } => node_buf.get(id).copied(),
@@ -619,9 +624,10 @@ impl Engine {
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| EngineError::Internal("ノードの入力の形がありません".into()))?;
             let hit = node.enabled && hits.nodes.contains(&node.id);
-            let (value, work, presolve, held, inner) = match region {
-                _ if !node.enabled || hit => (0, 0, 0, 0, 0),
-                Some(rc) if !rc.drawn.contains(&node.id) => (0, 0, 0, 0, 0),
+            let empty = Held::new();
+            let (value, work, presolve, held) = match region {
+                _ if !node.enabled || hit => (0, 0, 0, &empty),
+                Some(rc) if !rc.drawn.contains(&node.id) => (0, 0, 0, &empty),
                 Some(rc) => (
                     rc.bytes
                         .get(&node.id)
@@ -629,17 +635,20 @@ impl Engine {
                         .unwrap_or_else(|| node.inferred.shape.value_bytes()),
                     self.node_work(node, &in_shapes, tasks)?,
                     rc.presolve.get(&node.id).copied().unwrap_or(0),
-                    rc.held.get(&node.id).copied().unwrap_or(0),
-                    rc.held_inner.get(&node.id).copied().unwrap_or(0),
+                    rc.held.get(&node.id).unwrap_or(&empty),
                 ),
                 None => (
                     node.inferred.shape.value_bytes(),
                     self.node_work(node, &in_shapes, tasks)?,
                     0,
-                    0,
-                    0,
+                    &empty,
                 ),
             };
+            // 流し解きの中で解いた上流の結果で、まだ数えていないもの（このノードの結果は作業領域に数えてある）
+            let inner = held
+                .iter()
+                .filter(|(k, _)| k.0 != node.id && !counted.contains(k))
+                .fold(0u64, |a, (_, b)| a.saturating_add(*b));
             // 流し解きは核で描く前に終わる（入力の窓を流す間の最大と、描く間の最大の大きいほう）。描く間も、流し解きの中で
             // 解いた上流の結果は生きている
             let at = ledger.live.saturating_add(
@@ -670,9 +679,15 @@ impl Engine {
                     ledger.release(*b);
                 }
             }
-            // 流し解きで解いた結果は描画の終わりまで持つ（落とさない）
-            if held > 0 {
-                ledger.add(held);
+            // 解いた結果は描画の終わりまで持つ（落とさない。鍵ごとに 1 度だけ）
+            let mut keep = 0u64;
+            for (k, b) in held {
+                if counted.insert(*k) {
+                    keep = keep.saturating_add(*b);
+                }
+            }
+            if keep > 0 {
+                ledger.add(keep);
             }
             nodes.push(NodeEstimate {
                 id: node.id,
@@ -803,6 +818,22 @@ impl Engine {
             };
             complete.insert(node.id, c);
         }
+        // 描くノードが解く申告の結果は、どの道（流し解き・値に当てる・全体で描く）でもこの描画の表に入り、終わりまで持つ
+        for id in &rc.drawn {
+            let Some(node) = index.get(id).filter(|n| n.enabled) else {
+                continue;
+            };
+            for (k, need) in node.needs.iter().enumerate() {
+                let Some(shape) = node.inputs.get(need.input).and_then(|r| shapes.port(r)) else {
+                    continue;
+                };
+                let bytes = self
+                    .solvable(need)?
+                    .estimate(&need.params, &shape)
+                    .map_or(0, |e| e.bytes);
+                rc.held.entry(*id).or_default().insert((*id, k), bytes);
+            }
+        }
         for (id, rounded) in &walk.regional {
             let Some(node) = index.get(id) else { continue };
             let Shape::Audio {
@@ -823,7 +854,8 @@ impl Engine {
                 frames.saturating_mul(u64::from(channels)).saturating_mul(4),
             );
             // 流し解き：入力が部分の値で、解析がキャッシュにないもの
-            let (mut extra, mut held, mut held_inner) = (0u64, 0u64, 0u64);
+            let mut extra = 0u64;
+            let mut inner_all = Held::new();
             for need in &node.needs {
                 let Some(r) = node.inputs.get(need.input) else {
                     continue;
@@ -863,7 +895,7 @@ impl Engine {
                     .solvable(need)?
                     .estimate(&need.params, &in_shape)
                     .map_or(0, |e| e.bytes);
-                let (window, inner_held) = match (r, in_shape) {
+                let (window, inner_held): (u64, Held) = match (r, in_shape) {
                     (
                         PortRef::Node { id: up },
                         Shape::Audio {
@@ -872,11 +904,11 @@ impl Engine {
                         },
                     ) if depth < plan.nodes.len() => {
                         if let Some(known) = memo.get(&(*up, m)) {
-                            *known
+                            known.clone()
                         } else {
                             // 窓 0 の区間だけでは窓ごとの最大にならない（縮めるリサンプルでは、間の窓が上流のノードごとに
                             // 1 チャンク多く掛かる）ので、どの窓でも超えない数え方（`stream_windows_bound`）の最大
-                            let (mut most, mut inner_held) = (0u64, 0u64);
+                            let (mut most, mut inner_held) = (0u64, Held::new());
                             for (window, pad) in stream_windows_bound(m) {
                                 let inner = self.region_cost(
                                     plan,
@@ -903,26 +935,34 @@ impl Engine {
                                     )?
                                     .0;
                                 most = most.max(at);
-                                inner_held = inner_held.max(
-                                    inner.held.values().fold(0u64, |a, b| a.saturating_add(*b)),
-                                );
+                                for set in inner.held.values() {
+                                    for (k, b) in set {
+                                        let e = inner_held.entry(*k).or_insert(0);
+                                        *e = (*e).max(*b);
+                                    }
+                                }
                             }
-                            memo.insert((*up, m), (most, inner_held));
+                            memo.insert((*up, m), (most, inner_held.clone()));
                             (most, inner_held)
                         }
                     }
-                    _ => (0, 0),
+                    _ => (0, Held::new()),
                 };
                 extra = extra.saturating_add(window).saturating_add(result);
-                held = held.saturating_add(result).saturating_add(inner_held);
-                held_inner = held_inner.saturating_add(inner_held);
+                for (k, b) in inner_held {
+                    let e = inner_all.entry(k).or_insert(0);
+                    *e = (*e).max(b);
+                }
             }
             if extra > 0 {
                 rc.presolve.insert(*id, extra);
             }
-            if held > 0 {
-                rc.held.insert(*id, held);
-                rc.held_inner.insert(*id, held_inner);
+            if !inner_all.is_empty() {
+                let set = rc.held.entry(*id).or_default();
+                for (k, b) in inner_all {
+                    let e = set.entry(k).or_insert(0);
+                    *e = (*e).max(b);
+                }
             }
         }
         Ok(rc)

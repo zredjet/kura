@@ -979,7 +979,6 @@ fn anchor_seeds(image: &Value, frames: &Value, audio: &Value) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// 波形の段のバイナリの種：5 段・一部の段・1 段・長さ 0。
 /// 状態の表の種：試験の操作（`test.iir1`）の表の解析の例（先読み・リンク・格子の違い・NaN の旗）の正規の形。
 fn state_table_seeds() -> Vec<Vec<u8>> {
     use kura_engine::analysis::{Analysis, AnalysisOutput, AnalyzeCx};
@@ -1006,6 +1005,7 @@ fn state_table_seeds() -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// 波形の段のバイナリの種：5 段・一部の段・1 段・長さ 0。
 fn peak_seeds() -> Vec<Vec<u8>> {
     let engine = kura_engine::Engine::new().unwrap();
     let audio = |frames, channels| {

@@ -428,6 +428,7 @@ impl Iir1Op {
         );
         Ok(Box::new(StatefulKernel::new(
             Arc::new(m),
+            p.grid,
             table,
             audio.clone(),
         )?))
