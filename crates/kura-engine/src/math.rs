@@ -14,6 +14,11 @@ pub fn exp(x: f64) -> f64 {
     libm::exp(x)
 }
 
+/// e の x 乗 − 1（x が 0 に近くても桁落ちしない。イコライザの極の 1 − r。M17 段 2）。
+pub fn expm1(x: f64) -> f64 {
+    libm::expm1(x)
+}
+
 /// 自然対数。
 pub fn ln(x: f64) -> f64 {
     libm::log(x)

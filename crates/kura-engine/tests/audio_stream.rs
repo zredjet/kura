@@ -820,6 +820,8 @@ fn audio_analyses(engine: &Engine) -> Vec<std::sync::Arc<dyn kura_engine::analys
         "audio.loudness_gating",
         // M17 段 1：状態の表（試験の操作のもの。内部用でカタログに出ない）
         kura_engine::testing::stateful::STATE_ID,
+        // M17 段 2：イコライザの状態の表（内部用でカタログに出ないので、下の見張りでは気づけない）
+        "audio.eq_state",
     ];
     let all: Vec<_> = ids
         .iter()

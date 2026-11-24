@@ -137,6 +137,11 @@ pub struct Band {
 }
 
 impl Band {
+    /// 段を作らないバンド（オフ・0 dB のベル・シェルフ・チルト）。推論の扱いで飛ばし、状態の表の引数にも入れない。
+    pub fn is_inert(&self) -> bool {
+        !self.enabled || (self.kind.has_gain() && self.gain_db == 0.0)
+    }
+
     /// この型の 2 次の段の数（カットの 1 次の段も 1 段）。
     pub fn sections(&self) -> usize {
         match self.kind {
@@ -294,7 +299,7 @@ pub fn resolve(p: &EqParams, rate: u32, channels: usize) -> Result<Resolved, Iss
     };
     let mut errors = Issues::none();
     for (index, b) in p.bands.iter().enumerate() {
-        if !b.enabled || (b.kind.has_gain() && b.gain_db == 0.0) {
+        if b.is_inert() {
             continue;
         }
         let mut f = b.freq;
@@ -1023,6 +1028,53 @@ mod tests {
         // 0 dB のベル・オフのバンドは段を作らない
         let r = resolve(&p(band(Bell, 1_000.0, 0.0, 1.0)), 48_000, 2).unwrap();
         assert!(r.bands.is_empty() && r.warnings.is_empty());
+        let mut off = band(Bell, 1_000.0, 6.0, 1.0);
+        off.enabled = false;
+        let r = resolve(&p(off), 48_000, 2).unwrap();
+        assert!(r.bands.is_empty() && r.warnings.is_empty());
+        // チャンネルの行き先：モノラルは L・R・M をすべてに、S は外す。ステレオは L・R を 1・2 チャンネル目に、M/S は
+        // M/S の領域に。3 チャンネル以上は L・R を 1・2 チャンネル目に、M/S は外す。
+        let to = |ch: BandChannel, channels: usize| {
+            let mut b = band(Bell, 1_000.0, 3.0, 1.0);
+            b.channel = ch;
+            let r = resolve(&p(b), 48_000, channels).unwrap();
+            (
+                r.bands.first().map(|b| b.target),
+                r.warnings.first().map(|w| w.code),
+            )
+        };
+        use BandChannel as C;
+        let dropped = (None, Some(IssueCode::BandDropped));
+        for (ch, mono, stereo, three) in [
+            (
+                C::All,
+                Some(Target::All),
+                Some(Target::All),
+                Some(Target::All),
+            ),
+            (
+                C::Left,
+                Some(Target::All),
+                Some(Target::Channel(0)),
+                Some(Target::Channel(0)),
+            ),
+            (
+                C::Right,
+                Some(Target::All),
+                Some(Target::Channel(1)),
+                Some(Target::Channel(1)),
+            ),
+            (C::Mid, Some(Target::All), Some(Target::Mid), None),
+            (C::Side, None, Some(Target::Side), None),
+        ] {
+            for (channels, want) in [(1, mono), (2, stereo), (3, three), (6, three)] {
+                let got = to(ch, channels);
+                match want {
+                    Some(t) => assert_eq!(got, (Some(t), None), "{ch:?} {channels}"),
+                    None => assert_eq!(got, dropped, "{ch:?} {channels}"),
+                }
+            }
+        }
     }
 
     /// 素朴な参照：バンドごと・チャンネルごとに、1 標本ずつ DF-I を回す（M/S は毎標本で変換し直す形でなく、核と同じ
