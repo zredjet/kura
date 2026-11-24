@@ -6,6 +6,8 @@
 # - 全部のテストは手で起こすときだけ（Actions の「Run workflow」か `gh workflow run ci.yml --ref <ブランチ>`）：ubuntu で
 #   kura-engine・kura-core・vorbis-tables、macOS で Swift ヘルパーを含むクレートと、ffmpeg の段の実物のテスト（Homebrew の ffmpeg）。
 #   Linux・macOS とも、同じ分け方の 4 つの段に分けて並べて回す（ADR-212・ADR-214）。
+# - 手で起こすときに `measure` を渡すと、x86_64 の Linux で release の測り（`#[ignore]` のテスト。名前の絞り込み）も回す
+#   （`gh workflow run ci.yml --ref <ブランチ> -f measure=stateful::eq_subnormal_timings`。M17 段 2 のサブノーマルの測り）。
 # src-tauri はフロントのビルドが要るので、どちらでも回さない。
 name: CI
 
@@ -13,6 +15,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      measure:
+        description: 測り（release で回す `#[ignore]` のテストの名前の絞り込み。空なら回さない）
+        required: false
+        default: ''
 
 # 同じブランチ（PR）の同じきっかけの古い実行は取り消す（手で起こした全部の実行は、push で取り消さない）
 concurrency:
@@ -134,6 +141,26 @@ jobs:
           cargo test -p vorbis-tables
           cargo test -p kura-engine --lib "${tests[@]}"
           cargo test -p kura-engine --doc
+
+  measure:
+    name: 測り（Linux x86_64）
+    if: github.event_name == 'workflow_dispatch' && inputs.measure != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: measure
+      - name: 測り（release・--ignored）
+        env:
+          MEASURE: ${{ inputs.measure }}
+        run: |
+          uname -m
+          cargo test --release -p kura-engine --test suite -- --ignored --nocapture "$MEASURE"
 
   macos:
     name: 全部（macOS ${{ matrix.part }}）

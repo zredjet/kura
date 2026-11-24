@@ -580,24 +580,76 @@ fn stateful_chain_timings() {
 }
 
 /// 測り（M17 段 2 の F6。`--release -- --ignored --nocapture`）：48 kHz ステレオの短い音声（5・10・20・40 秒）に `audio.eq`
-/// （2 次の段 8 と 24）をかけ、バンドの利得を 1 手変えたときの表示（全体。短い音声のエディタの道）の時間。手ごとに状態の表を
-/// 流し直す（入力の全体を 1 回）ので、手間（段 × フレーム）に比例する。中央値（5 回）。
+/// （2 次の段 1・8・24・48 と、8 段を M/S に当てたもの（組の幅 2））をかけ、バンドの利得を 1 手変えたときの表示（全体。短い
+/// 音声のエディタの道）の時間。手ごとに状態の表を流し直す（入力の全体を 1 回）ので、手間（段 × フレーム）に比例する。
+/// 中央値（5 回）。
 #[test]
 #[ignore = "測り（--release -- --ignored --nocapture）"]
 fn eq_step_timings() {
     #![allow(clippy::disallowed_methods)]
-    use kura_engine::ops::audio::eq::{BandType, EqParams, Phase, band};
+    use kura_engine::ops::audio::eq::{Band, BandChannel, BandType, EqParams, Phase, band};
     let engine = engine();
-    let bells = |n: usize, gain: f64| -> Vec<kura_engine::ops::audio::eq::Band> {
-        [
-            60.0, 120.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0,
-        ]
-        .iter()
-        .take(n)
-        .enumerate()
-        .map(|(i, f)| band(BandType::Bell, *f, gain - i as f64 * 0.5, 1.2))
-        .collect()
+    const FREQS: [f64; 16] = [
+        60.0, 90.0, 120.0, 180.0, 250.0, 350.0, 500.0, 700.0, 1_000.0, 1_400.0, 2_000.0, 2_800.0,
+        4_000.0, 5_600.0, 8_000.0, 11_000.0,
+    ];
+    let bells = |n: usize, gain: f64| -> Vec<Band> {
+        FREQS
+            .iter()
+            .step_by(16 / n.max(1))
+            .take(n)
+            .enumerate()
+            .map(|(i, f)| band(BandType::Bell, *f, gain - i as f64 * 0.5, 1.2))
+            .collect()
     };
+    let cuts = |n: usize| -> Vec<Band> {
+        (0..n)
+            .map(|i| {
+                let low = i % 2 == 0;
+                let mut c = band(
+                    if low {
+                        BandType::LowCut
+                    } else {
+                        BandType::HighCut
+                    },
+                    if low {
+                        30.0 + i as f64
+                    } else {
+                        16_000.0 - i as f64
+                    },
+                    0.0,
+                    0.7,
+                );
+                c.slope = 96;
+                c
+            })
+            .collect()
+    };
+    // （名前, 段を作る）
+    type Make = Box<dyn Fn(f64) -> Vec<Band>>;
+    let cases: Vec<(&str, Make)> = vec![
+        ("段 1", Box::new(move |g| bells(1, g))),
+        ("段 8", Box::new(move |g| bells(8, g))),
+        ("段 24", Box::new(move |g| [bells(8, g), cuts(2)].concat())),
+        ("段 48", Box::new(move |g| [bells(16, g), cuts(4)].concat())),
+        (
+            "段 8・M/S",
+            Box::new(move |g| {
+                bells(8, g)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut b)| {
+                        b.channel = if i % 2 == 0 {
+                            BandChannel::Mid
+                        } else {
+                            BandChannel::Side
+                        };
+                        b
+                    })
+                    .collect()
+            }),
+        ),
+    ];
     for secs in [5u64, 10, 20, 40] {
         let input = InputGen::AudioNoise {
             rate: 48_000,
@@ -607,27 +659,10 @@ fn eq_step_timings() {
         }
         .generate()
         .unwrap();
-        for sections in [8usize, 24] {
+        for (name, make) in &cases {
             let doc = |gain: f64| {
-                let mut b = bells(8, gain);
-                if sections == 24 {
-                    for kind in [BandType::LowCut, BandType::HighCut] {
-                        let mut c = band(
-                            kind,
-                            if kind == BandType::LowCut {
-                                30.0
-                            } else {
-                                16_000.0
-                            },
-                            0.0,
-                            0.7,
-                        );
-                        c.slope = 96;
-                        b.push(c);
-                    }
-                }
                 let p = EqParams {
-                    bands: b,
+                    bands: make(gain),
                     phase: Phase::Minimum,
                     gain_db: 0.0,
                 };
@@ -666,8 +701,129 @@ fn eq_step_timings() {
             }
             times.sort_by(f64::total_cmp);
             eprintln!(
-                "{secs} 秒・段 {sections}：1 手 {:.1} ms（中央値。最小 {:.1}・最大 {:.1}）",
+                "{secs} 秒・{name}：1 手 {:.1} ms（中央値。最小 {:.1}・最大 {:.1}）",
                 times[2], times[0], times[4]
+            );
+        }
+    }
+}
+
+/// 測り（M17 段 2 の F5。`--release -- --ignored --nocapture`、長さは `KURA_SUBNORMAL_SECS`（既定 600 秒））：`audio.eq` の状態
+/// 機械（`EqMachine`。表の流しと核の中身）を 48 kHz モノラルで、「信号 2 秒のあと無音」「ずっと信号（雑音）」「ずっと無音」に
+/// 通し、標本あたりの時間と、格子（`STATE_GRID`）の境で状態にサブノーマル（と 2⁻¹⁰⁰⁰ 未満の 0 でない値）があった格子の数を
+/// 出す。EQ は 2 つ：遅い極を頭に置いたもの（20 Hz・Q 18 のベル。減衰が遅く、サブノーマルまで約 400 秒）と、速く減るもの
+/// （30 Hz の 48 dB/oct のローカット・100 Hz のベル・10 kHz のハイカット。約 20 秒）。x86_64 ではサブノーマルの演算が遅い
+/// ので、その差を CI の手で起こす測り（`measure`）で見る。
+#[test]
+#[ignore = "測り（--release -- --ignored --nocapture）"]
+fn eq_subnormal_timings() {
+    #![allow(clippy::disallowed_methods)]
+    use kura_engine::audio::state::{STATE_GRID, Stateful};
+    use kura_engine::ops::audio::eq::{Band, BandType, EqMachine, EqParams, Phase, band, resolve};
+    const RATE: u32 = 48_000;
+    let secs: usize = std::env::var("KURA_SUBNORMAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let n = secs * RATE as usize;
+    if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo")
+        && let Some(line) = info.lines().find(|l| l.starts_with("model name"))
+    {
+        eprintln!("{line}");
+    }
+    let cut = |kind, freq, slope| -> Band {
+        let mut b = band(kind, freq, 0.0, std::f64::consts::FRAC_1_SQRT_2);
+        b.slope = slope;
+        b
+    };
+    let configs: [(&str, Vec<Band>); 2] = [
+        (
+            "遅い極が頭",
+            vec![
+                band(BandType::Bell, 20.0, 12.0, 18.0),
+                band(BandType::Bell, 100.0, 6.0, 4.0),
+                band(BandType::LowShelf, 30.0, 6.0, 4.0),
+                band(BandType::Bell, 1_000.0, -3.0, 2.0),
+                cut(BandType::LowCut, 30.0, 48),
+                cut(BandType::HighCut, 10_000.0, 24),
+            ],
+        ),
+        (
+            "速く減る",
+            vec![
+                cut(BandType::LowCut, 30.0, 48),
+                band(BandType::Bell, 100.0, 6.0, 4.0),
+                band(BandType::Bell, 1_000.0, -3.0, 2.0),
+                cut(BandType::HighCut, 10_000.0, 24),
+            ],
+        ),
+    ];
+    // 雑音（xorshift。-0.5〜0.5）
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let noise: Vec<f32> = (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        })
+        .collect();
+    let signal_frames = 2 * RATE as usize;
+    let inputs: [(&str, Vec<f32>); 3] = [
+        (
+            "信号 2 秒のあと無音",
+            noise
+                .iter()
+                .enumerate()
+                .map(|(i, x)| if i < signal_frames { *x } else { 0.0 })
+                .collect(),
+        ),
+        ("ずっと信号", noise.clone()),
+        ("ずっと無音", vec![0.0; n]),
+    ];
+    let tiny = f64::from_bits(((1023 - 1000) as u64) << 52); // 2⁻¹⁰⁰⁰
+    let grid = STATE_GRID as usize;
+    let grids = n.div_ceil(grid);
+    let mut out = vec![0.0f32; grid];
+    for (cname, bands) in &configs {
+        let p = EqParams {
+            bands: bands.clone(),
+            phase: Phase::Minimum,
+            gain_db: 0.0,
+        };
+        let r = resolve(&p, RATE, 1).unwrap();
+        let m = EqMachine::new(&r, 1, 1.0);
+        for (iname, input) in &inputs {
+            let mut st = vec![0.0; m.state_len()];
+            m.init(0, &mut st);
+            let (mut sub, mut small) = (0usize, 0usize);
+            let (mut sub_ns, mut other_ns, mut first) = (0.0f64, 0.0f64, None);
+            let t_all = std::time::Instant::now();
+            for (k, a) in (0..n).step_by(grid).enumerate() {
+                let b = (a + grid).min(n);
+                let had = st.iter().any(|x| *x != 0.0 && x.abs() < f64::MIN_POSITIVE);
+                small += usize::from(st.iter().any(|x| *x != 0.0 && x.abs() < tiny));
+                let t = std::time::Instant::now();
+                let mut o: [&mut [f32]; 1] = [&mut out[..b - a]];
+                m.run(0, &mut st, a as u64, &[&input[a..b]], Some(&mut o));
+                let ns = t.elapsed().as_secs_f64() * 1e9;
+                if had {
+                    sub += 1;
+                    sub_ns += ns;
+                    first.get_or_insert(k);
+                } else {
+                    other_ns += ns;
+                }
+            }
+            let all = t_all.elapsed().as_secs_f64();
+            let per = |ns: f64, g: usize| if g == 0 { 0.0 } else { ns / (g * grid) as f64 };
+            eprintln!(
+                "{cname}・{iname}：全体 {all:.2} 秒（{:.1} ns / 標本、段 {}）。頭にサブノーマルのある格子 {sub} / {grids}\
+                 （最初 {first:?}）・2⁻¹⁰⁰⁰ 未満のある格子 {small}：サブノーマルの格子 {:.1} ns / 標本、ほか {:.1} ns / 標本",
+                all * 1e9 / n as f64,
+                m.state_len() / 4,
+                per(sub_ns, sub),
+                per(other_ns, grids - sub),
             );
         }
     }
