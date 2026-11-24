@@ -313,7 +313,17 @@ struct RegionCost {
     bytes: BTreeMap<NodeId, u64>,
     /// 流し解きの量（入力のポートを窓で描いて流す間の最大 ＋ 解析の結果。核で描く間の量との大きいほうを数える）。
     presolve: BTreeMap<NodeId, u64>,
+    /// 流し解きで解いた結果のうち、描画の終わりまで持つもの（`Presolved` が持つ。M17 段 1）：このノードの解析の結果と、
+    /// その流し解きの中で解いた上流の結果（入れ子）。このノードを描いたあとの段に足し続ける。
+    held: BTreeMap<NodeId, u64>,
+    /// 上のうち、上流の結果（入れ子）。このノードを描く間にも生きている（このノードの結果は作業領域に数える）。
+    held_inner: BTreeMap<NodeId, u64>,
 }
+
+/// 流し解きの見積もりの覚え（上流のポートのノード, 長さ）→（窓を描いて流す間の最大, その中で解いた結果の和）。流し解きは
+/// 上流のポートの全体を流すので、外の窓によらない。入れ子の鎖で同じポートを何度も数えないようにする（k 段で 3^k 回に
+/// ならない。M17 段 1）。
+type PresolveMemo = BTreeMap<(NodeId, u64), (u64, u64)>;
 
 /// キャッシュに当たるもの（描かないノードと、量子化した出力の番号）。
 #[derive(Default)]
@@ -609,9 +619,9 @@ impl Engine {
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| EngineError::Internal("ノードの入力の形がありません".into()))?;
             let hit = node.enabled && hits.nodes.contains(&node.id);
-            let (value, work, presolve) = match region {
-                _ if !node.enabled || hit => (0, 0, 0),
-                Some(rc) if !rc.drawn.contains(&node.id) => (0, 0, 0),
+            let (value, work, presolve, held, inner) = match region {
+                _ if !node.enabled || hit => (0, 0, 0, 0, 0),
+                Some(rc) if !rc.drawn.contains(&node.id) => (0, 0, 0, 0, 0),
                 Some(rc) => (
                     rc.bytes
                         .get(&node.id)
@@ -619,17 +629,25 @@ impl Engine {
                         .unwrap_or_else(|| node.inferred.shape.value_bytes()),
                     self.node_work(node, &in_shapes, tasks)?,
                     rc.presolve.get(&node.id).copied().unwrap_or(0),
+                    rc.held.get(&node.id).copied().unwrap_or(0),
+                    rc.held_inner.get(&node.id).copied().unwrap_or(0),
                 ),
                 None => (
                     node.inferred.shape.value_bytes(),
                     self.node_work(node, &in_shapes, tasks)?,
                     0,
+                    0,
+                    0,
                 ),
             };
-            // 流し解きは核で描く前に終わる（入力の窓を流す間の最大と、描く間の最大の大きいほう）
-            let at = ledger
-                .live
-                .saturating_add(value.saturating_add(work).max(presolve));
+            // 流し解きは核で描く前に終わる（入力の窓を流す間の最大と、描く間の最大の大きいほう）。描く間も、流し解きの中で
+            // 解いた上流の結果は生きている
+            let at = ledger.live.saturating_add(
+                value
+                    .saturating_add(work)
+                    .saturating_add(inner)
+                    .max(presolve),
+            );
             render = render.max(at);
             let buf = if node.enabled {
                 ledger.add(value)
@@ -651,6 +669,10 @@ impl Engine {
                 if let Some(b) = node_buf.get(id) {
                     ledger.release(*b);
                 }
+            }
+            // 流し解きで解いた結果は描画の終わりまで持つ（落とさない）
+            if held > 0 {
+                ledger.add(held);
             }
             nodes.push(NodeEstimate {
                 id: node.id,
@@ -698,6 +720,7 @@ impl Engine {
             tasks,
             0,
             pad,
+            &mut PresolveMemo::new(),
         )?))
     }
 
@@ -715,6 +738,7 @@ impl Engine {
         tasks: u64,
         depth: usize,
         pad: bool,
+        memo: &mut PresolveMemo,
     ) -> Result<RegionCost, EngineError> {
         use crate::value::AUDIO_CHUNK;
         let shapes = super::area::Shapes::of(plan);
@@ -799,7 +823,7 @@ impl Engine {
                 frames.saturating_mul(u64::from(channels)).saturating_mul(4),
             );
             // 流し解き：入力が部分の値で、解析がキャッシュにないもの
-            let mut extra = 0u64;
+            let (mut extra, mut held, mut held_inner) = (0u64, 0u64, 0u64);
             for need in &node.needs {
                 let Some(r) = node.inputs.get(need.input) else {
                     continue;
@@ -839,7 +863,7 @@ impl Engine {
                     .solvable(need)?
                     .estimate(&need.params, &in_shape)
                     .map_or(0, |e| e.bytes);
-                let window = match (r, in_shape) {
+                let (window, inner_held) = match (r, in_shape) {
                     (
                         PortRef::Node { id: up },
                         Shape::Audio {
@@ -847,36 +871,58 @@ impl Engine {
                             ..
                         },
                     ) if depth < plan.nodes.len() => {
-                        // 窓 0 の区間だけでは窓ごとの最大にならない（縮めるリサンプルでは、間の窓が上流のノードごとに
-                        // 1 チャンク多く掛かる）ので、どの窓でも超えない数え方（`stream_windows_bound`）の最大
-                        let mut most = 0u64;
-                        for (window, pad) in stream_windows_bound(m) {
-                            let inner = self.region_cost(
-                                plan,
-                                *up,
-                                window,
-                                hits,
-                                probe,
-                                tasks,
-                                depth + 1,
-                                pad,
-                            )?;
-                            let mut fresh = Ledger::default();
-                            let inputs: BTreeMap<InputId, usize> =
-                                plan.inputs.keys().map(|k| (*k, fresh.add(0))).collect();
-                            let at = self
-                                .render_stage(plan, &mut fresh, &inputs, hits, Some(&inner), tasks)?
-                                .0;
-                            most = most.max(at);
+                        if let Some(known) = memo.get(&(*up, m)) {
+                            *known
+                        } else {
+                            // 窓 0 の区間だけでは窓ごとの最大にならない（縮めるリサンプルでは、間の窓が上流のノードごとに
+                            // 1 チャンク多く掛かる）ので、どの窓でも超えない数え方（`stream_windows_bound`）の最大
+                            let (mut most, mut inner_held) = (0u64, 0u64);
+                            for (window, pad) in stream_windows_bound(m) {
+                                let inner = self.region_cost(
+                                    plan,
+                                    *up,
+                                    window,
+                                    hits,
+                                    probe,
+                                    tasks,
+                                    depth + 1,
+                                    pad,
+                                    memo,
+                                )?;
+                                let mut fresh = Ledger::default();
+                                let inputs: BTreeMap<InputId, usize> =
+                                    plan.inputs.keys().map(|k| (*k, fresh.add(0))).collect();
+                                let at = self
+                                    .render_stage(
+                                        plan,
+                                        &mut fresh,
+                                        &inputs,
+                                        hits,
+                                        Some(&inner),
+                                        tasks,
+                                    )?
+                                    .0;
+                                most = most.max(at);
+                                inner_held = inner_held.max(
+                                    inner.held.values().fold(0u64, |a, b| a.saturating_add(*b)),
+                                );
+                            }
+                            memo.insert((*up, m), (most, inner_held));
+                            (most, inner_held)
                         }
-                        most
                     }
-                    _ => 0,
+                    _ => (0, 0),
                 };
                 extra = extra.saturating_add(window).saturating_add(result);
+                held = held.saturating_add(result).saturating_add(inner_held);
+                held_inner = held_inner.saturating_add(inner_held);
             }
             if extra > 0 {
                 rc.presolve.insert(*id, extra);
+            }
+            if held > 0 {
+                rc.held.insert(*id, held);
+                rc.held_inner.insert(*id, held_inner);
             }
         }
         Ok(rc)

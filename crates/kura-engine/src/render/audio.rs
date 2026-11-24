@@ -268,6 +268,12 @@ impl Engine {
             node_seed(node, &cx.source),
             cx.plan.rules,
         );
+        // 描くチャンクがない（継ぎはぎで前の値とすべて共有する・頼んだ区間がない）ノードは、申告した解析を解かず、核も作らない
+        // （上流の手で表の入力が変わっても、表示の外なら長い入力を流し直さない。M17 段 1）。メタデータを写す操作で、出力の形が
+        // 入力 0 と同じときだけ（メタデータは入力 0 のもの。警告は描いたノードの分だけなので出さない）
+        if let Some(blank) = blank_region(node, ins, rounded, draw) {
+            return self.blank_audio_region(cx, node, ins, blank, base, &mut acx);
+        }
         if !node.needs.is_empty() {
             let in_fps = node_input_fingerprints(node, &cx.fps.nodes, &cx.input_fps)?;
             for need in &node.needs {
@@ -363,6 +369,120 @@ impl Engine {
             map_warnings,
             drawn,
             shared,
+        })
+    }
+}
+
+/// 描くチャンクのない範囲の描画の形（[`blank_region`]）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Blank {
+    rate: u32,
+    channels: usize,
+    frames: u64,
+}
+
+impl crate::audio::AudioKernel for Blank {
+    fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    fn render(&self, _ch: usize, _start: u64, _out: &mut [f32]) -> Result<(), EngineError> {
+        Err(EngineError::Internal(
+            "描くチャンクのないノードの核を描こうとしました".into(),
+        ))
+    }
+}
+
+/// 申告した解析のある音声の範囲のノードで、描くチャンクがなく、メタデータを写す操作（`MetaAccess::Map`）で出力の形が入力 0 と
+/// 同じなら、その形（解析を解かず、核を作らずに、前の値のチャンクか無効なチャンクだけの値を作る）。
+pub(super) fn blank_region(
+    node: &PlannedNode,
+    ins: &[Value],
+    rounded: &Area,
+    draw: Option<&ChunkSet>,
+) -> Option<Blank> {
+    if node.needs.is_empty() || node.op.signature().meta != crate::op::MetaAccess::Map {
+        return None;
+    }
+    let Shape::Audio {
+        rate,
+        channels,
+        frames: Dim::Exact(frames),
+    } = node.inferred.shape
+    else {
+        return None;
+    };
+    let Some(Value::Audio(a)) = ins.first() else {
+        return None;
+    };
+    if a.rate() != rate || a.channels() != usize::from(channels) || a.frames() as u64 != frames {
+        return None;
+    }
+    let n = usize::try_from(frames).ok()?;
+    let empty = match draw {
+        Some(d) => d.is_empty(),
+        None => chunks_covering(rounded, n).is_empty(),
+    };
+    empty.then_some(Blank {
+        rate,
+        channels: usize::from(channels),
+        frames,
+    })
+}
+
+impl Engine {
+    /// [`blank_region`] のノードを描く（前の値のチャンクを共有し、ほかは無効。メタデータは入力 0 のものを写す）。
+    fn blank_audio_region(
+        &self,
+        cx: &PassCx<'_>,
+        node: &PlannedNode,
+        ins: &[Value],
+        blank: Blank,
+        base: Option<&Value>,
+        acx: &mut ApplyCx<'_>,
+    ) -> Result<AudioRun, EngineError> {
+        let base = match base {
+            Some(Value::Audio(b)) => Some(b.clone()),
+            Some(_) => {
+                return Err(EngineError::Internal(
+                    "範囲の描画の前の値が音声ではありません".into(),
+                ));
+            }
+            None => None,
+        };
+        let meta = match ins.first() {
+            Some(Value::Audio(a)) => a.meta.clone(),
+            _ => AudioMeta::default(),
+        };
+        let count = usize::try_from(blank.frames)
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?
+            .div_ceil(AUDIO_CHUNK);
+        let (value, map_warnings) = apply_node(cx.plan.rules, node, ins, acx, &mut |_, _, kcx| {
+            let (a, _) = crate::audio::render_chunks(
+                &blank,
+                None,
+                &ChunkSet::empty(count),
+                base.as_deref(),
+                meta.clone(),
+                kcx.mon,
+            )?;
+            Ok(Applied::value(Value::Audio(Arc::new(a))))
+        })
+        .map_err(|e| e.at(node.id))?;
+        Ok(AudioRun {
+            value,
+            apply_warnings: std::mem::take(&mut acx.warnings),
+            map_warnings,
+            drawn: 0,
+            shared: 0,
         })
     }
 }

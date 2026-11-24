@@ -30,7 +30,7 @@ use std::sync::Arc;
 use super::audio::{chunk_spans, chunks_covering, pad_chunks, patch_target_audio, round_to_chunks};
 use super::cache::{
     Fingerprint, FingerprintedInput, Fingerprints, NodeCache, Origin, RenderOptions,
-    node_input_fingerprints, quantized_output,
+    analysis_fingerprint, node_input_fingerprints, quantized_output,
 };
 use super::region::{
     Area, Base, FrameTiles, PartialValue, Rects, Spans, Tiles, frames_of, invalidate, tiles_in,
@@ -239,12 +239,15 @@ impl Engine {
         }
         self.check_inputs(plan, |id| inputs.get(&id).map(|v| &v.value))?;
         let (mut rebased, mut fallbacks) = (0, 0);
-        let mut first = self.area_pass(plan, inputs, cache, req, base, mon, false);
+        // 流し解きの結果は描き直し（前の値なし・全体で）をまたいで使う（同じ入力の同じ解析。キャッシュの上限が 0 でも
+        // 解き直さない。M17 段 1）
+        let mut presolved = Presolved::new();
+        let mut first = self.area_pass(plan, inputs, cache, req, base, mon, false, &mut presolved);
         // 継ぎはぎの前の値の大きさ・形式・パレットが今と違い、範囲の描画が断った（変わりうる範囲が小さすぎた）：前の値なしで
         // 描き直す（PassError::Hole と同じく、遅いだけで正しい）
         if matches!(first, Err(PassError::Rebase)) {
             rebased += 1;
-            first = self.area_pass(plan, inputs, cache, req, None, mon, false);
+            first = self.area_pass(plan, inputs, cache, req, None, mon, false, &mut presolved);
         }
         let result = match first {
             Ok(r) => Ok(r),
@@ -252,7 +255,7 @@ impl Engine {
             // 範囲の描画が申告した依存の外を読んだ：全体で描き直す（継ぎはぎもしない）
             Err(PassError::Hole) => {
                 fallbacks += 1;
-                match self.area_pass(plan, inputs, cache, req, None, mon, true) {
+                match self.area_pass(plan, inputs, cache, req, None, mon, true, &mut presolved) {
                     Ok(r) => Ok(r),
                     Err(PassError::Engine(e)) => Err(e),
                     Err(PassError::Hole) => Err(EngineError::Internal(
@@ -410,6 +413,7 @@ impl Engine {
         base: Option<&Base<'_>>,
         mon: &dyn Monitor,
         full: bool,
+        presolved: &mut Presolved,
     ) -> Result<AreaRender, PassError> {
         let mut stats = AreaStats::default();
         let cx = PassCx::new(self, plan, inputs)?;
@@ -458,18 +462,8 @@ impl Engine {
         } else {
             clip_to_canvas(&req.area, out_shape)
         };
-        let mut presolved = Presolved::new();
         let pass = self.port_pass(
-            &cx,
-            cache,
-            *out_node,
-            out_shape,
-            target,
-            base,
-            full,
-            &mut stats,
-            &mut presolved,
-            mon,
+            &cx, cache, *out_node, out_shape, target, base, full, &mut stats, presolved, mon,
         )?;
         let mut out_exact = pass.exact && pass.value.is_complete();
         let kept = pass.kept.as_ref().filter(|_| pass.patched);
@@ -770,14 +764,37 @@ impl Engine {
                             );
                             run
                         }
-                        None => self.run_node(
-                            plan,
-                            node,
-                            &ins,
-                            &cx.source,
-                            mon,
-                            &mut |need, v, a, acx| a.run_any(&need.params, v, acx),
-                        )?,
+                        // 入力が範囲の描画で作った値（全体を覆う）：申告した解析は、この描画の中の表・キャッシュにあれば
+                        // 使い、なければ値に当てて解いて表に入れる（入力は全体の値なので、同じ入力の指紋の結果と同じ。
+                        // M17 段 1：状態の表を同じ描画の中で解き直さない）
+                        None => {
+                            let in_fps =
+                                node_input_fingerprints(node, &cx.fps.nodes, &cx.input_fps)?;
+                            self.run_node(
+                                plan,
+                                node,
+                                &ins,
+                                &cx.source,
+                                mon,
+                                &mut |need, v, a, acx| {
+                                    let Some(fp) = in_fps.get(need.input) else {
+                                        return a.run_any(&need.params, v, acx);
+                                    };
+                                    let key =
+                                        analysis_fingerprint(*fp, need.id, need.v, &need.params)?;
+                                    if let Some(out) = presolved.get(&key).cloned() {
+                                        return Ok(out);
+                                    }
+                                    if let Some(out) = cache.get_analysis(&key) {
+                                        presolved.insert(key, out.clone());
+                                        return Ok(out);
+                                    }
+                                    let out = a.run_any(&need.params, v, acx)?;
+                                    presolved.insert(key, out.clone());
+                                    Ok(out)
+                                },
+                            )?
+                        }
                     };
                     stats.full_nodes += 1;
                     let mut all = run.apply_warnings;
