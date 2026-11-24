@@ -8,7 +8,7 @@ import { clampSeek, FINE_STEP_MS, frameStepTarget } from './seek';
  * | キー | 動き |
  * |---|---|
  * | , / . | 止めて 1 コマ戻す / 進める（コマが分からない・動画でなければ 0.1 秒） |
- * | ⇧, / ⇧.（< >） | 1 秒戻す / 進める（`e.code` で見るので配列に左右されない） |
+ * | ⇧, / ⇧.（< >） | 1 秒戻す / 進める（打たれた文字「<」「>」で見る） |
  * | J / L | 5 秒戻す / 進める |
  * | K | 再生 / 一時停止 |
  *
@@ -29,12 +29,12 @@ export function seekKeyAction(e: KeyboardEvent): SeekKeyAction | null {
   if (e.metaKey || e.ctrlKey || e.altKey || isImeKey(e) || isReplayed(e)) {
     return null;
   }
-  const comma = e.code === 'Comma' || e.key === ',' || e.key === '<';
-  const period = e.code === 'Period' || e.key === '.' || e.key === '>';
-  if (comma || period) {
-    const dir = comma ? -1 : 1;
-    const shifted = e.shiftKey || e.key === '<' || e.key === '>';
-    return shifted ? { kind: 'by', ms: dir * NUDGE_MS } : { kind: 'frame', dir };
+  // 打たれた文字で見る（Dvorak などでも「,」「.」「<」「>」の字のキー。⇧, ⇧. は US・JIS とも「<」「>」）
+  if (e.key === '<' || e.key === '>') {
+    return { kind: 'by', ms: e.key === '<' ? -NUDGE_MS : NUDGE_MS };
+  }
+  if ((e.key === ',' || e.key === '.') && !e.shiftKey) {
+    return { kind: 'frame', dir: e.key === ',' ? -1 : 1 };
   }
   if (e.shiftKey) {
     return null;

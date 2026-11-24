@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
@@ -83,6 +83,29 @@ describe('再生バーのシーク（ADR-230）', () => {
     fireEvent.change(input, { target: { value: '1:05.5' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(controller.seek).toHaveBeenLastCalledWith(65_500);
+  });
+
+  it('時刻の欄を開いたままバーを押したら、欄を閉じる', () => {
+    render(<PlayBar />);
+    fireEvent.click(screen.getByRole('button', { name: ja.seek.jump('0:20') }));
+    expect(screen.getByLabelText(ja.seek.field)).toBeInTheDocument();
+    const bar = screen.getByRole('slider', { name: ja.seek.label }).parentElement as HTMLElement;
+    fireEvent.pointerDown(bar, { button: 0, pointerId: 1, clientX: 250 });
+    expect(screen.queryByLabelText(ja.seek.field)).toBeNull();
+    fireEvent.pointerUp(bar, { pointerId: 1, clientX: 250 });
+  });
+
+  it('ドラッグ中にスロットが替わったら、時刻の 0.1 秒の表示を戻す', () => {
+    render(<PlayBar />);
+    const bar = screen.getByRole('slider', { name: ja.seek.label }).parentElement as HTMLElement;
+    fireEvent.pointerDown(bar, { button: 0, pointerId: 1, clientX: 250 });
+    expect(screen.getByRole('button', { name: ja.seek.jump('0:20') })).toHaveTextContent('0:20.0');
+    act(() => {
+      usePlayerStore.setState({
+        snapshot: { ...usePlayerStore.getState().snapshot, index: 1, itemId: 6, positionMs: 3000 },
+      });
+    });
+    expect(screen.getByRole('button', { name: ja.seek.jump('0:03') })).toHaveTextContent(/^0:03$/);
   });
 
   it('今のアイテムがなければ押せない', () => {

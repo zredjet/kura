@@ -56,10 +56,16 @@ export function applyVolume(el: HTMLMediaElement, volume: number): void {
 
 const resume = new WeakMap<HTMLMediaElement, boolean>();
 
-/** ドラッグを始める：止める（鳴っていたかを覚える）。 */
+/**
+ * ドラッグを始める：止める（鳴っていたかを覚える）。止まっている要素には pause を呼ばない（自動再生の印が消えて、
+ * 開いた直後に押すと鳴らなくなるため）。自動再生でまだ一度も鳴っていなければ、離したときに鳴らす。
+ */
 export function beginMediaScrub(el: HTMLMediaElement): void {
-  resume.set(el, !el.paused);
-  el.pause();
+  const pendingAutoplay = el.autoplay && el.paused && (el.played?.length ?? 0) === 0;
+  resume.set(el, !el.paused || pendingAutoplay);
+  if (!el.paused) {
+    el.pause();
+  }
 }
 
 /** ドラッグを終える：鳴っていたなら続きから鳴らす。 */

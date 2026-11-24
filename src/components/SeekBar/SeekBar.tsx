@@ -12,6 +12,17 @@ export const TIP_WIDTH = 72;
 export const KEY_STEP_MS = 5000;
 /** フォーカス中の PageUp・PageDown で動かす幅（ms）。 */
 export const PAGE_STEP_MS = 30_000;
+/** フォーカス中にこの部品が受けるキー。 */
+const RANGE_KEYS: ReadonlySet<string> = new Set([
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+]);
 
 export interface SeekBarProps {
   /** 読み上げの名前（「再生位置」）。 */
@@ -32,7 +43,8 @@ export interface SeekBarProps {
  * シークバー（design.md §4「シークバー」・ADR-230）：押せる範囲 28px、溝 6px（ホバー・ドラッグ中 10px）、つまみ 16px。
  * ホバーでポインタの下の時刻、ドラッグ中は 0.1 秒までを吹き出しで出す。⌥ ドラッグは 1/10 の速さ。
  * 見た目は自前で描き、本物の `<input type="range">` を透明に重ねて読み上げ・Tab・キーを受け持たせる（押しても
- * フォーカスは移らない。Tab で乗ったときだけ ← → ↑ ↓ で ±5 秒、PageUp・PageDown で ±30 秒、Home・End）。
+ * フォーカスは移らない。Tab で乗ったときだけ ← → ↑ ↓ で ±5 秒、PageUp・PageDown で ±30 秒、Home・End。読み上げの
+ * 増減は 1 秒）。
  */
 export function SeekBar({
   label,
@@ -78,7 +90,15 @@ export function SeekBar({
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (!enabled || e.metaKey || e.ctrlKey || e.altKey) {
+    if (!enabled) {
+      return;
+    }
+    // 修飾キーつきの矢印などは動かさない（range の既定の 1% 送りもしない）
+    if ((e.metaKey || e.ctrlKey || e.altKey) && RANGE_KEYS.has(e.key)) {
+      e.preventDefault();
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) {
       return;
     }
     let next: number;
@@ -138,7 +158,8 @@ export function SeekBar({
         }
         min={0}
         max={length ?? 0}
-        step="any"
+        // 読み上げの増減（VoiceOver）は step で動くので 1 秒にする（"any" だと動かない）
+        step={1000}
         value={shownMs}
         disabled={!enabled}
         onKeyDown={onKeyDown}

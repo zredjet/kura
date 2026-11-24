@@ -688,6 +688,46 @@ describe('シーク（ADR-230）', () => {
     expect(h.reports[0]?.playedMs ?? 0).toBeLessThan(1000);
   });
 
+  it('再開で途中から始めた画像は、最後まで出せば「最後まで表示した」', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [8000, null]), 0, 6500);
+    await advance(1500 + TICK_MS);
+    expect(h.last().index).toBe(1);
+    await advance(0);
+    expect(h.reports[0]).toMatchObject({ itemId: 1, completed: true });
+  });
+
+  it('前へ戻すシークでは「最後まで表示した」を外さない', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [2000, null]));
+    await advance(1000);
+    h.controller.seek(200);
+    await advance(1800 + TICK_MS);
+    expect(h.last().index).toBe(1);
+    await advance(0);
+    expect(h.reports[0]).toMatchObject({ itemId: 1, completed: true });
+  });
+
+  it('プロキシ待ちに入ったらスクラブを終える（外れた波形の代わり）', async () => {
+    // 元のまま再生できるはずだったもの（読めなければプロキシを作ってもらって待つ）
+    const h = setup([item(1, 'audio', { proxyState: 'not_needed' }), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2]));
+    await advance(0);
+    h.controller.beginScrub();
+    h.tracks[1]?.fire('error');
+    await advance(0);
+    expect(h.last().phase).toBe('waiting');
+    // スクラブが残っていれば tick が位置を進めない。プロキシができて鳴り出したら位置が出ることで見る
+    h.items.set(1, { ...item(1, 'audio'), proxyState: 'ready' });
+    await advance(POLL_MS + TICK_MS);
+    // プロキシはもう一方の <audio> で鳴らす
+    h.tracks.forEach((t) => {
+      t.currentTime = 4;
+    });
+    await advance(TICK_MS);
+    expect(h.last().positionMs).toBe(4000);
+  });
+
   it('1 曲リピートは、画像をシークで終わりへ飛ばしても同じスロットを繰り返す', async () => {
     const h = setup([item(1, 'image'), item(2, 'image')]);
     h.controller.start(queueOf([1, 2], [3000, null]));

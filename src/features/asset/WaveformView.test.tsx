@@ -237,6 +237,45 @@ describe('WaveformView（/peaks の波形）', () => {
       vi.restoreAllMocks();
     });
 
+    it('ドラッグ中に段を読み直しても（version が替わった）、終わりを知らせて次は押せる', async () => {
+      mockRect();
+      const { buf } = vector('default-five-levels');
+      const onSeek = vi.fn();
+      const onScrubEnd = vi.fn();
+      const load = async () => buf;
+      const { rerender } = render(
+        <WaveformView
+          hash={HASH}
+          version={1}
+          loop={null}
+          load={load}
+          onSeek={onSeek}
+          onScrubEnd={onScrubEnd}
+        />,
+      );
+      const img = screen.getByRole('img', { name: ja.asset.waveform });
+      await waitFor(() => expect(img).toHaveAttribute('data-seekable', 'true'));
+      fireEvent.pointerDown(img, { button: 0, pointerId: 1, clientX: 100 });
+      rerender(
+        <WaveformView
+          hash={HASH}
+          version={2}
+          loop={null}
+          load={load}
+          onSeek={onSeek}
+          onScrubEnd={onScrubEnd}
+        />,
+      );
+      expect(onScrubEnd).toHaveBeenCalledOnce();
+      fireEvent.pointerUp(img, { pointerId: 1, clientX: 100 });
+      await waitFor(() => expect(img).toHaveAttribute('data-seekable', 'true'));
+      onSeek.mockClear();
+      fireEvent.pointerDown(img, { button: 0, pointerId: 2, clientX: 200 });
+      expect(onSeek.mock.lastCall?.[0]).toBeCloseTo(LENGTH / 2, 6);
+      fireEvent.pointerUp(img, { pointerId: 2, clientX: 200 });
+      vi.restoreAllMocks();
+    });
+
     it('段がなければ押しても飛ばない', async () => {
       mockRect();
       const onSeek = vi.fn();

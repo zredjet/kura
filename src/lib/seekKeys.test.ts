@@ -20,8 +20,9 @@ describe('seekKeyAction', () => {
       kind: 'by',
       ms: 1000,
     });
-    // code がなくても文字で読む
+    // 文字で読む（Dvorak で物理的な Comma の位置のキーは「w」なのでコマ送りにしない）
     expect(seekKeyAction(key({ key: '>' }))).toEqual({ kind: 'by', ms: 1000 });
+    expect(seekKeyAction(key({ key: 'w', code: 'Comma' }))).toBeNull();
   });
 
   it('J・L は 5 秒、K は再生／一時停止', () => {

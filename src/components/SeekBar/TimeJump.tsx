@@ -55,12 +55,17 @@ export function TimeJump({
   };
 
   const shown = formatDuration(positionMs, tenths);
+  // ドラッグ中に 0.1 秒の桁が増えてもバーがずれないよう、長さの 0.1 秒の形の字数だけ幅を取っておく
+  const reserve = {
+    minWidth: `calc(${formatDuration(durationMs ?? 0, true).length}ch + var(--space-3))`,
+  };
   if (!editing) {
     return (
       <button
         ref={buttonRef}
         type="button"
         className={styles.jump}
+        style={reserve}
         aria-label={t.jump(formatDuration(positionMs))}
         title={t.jumpHint}
         disabled={disabled}

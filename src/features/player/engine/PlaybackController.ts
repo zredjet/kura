@@ -77,6 +77,8 @@ export class PlaybackController {
   private lastMediaSec = 0;
   /** シークバー・波形をドラッグしている間（要素・画像の時計を止める。ADR-230）。 */
   private scrubbing = false;
+  /** 今のスロットでシークで先へ飛ばしたか（画像の「最後まで表示した」の判定。ADR-230）。 */
+  private skipped = false;
 
   private readonly attempts = new Map<number, number>();
   private readonly forced = new Set<number>();
@@ -311,6 +313,9 @@ export class PlaybackController {
    */
   seek(ms: number, guardMs = END_GUARD_MS): void {
     const target = clampSeek(ms, this.endMs(), guardMs);
+    if (target > this.positionMs) {
+      this.skipped = true;
+    }
     const media = this.slotMedia();
     if (media) {
       media.currentTime = target / 1000;
@@ -428,6 +433,7 @@ export class PlaybackController {
     this.playedMs = 0;
     this.completed = false;
     this.scrubbing = false;
+    this.skipped = false;
     this.lastMediaSec = 0;
     this.lastTick = this.deps.clock.now();
     this.phase = 'loading';
@@ -516,12 +522,10 @@ export class PlaybackController {
     }
     const unitId = queue.unitIds[this.index] ?? null;
     const item = this.items.get(itemId);
-    // 画像の「最後まで表示した」は、実際に表示した時間が表示時間に届いたときだけ（シークで終わりへ飛ばしただけでは
-    // 当たらない。1 曲リピートの判定の `completed` とは分ける。ADR-230）
-    const completed =
-      item?.kind === 'image'
-        ? this.completed && this.playedMs >= (this.durationMs ?? this.imageMs())
-        : this.completed;
+    // 画像の「最後まで表示した」は、シークで先へ飛ばしたスロットでは当たらない（シークで終わりへ飛ばしただけで記録
+    // しない。再開・作り直しで途中から始めたスロットは、最後まで出せば当たる。1 曲リピートの判定の `completed` とは
+    // 分ける。ADR-230）
+    const completed = item?.kind === 'image' ? this.completed && !this.skipped : this.completed;
     const report = {
       itemId,
       unitId,
@@ -589,6 +593,7 @@ export class PlaybackController {
   private finish(): void {
     this.leave();
     this.playing = false;
+    this.scrubbing = false;
     this.phase = 'ended';
     this.video?.pause();
     if (this.bgmStatus === 'playing') {
@@ -768,6 +773,8 @@ export class PlaybackController {
   /** プロキシができるまで待ち、できたら再生する。 */
   private waitForProxy(item: ItemSummaryDto, force: boolean): void {
     this.phase = 'waiting';
+    // ドラッグしていた波形が外れても止まったままにならないよう、スクラブを終える
+    this.scrubbing = false;
     this.stopPolling();
     const token = this.enterToken;
     void this.deps.requestProxies([item.id], force).catch((error: unknown) => {
@@ -841,6 +848,7 @@ export class PlaybackController {
     }
     // ドラッグ中は進めず、終わりの判定もしない（位置はシークが出す）
     if (this.scrubbing) {
+      this.emit();
       return;
     }
     const kind = this.currentKind();

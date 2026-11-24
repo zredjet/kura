@@ -10,7 +10,9 @@ import { clampSeek, moveScrub, type ScrubAnchor, startScrub } from '../../lib/se
  * - 動かしている間の `onSeek` は 1 フレームに 1 回にまとめ、離したときはすぐ送る。飛び先は終わりの手前で止める
  *   （`clampSeek`）。
  * - `onScrubStart`・`onScrubEnd` は押したとき・離したとき（再生を止めて戻すのは呼ぶ側）。
- * - `resetKey`（アイテム）が替わったら、そのドラッグは無かったことにする（あとの動き・離すのを無視する）。
+ * - `resetKey`（アイテム）が替わったら、そのドラッグは無かったことにする（あとの動き・離すのを無視する）。そのときと、
+ *   ドラッグ中に外れたときも `onScrubEnd` は呼ぶ（止めた再生を戻す・ドラッグ中の表示を戻すため）。
+ * - ⌃クリック（macOS の副クリック）・左以外のボタンでは始めない。
  * - `trackHover` なら、押していない間もポインタの位置を返す（シークバーの吹き出し）。
  */
 
@@ -59,6 +61,14 @@ interface Drag {
   ms: number;
 }
 
+/** まとめていたシークを取り消す。 */
+function cancelFrame(frame: { current: number | null }): void {
+  if (frame.current !== null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(frame.current);
+  }
+  frame.current = null;
+}
+
 /** 1 フレームに 1 回にまとめる口（rAF がなければすぐ）。 */
 function schedule(cb: () => void): number | null {
   if (typeof requestAnimationFrame === 'function') {
@@ -90,21 +100,29 @@ export function useScrub({
   const length = durationMs !== null && durationMs > 0 ? durationMs : null;
   const enabled = !disabled && length !== null;
 
+  // アイテムが替わった：そのドラッグを捨て、終わりだけ知らせる
+  useEffect(() => {
+    const d = drag.current;
+    if (d && d.key !== resetKey) {
+      drag.current = null;
+      cancelFrame(frame);
+      latest.current.onScrubEnd?.();
+    }
+  }, [resetKey]);
+
+  // 外れた：まとめていたシークを取り消し、ドラッグ中なら終わりを知らせる
   useEffect(
     () => () => {
-      if (frame.current !== null && typeof cancelAnimationFrame === 'function') {
-        cancelAnimationFrame(frame.current);
+      cancelFrame(frame);
+      if (drag.current) {
+        drag.current = null;
+        latest.current.onScrubEnd?.();
       }
     },
     [],
   );
 
-  const flush = () => {
-    if (frame.current !== null && typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(frame.current);
-    }
-    frame.current = null;
-  };
+  const flush = () => cancelFrame(frame);
 
   const send = (ms: number, now: boolean) => {
     const target = clampSeek(ms, latest.current.durationMs);
@@ -145,7 +163,7 @@ export function useScrub({
 
   const handlers: ScrubHandlers = {
     onPointerDown: (e) => {
-      if (!enabled || length === null || e.button !== 0 || drag.current !== null) {
+      if (!enabled || length === null || e.button !== 0 || e.ctrlKey || drag.current !== null) {
         return;
       }
       // 文字の選択・フォーカスの移動をしない（← → は前後のアイテムのまま）

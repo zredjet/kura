@@ -153,7 +153,21 @@ describe('SeekBar', () => {
     expect(onSeek).not.toHaveBeenCalled();
   });
 
-  it('アイテムが替わったら、そのドラッグは無かったことにする', () => {
+  it('⌃クリック（副クリック）では始めない', () => {
+    const { onSeek, onScrubStart } = setup();
+    fireEvent.pointerDown(barOf(), { button: 0, pointerId: 1, clientX: 400, ctrlKey: true });
+    expect(onScrubStart).not.toHaveBeenCalled();
+    expect(onSeek).not.toHaveBeenCalled();
+  });
+
+  it('ドラッグ中に外れたら、終わりだけ知らせる', () => {
+    const { onScrubEnd, unmount } = setup();
+    fireEvent.pointerDown(barOf(), { button: 0, pointerId: 1, clientX: 400 });
+    unmount();
+    expect(onScrubEnd).toHaveBeenCalledOnce();
+  });
+
+  it('アイテムが替わったら、そのドラッグは無かったことにする（終わりだけ知らせる）', () => {
     const { onSeek, onScrubEnd, rerender } = setup({ resetKey: 1 });
     const bar = barOf();
     fireEvent.pointerDown(bar, { button: 0, pointerId: 1, clientX: 400 });
@@ -169,12 +183,24 @@ describe('SeekBar', () => {
       />,
     );
     expect(barOf()).not.toHaveAttribute('data-scrubbing');
+    expect(onScrubEnd).toHaveBeenCalledOnce();
     fireEvent.pointerMove(barOf(), { pointerId: 1, clientX: 500 });
     fireEvent.pointerUp(barOf(), { pointerId: 1, clientX: 500 });
     act(() => {
       vi.advanceTimersByTime(20);
     });
     expect(onSeek).not.toHaveBeenCalled();
-    expect(onScrubEnd).not.toHaveBeenCalled();
+    expect(onScrubEnd).toHaveBeenCalledOnce();
+    // 次のドラッグは始められる
+    fireEvent.pointerDown(barOf(), { button: 0, pointerId: 2, clientX: 400 });
+    expect(onSeek).toHaveBeenLastCalledWith(30_000);
+  });
+
+  it('修飾キーつきの矢印は動かさず、既定の動きも止める', () => {
+    const { onSeek } = setup();
+    const input = screen.getByRole('slider');
+    const e = fireEvent.keyDown(input, { key: 'ArrowRight', altKey: true });
+    expect(e).toBe(false);
+    expect(onSeek).not.toHaveBeenCalled();
   });
 });

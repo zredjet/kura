@@ -191,7 +191,9 @@ export function WaveformView({
       data-loaded={data ? 'true' : 'false'}
       data-seekable={seekable || undefined}
       data-scrubbing={scrubMs !== null || undefined}
-      {...(seekable ? handlers : {})}
+      // 段を読み直している間（version が替わった）もドラッグの終わりを受けられるよう、onSeek があれば付けたままにする
+      // （押せない間は useScrub が押すのを無視する）
+      {...(onSeek ? handlers : {})}
     >
       {path === null ? (
         fallback

@@ -74,9 +74,12 @@ function refresh(el: HTMLMediaElement): MediaState {
 
 function subscribe(el: HTMLMediaElement, notify: () => void): () => void {
   let frame: number | null = null;
+  // 知らせるかは購読ごとに自分が最後に見た値で決める（同じ要素を 2 つの部品が見ても取りこぼさない）
+  let seen = states.get(el);
   const update = () => {
-    const before = states.get(el);
-    if (refresh(el) !== before) {
+    const next = refresh(el);
+    if (next !== seen) {
+      seen = next;
       notify();
     }
   };
