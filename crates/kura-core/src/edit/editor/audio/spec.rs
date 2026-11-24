@@ -1053,6 +1053,28 @@ mod tests {
         }
     }
 
+    /// 帯の端は共有のベクタ（`tests/vectors/edit/spec_bands.json`。フロントの帯の表と照らす）と同じ。
+    #[test]
+    fn bands_match_the_shared_vector() {
+        let raw = include_str!("../../../../tests/vectors/edit/spec_bands.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let rates = v["rates"].as_array().unwrap();
+        assert_eq!(rates.len(), 3);
+        for r in rates {
+            let rate = r["rate"].as_u64().unwrap() as u32;
+            let p = SpecParams::for_rate(rate).unwrap();
+            assert_eq!(p.n() as u64, r["n"].as_u64().unwrap());
+            assert_eq!(p.hop() as u64, r["hop"].as_u64().unwrap());
+            let want = r["bands"].as_array().unwrap();
+            assert_eq!(p.bands().len(), want.len(), "{rate}");
+            for (b, w) in p.bands().iter().zip(want) {
+                assert_eq!(b.lo.to_bits(), w[0].as_f64().unwrap().to_bits(), "{rate}");
+                assert_eq!(b.hi.to_bits(), w[1].as_f64().unwrap().to_bits(), "{rate}");
+                assert_eq!(b.long, w[2].as_bool().unwrap(), "{rate}");
+            }
+        }
+    }
+
     /// 頼んだ区間のチャンクは頼みの順に重ねずに、長さで切る。半開区間にまとめる。
     #[test]
     fn chunks_and_runs() {

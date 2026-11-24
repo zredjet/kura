@@ -77,9 +77,10 @@ pub struct AudioNodeView {
     pub id: NodeId,
     pub op: String,
     pub enabled: bool,
-    /// 入力 0 のレートと長さ。
+    /// 入力 0 のレートと長さ・チャンネルの数。
     pub in_rate: u32,
     pub in_frames: u64,
+    pub in_channels: u16,
     /// 引数の位置を出力のフレームに写したもの（写せない・印のない操作は None）。
     pub marks: Option<Marks>,
 }
@@ -285,6 +286,10 @@ pub fn node_views(chain: &[TimeLink], head: &Snapshot) -> Vec<AudioNodeView> {
         .enumerate()
         .filter_map(|(i, l)| {
             let (in_rate, in_frames) = rate_frames(&l.input)?;
+            let in_channels = match l.input {
+                kura_engine::Shape::Audio { channels, .. } => channels,
+                _ => return None,
+            };
             let down = &chain[i + 1..];
             let p = params_of(head, l.node).unwrap_or(Json::Null);
             let num = |k: &str| p.get(k).and_then(Json::as_u64);
@@ -318,6 +323,7 @@ pub fn node_views(chain: &[TimeLink], head: &Snapshot) -> Vec<AudioNodeView> {
                 enabled: l.enabled,
                 in_rate,
                 in_frames,
+                in_channels,
                 marks,
             })
         })

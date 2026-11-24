@@ -201,6 +201,7 @@ describe('切り詰めの道具', () => {
       enabled: true,
       inRate: 48_000,
       inFrames: 20_000,
+      inChannels: 2,
       marks: { type: 'trim' as const, start: 2000, end: 12_000 },
     };
     await open(view({ nodes: [trimNode] }), [node(5, 'audio.trim')]);
@@ -235,6 +236,7 @@ describe('切り詰めの道具', () => {
       enabled: true,
       inRate: 48_000,
       inFrames: 20_000,
+      inChannels: 2,
       marks: null,
     };
     await open(view({ nodes: [trimNode] }), [node(5, 'audio.trim')]);
@@ -260,8 +262,22 @@ describe('切り詰めの道具', () => {
 
   it('外す前の印では写せなくても（後ろに end: null の切り詰め）、外した表示の印で枠を出して直せる', async () => {
     // [trim A {1000, 2000}, trim B {100, null}]：A が有効なとき、B の写しでは A の印が範囲の外
-    const a = { id: 1, op: 'audio.trim', enabled: true, inRate: 48_000, inFrames: 20_000 };
-    const b = { id: 2, op: 'audio.trim', enabled: true, inRate: 48_000, inFrames: 1000 };
+    const a = {
+      id: 1,
+      op: 'audio.trim',
+      enabled: true,
+      inRate: 48_000,
+      inFrames: 20_000,
+      inChannels: 2,
+    };
+    const b = {
+      id: 2,
+      op: 'audio.trim',
+      enabled: true,
+      inRate: 48_000,
+      inFrames: 1000,
+      inChannels: 2,
+    };
     await open(
       view({
         frames: 900,
@@ -281,7 +297,12 @@ describe('切り詰めの道具', () => {
           rev: 2,
           nodes: [
             { ...a, enabled: false, marks: { type: 'trim' as const, start: 900, end: 1900 } },
-            { ...b, inFrames: 20_000, marks: { type: 'trim' as const, start: 0, end: 19_900 } },
+            {
+              ...b,
+              inFrames: 20_000,
+              inChannels: 2,
+              marks: { type: 'trim' as const, start: 0, end: 19_900 },
+            },
           ],
         }),
       ),
@@ -327,6 +348,7 @@ describe('切り詰めの道具', () => {
       enabled: true,
       inRate: 48_000,
       inFrames: 20_000,
+      inChannels: 2,
       marks: { type: 'trim' as const, start: 0, end: 100 },
     };
     await open(view({ nodes: [trimNode] }), [node(5, 'audio.trim')]);

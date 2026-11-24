@@ -642,9 +642,10 @@ pub struct EditAudioNodeDto {
     pub id: u32,
     pub op: String,
     pub enabled: bool,
-    /// 入力 0 のレートと長さ（引数の欄で時間と標本を変換する）。
+    /// 入力 0 のレートと長さ（引数の欄で時間と標本を変換する）・チャンネルの数（イコライザの曲線・チャンネルの選び方。M17 段 5）。
     pub in_rate: u32,
     pub in_frames: u64,
+    pub in_channels: u16,
     /// ハンドルの位置（写せない・印のない操作は null）。
     pub marks: Option<EditAudioMarksDto>,
 }
@@ -657,6 +658,7 @@ impl From<AudioNodeView> for EditAudioNodeDto {
             enabled: n.enabled,
             in_rate: n.in_rate,
             in_frames: n.in_frames,
+            in_channels: n.in_channels,
             marks: n.marks.map(Into::into),
         }
     }
@@ -1415,6 +1417,48 @@ impl From<EditorError> for AppError {
 }
 
 /// 操作のカタログ（bindings の定数 `EDIT_OPS`。今の版の操作の ID・版・入力・引数の記述（表示の条件つき））。
+/// イコライザ（`audio.eq` v1）の範囲と既定（M17 段 5。フロントのスペクトルの面・バンドの表は手で写さずにこれを読む）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditEqLimitsDto {
+    /// バンドの数・2 次の段の数の上限。
+    pub max_bands: u32,
+    pub max_sections: u32,
+    /// 周波数の範囲（Hz）と、止める上限（レートに対する比）。
+    pub freq_min: f64,
+    pub freq_max: f64,
+    pub nyquist_guard: f64,
+    /// 利得の範囲（±dB。バンドと出力）。
+    pub gain_max: f64,
+    /// Q の範囲とシェルフの上限・既定。
+    pub q_min: f64,
+    pub q_max: f64,
+    pub shelf_q_max: f64,
+    pub default_q: f64,
+    /// カットの傾き（dB/oct）と既定。
+    pub slopes: Vec<u32>,
+    pub default_slope: u32,
+}
+
+/// `EQ_LIMITS` の値。
+pub fn eq_limits() -> EditEqLimitsDto {
+    use kura_engine::ops::audio::eq as e;
+    EditEqLimitsDto {
+        max_bands: e::MAX_BANDS as u32,
+        max_sections: e::MAX_SECTIONS as u32,
+        freq_min: e::FREQ_MIN,
+        freq_max: e::FREQ_MAX,
+        nyquist_guard: e::NYQUIST_GUARD,
+        gain_max: e::GAIN_MAX,
+        q_min: e::Q_MIN,
+        q_max: e::Q_MAX,
+        shelf_q_max: e::SHELF_Q_MAX,
+        default_q: e::DEFAULT_Q,
+        slopes: e::SLOPES.to_vec(),
+        default_slope: e::DEFAULT_SLOPE,
+    }
+}
+
 pub fn edit_ops() -> Vec<OpDescriptor> {
     match kura_engine::ops::registry() {
         Ok(r) => r.catalog(),
@@ -2227,6 +2271,7 @@ mod tests {
                     enabled: true,
                     in_rate: 48_000,
                     in_frames: 96_000,
+                    in_channels: 2,
                     marks: Some(Marks::Fade {
                         in_start: Some(-5),
                         in_end: Some(10),
@@ -2316,6 +2361,15 @@ mod tests {
             json!({ "type": "fade", "inStart": -5, "inEnd": 10, "outStart": null, "outEnd": null })
         );
         assert_eq!(json["view"]["nodes"][0]["inFrames"], json!(96000));
+        assert_eq!(json["view"]["nodes"][0]["inChannels"], json!(2));
+        // イコライザの範囲と既定（EQ_LIMITS）
+        assert_eq!(
+            serde_json::to_value(eq_limits()).unwrap(),
+            json!({ "maxBands": 24, "maxSections": 48, "freqMin": 10.0, "freqMax": 30000.0,
+                    "nyquistGuard": 0.49, "gainMax": 30.0, "qMin": 0.1, "qMax": 40.0, "shelfQMax": 4.0,
+                    "defaultQ": std::f64::consts::FRAC_1_SQRT_2, "slopes": [6, 12, 18, 24, 36, 48, 72, 96],
+                    "defaultSlope": 12 })
+        );
         assert_eq!(
             json["view"]["loudness"],
             json!({ "type": "ready", "samplesId": "0123456789abcdef", "loudness": {

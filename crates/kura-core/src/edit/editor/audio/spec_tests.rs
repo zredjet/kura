@@ -588,6 +588,12 @@ fn node_ports_follow_the_time_map() {
     }
     let info = info.expect("作り終える");
     assert_eq!(info.spec.len(), 2);
+    // 表示のノードに入力のチャンネル数（モノラル）
+    assert!(
+        info.nodes.iter().all(|n| n.in_channels == 1),
+        "{:?}",
+        info.nodes
+    );
     let (before, after) = (&info.spec[0], &info.spec[1]);
     assert_eq!(before.frames, frames);
     assert_eq!(before.map[0].in_start, shift);

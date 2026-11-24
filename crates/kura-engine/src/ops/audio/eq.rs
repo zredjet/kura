@@ -55,6 +55,10 @@ pub const SHELF_Q_MAX: f64 = 4.0;
 pub const SLOPES: &[u32] = &[6, 12, 18, 24, 36, 48, 72, 96];
 /// 周波数を止める上限（レートに対する比）。
 pub const NYQUIST_GUARD: f64 = 0.49;
+/// Q の既定（1/√2）。
+pub const DEFAULT_Q: f64 = std::f64::consts::FRAC_1_SQRT_2;
+/// カットの傾きの既定（dB/oct）。
+pub const DEFAULT_SLOPE: u32 = 12;
 
 /// バンドの型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,11 +106,11 @@ pub enum Phase {
 }
 
 fn default_q() -> f64 {
-    std::f64::consts::FRAC_1_SQRT_2
+    DEFAULT_Q
 }
 
 fn default_slope() -> u32 {
-    12
+    DEFAULT_SLOPE
 }
 
 fn yes() -> bool {

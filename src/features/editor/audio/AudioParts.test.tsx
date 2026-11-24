@@ -75,6 +75,7 @@ function openState(nodes: EditNodeDto[] = [], outputs: unknown[] = []) {
       enabled: true,
       inRate: 48_000,
       inFrames: TOTAL,
+      inChannels: 2,
       marks: null,
     })),
   });

@@ -253,6 +253,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
         // これを読む。docs/editing.md §7.2・§7.3）
         .typ::<kura_engine::op::OpDescriptor>()
         .constant("EDIT_OPS", commands::edit::edit_ops())
+        // イコライザの範囲と既定（スペクトルの面・バンドの表。M17 段 5）
+        .typ::<commands::edit::EditEqLimitsDto>()
+        .constant("EQ_LIMITS", commands::edit::eq_limits())
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }

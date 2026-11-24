@@ -586,6 +586,7 @@ describe('フェードの曲線', () => {
     enabled,
     inRate: 48_000,
     inFrames: TOTAL,
+    inChannels: 2,
     marks: {
       type: 'fade' as const,
       inStart: 0,
