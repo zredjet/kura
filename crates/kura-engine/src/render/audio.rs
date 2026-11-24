@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use super::area::{AreaStats, PassCx, PassError, Presolved};
 use super::cache::{
-    FingerprintedInput, NodeCache, analysis_fingerprint, insert_analysis, node_input_fingerprints,
-    solve_cached,
+    Fingerprint, FingerprintedInput, NodeCache, analysis_fingerprint, insert_analysis,
+    node_input_fingerprints, solve_cached,
 };
 use super::region::{Area, Reach, Spans};
 use super::{Engine, Plan, PlannedNode, apply_node, bad_input, node_seed, op_shapes};
@@ -30,7 +30,7 @@ use crate::audio::stream::{AudioSink, StreamEnd, StreamInfo, stream_windows};
 use crate::digest::Digest;
 use crate::doc::{InputId, OutputId, PortRef, Quantize};
 use crate::error::{EngineError, Issue};
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, NoMonitor};
 use crate::op::{Applied, ApplyCx};
 use crate::shape::{Dim, Shape};
 use crate::value::{AUDIO_CHUNK, Audio, AudioMeta, ChunkSet, Value};
@@ -520,14 +520,15 @@ pub struct StreamStats {
     pub area: AreaStats,
 }
 
-/// 流れを解析に渡す包み（流し解き）。`begin` の形とメタデータを覚え、終わりに `StreamEnd` を作る。
-struct AnalysisFeed<'a> {
-    stream: &'a mut Box<dyn AudioStream>,
-    limits: &'a crate::limits::Limits,
-    info: Option<StreamInfo>,
+/// 流し解きの途中の流れ（描画の中の流し解きと、区切りで進める仕事 `PresolveJob` が同じものを使う。M17 段 3）：解析の流れ・
+/// 流れの形とメタデータ（最初の窓で決まる）・受け手が食べ終えた位置（フレーム）。
+pub(super) struct Solving {
+    pub stream: Box<dyn AudioStream>,
+    pub info: Option<StreamInfo>,
+    pub pos: u64,
 }
 
-impl AnalysisFeed<'_> {
+impl Solving {
     /// 流し終えた流れの終わり（長さとメタデータ）。
     fn end(&self) -> Result<StreamEnd, EngineError> {
         let info = self
@@ -541,9 +542,18 @@ impl AnalysisFeed<'_> {
     }
 }
 
+/// 流れを解析に渡す包み（流し解き）。`begin` の形とメタデータを覚え、食べ終えた位置を進める。`atomic` なら `feed` に中止
+/// しない監視を渡す（区切りで進める仕事：窓を描く側だけが中止を見るので、受け手の状態は窓の境でしか止まらず、続きから
+/// 流せる。`TableBuilder::feed` は中止で一部の組だけ進むため。M17 段 3）。
+struct AnalysisFeed<'a> {
+    solving: &'a mut Solving,
+    limits: &'a crate::limits::Limits,
+    atomic: bool,
+}
+
 impl AudioSink for AnalysisFeed<'_> {
     fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
-        self.info = Some(info.clone());
+        self.solving.info = Some(info.clone());
         Ok(())
     }
 
@@ -553,11 +563,15 @@ impl AudioSink for AnalysisFeed<'_> {
         planes: &[&[f32]],
         mon: &dyn Monitor,
     ) -> Result<(), EngineError> {
+        let mon: &dyn Monitor = if self.atomic { &NoMonitor } else { mon };
         let cx = AnalyzeCx {
             mon,
             limits: self.limits,
         };
-        self.stream.feed(start, planes, &cx)
+        self.solving.stream.feed(start, planes, &cx)?;
+        let len = planes.first().map_or(0, |p| p.len() as u64);
+        self.solving.pos = start.saturating_add(len);
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), EngineError> {
@@ -593,7 +607,8 @@ impl AudioSink for WindowDigest {
 
 impl Engine {
     /// 申告した解析 `need` を、入力のポート `r` を窓ごとに流して解く（流し解き。入力が部分の値でキャッシュにもないとき）。
-    /// 結果はキャッシュに入れる（大きさは解析の見積もり）。
+    /// 結果はキャッシュに入れる（大きさは解析の見積もり）。区切りで進める仕事（`PresolveJob`）と同じ実装（`start_solving`・
+    /// `solve_port`・`finish_solving`）を、全体を 1 回で流す形で通る。
     #[allow(clippy::too_many_arguments)]
     fn presolve(
         &self,
@@ -610,48 +625,75 @@ impl Engine {
             .shapes
             .port(r)
             .ok_or_else(|| EngineError::Internal("解析する入力の形がありません".into()))?;
-        let mut stream = a.stream_any(&need.params, &shape)?.ok_or_else(|| {
-            EngineError::Internal(format!(
-                "解析 {} は入力を流して解けません（範囲の描画の判定の誤り）",
-                need.id
-            ))
-        })?;
-        let mut feed = AnalysisFeed {
-            stream: &mut stream,
-            limits: &self.limits,
-            info: None,
-        };
+        let mut solving = start_solving(a, need, &shape)?;
         let mut windows = 0;
-        self.stream_port(
+        self.solve_port(
             cx,
             cache,
             r,
             &shape,
             None,
-            None,
-            None,
-            &mut feed,
+            &mut solving,
+            false,
             presolved,
             stats,
             &mut windows,
-            None,
             mon,
         )?;
-        let end = feed.end()?;
+        let key = port_analysis_key(cx, r, need)?;
+        let out = self.finish_solving(cache, a, need, &shape, key, solving, mon)?;
+        stats.presolved += 1;
+        Ok(out)
+    }
+
+    /// ポート `r` の `spans`（None は全体）を流して `solving` に食わせる（流し解きの本体。`atomic` は [`AnalysisFeed`]）。
+    /// 中止・誤りで止まっても、食べ終えた位置（`solving.pos`）は渡し終えた窓の終わりまで進んでいる。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn solve_port(
+        &self,
+        cx: &PassCx<'_>,
+        cache: &mut NodeCache,
+        r: &PortRef,
+        shape: &Shape,
+        spans: Option<&Spans>,
+        solving: &mut Solving,
+        atomic: bool,
+        presolved: &mut Presolved,
+        stats: &mut AreaStats,
+        windows: &mut u64,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let mut feed = AnalysisFeed {
+            solving,
+            limits: &self.limits,
+            atomic,
+        };
+        self.stream_port(
+            cx, cache, r, shape, None, None, spans, &mut feed, presolved, stats, windows, None, mon,
+        )
+    }
+
+    /// 流し終えた流れを結果にしてキャッシュに入れる（大きさは解析の見積もり）。`finish` には中止しない監視を渡す（終わりの
+    /// 残りの格子の分だけで軽い。途中で止めると流れを失うため）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_solving(
+        &self,
+        cache: &mut NodeCache,
+        a: &dyn DynAnalysis,
+        need: &Need,
+        shape: &Shape,
+        key: Fingerprint,
+        solving: Solving,
+        _mon: &dyn Monitor,
+    ) -> Result<AnyOutput, EngineError> {
+        let end = solving.end()?;
         let acx = AnalyzeCx {
-            mon,
+            mon: &NoMonitor,
             limits: &self.limits,
         };
-        let out = stream.finish(&end, &acx)?;
-        let in_fps = match r {
-            PortRef::Input { id } => cx.input_fps.get(id).copied(),
-            PortRef::Node { id } => cx.fps.nodes.get(id).copied(),
-        }
-        .ok_or_else(|| EngineError::Internal("解析する入力の指紋がありません".into()))?;
-        let key = analysis_fingerprint(in_fps, need.id, need.v, &need.params)?;
-        let bytes = a.estimate(&need.params, &shape).map_or(0, |e| e.bytes);
+        let out = solving.stream.finish(&end, &acx)?;
+        let bytes = a.estimate(&need.params, shape).map_or(0, |e| e.bytes);
         insert_analysis(cache, key, out.clone(), bytes);
-        stats.presolved += 1;
         Ok(out)
     }
 
@@ -930,6 +972,39 @@ impl Engine {
             .ok_or_else(|| EngineError::Internal("流れのメタデータがありません".into()))?;
         sink.digest.finish(&meta)
     }
+}
+
+/// 申告した解析 `need` の流し解きを始める（入力の形 `shape`。流せなければ内部の誤り）。
+pub(super) fn start_solving(
+    a: &dyn DynAnalysis,
+    need: &Need,
+    shape: &Shape,
+) -> Result<Solving, EngineError> {
+    let stream = a.stream_any(&need.params, shape)?.ok_or_else(|| {
+        EngineError::Internal(format!(
+            "解析 {} は入力を流して解けません（範囲の描画の判定の誤り）",
+            need.id
+        ))
+    })?;
+    Ok(Solving {
+        stream,
+        info: None,
+        pos: 0,
+    })
+}
+
+/// ポート `r` を入力にした申告した解析 `need` の鍵（`analysis_fingerprint`）。
+pub(super) fn port_analysis_key(
+    cx: &PassCx<'_>,
+    r: &PortRef,
+    need: &Need,
+) -> Result<Fingerprint, EngineError> {
+    let in_fp = match r {
+        PortRef::Input { id } => cx.input_fps.get(id).copied(),
+        PortRef::Node { id } => cx.fps.nodes.get(id).copied(),
+    }
+    .ok_or_else(|| EngineError::Internal("解析する入力の指紋がありません".into()))?;
+    analysis_fingerprint(in_fp, need.id, need.v, &need.params)
 }
 
 /// 窓の警告 `w` を `out` に足す（同じもの（ノード・符号・文）は 1 度だけ）。

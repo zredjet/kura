@@ -101,6 +101,25 @@ impl Analysis for EqState {
             .collect()
     }
 
+    /// 段 2 の実測の式（docs/editing.md §18.5 の「手ごとに正で描く境」）：12 + S·(1.5 + S/16) ns / フレーム（S は推論のあとの
+    /// 2 次の段の数。M/S の組（幅 2）は 2 倍に数える）。
+    fn solve_ns_per_frame(p: &EqStateParams, input: &Shape) -> f64 {
+        let Shape::Audio { rate, channels, .. } = *input else {
+            return crate::analysis::DEFAULT_SOLVE_NS_PER_FRAME;
+        };
+        let Ok(r) = resolve(&p.eq(), rate, usize::from(channels)) else {
+            return crate::analysis::DEFAULT_SOLVE_NS_PER_FRAME;
+        };
+        let sections: usize = r.bands.iter().map(|b| b.sections.len()).sum();
+        let width = if r.has_ms() && channels == 2 {
+            2.0
+        } else {
+            1.0
+        };
+        let s = sections as f64 * width;
+        crate::analysis::DEFAULT_SOLVE_NS_PER_FRAME + s * (1.5 + s / 16.0)
+    }
+
     fn estimate(p: &EqStateParams, input: &Shape) -> Estimate {
         let Shape::Audio { rate, channels, .. } = *input else {
             return Estimate::default();

@@ -828,3 +828,73 @@ fn eq_subnormal_timings() {
         }
     }
 }
+
+/// 測り（M17 段 3。`--release -- --ignored --nocapture`。`RAYON_NUM_THREADS=3` で NFR-11 の判定の条件）：48 kHz ステレオの
+/// 短い音声（5・10・20・40 秒）で、`audio.gain` → `audio.normalize` の手前の gain を 1 手変えたときの表示（全体）の時間。
+/// 正規化の申告（`audio.loudness_gating`）を手ごとに流し直すので、`Analysis::solve_ns_per_frame` の係数を決める。中央値（5 回）。
+#[test]
+#[ignore = "測り（--release -- --ignored --nocapture）"]
+fn normalize_step_timings() {
+    #![allow(clippy::disallowed_methods)]
+    let engine = engine();
+    for secs in [5u64, 10, 20, 40] {
+        let input = InputGen::AudioNoise {
+            rate: 48_000,
+            channels: 2,
+            frames: secs * 48_000,
+            seed: 7,
+        }
+        .generate()
+        .unwrap();
+        let doc = |db: f64| {
+            let mut g = Graph::new_single();
+            g.push_linear("audio.gain", 1, json!({ "db": db }), 1)
+                .unwrap();
+            g.push_linear(
+                "audio.normalize",
+                1,
+                json!({ "target": -20.0, "peakLimit": null }),
+                2,
+            )
+            .unwrap();
+            g
+        };
+        let req = ViewRequest {
+            output: OutputId(0),
+            area: Area::All,
+            focus: None,
+        };
+        let mut cache = NodeCache::new(512 << 20);
+        let plan = compile(&engine, &doc(-3.0), &input);
+        let mut prev = engine
+            .render_view(&plan, &fin(&input), &mut cache, &req, None, &NoMonitor)
+            .unwrap()
+            .view;
+        let mut times = Vec::new();
+        for k in 0..5 {
+            let plan = compile(&engine, &doc(-2.5 + k as f64 * 0.5), &input);
+            let t = std::time::Instant::now();
+            let got = engine
+                .render_view(
+                    &plan,
+                    &fin(&input),
+                    &mut cache,
+                    &req,
+                    Some(&prev),
+                    &NoMonitor,
+                )
+                .unwrap();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+            prev = got.view;
+        }
+        times.sort_by(f64::total_cmp);
+        let frames = (secs * 48_000) as f64;
+        eprintln!(
+            "{secs} 秒・正規化の手前：1 手 {:.1} ms（中央値。最小 {:.1}・最大 {:.1}）・{:.1} ns / フレーム",
+            times[2],
+            times[0],
+            times[4],
+            times[2] * 1e6 / frames
+        );
+    }
+}

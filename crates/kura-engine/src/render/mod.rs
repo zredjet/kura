@@ -21,6 +21,7 @@ pub mod cache;
 pub mod delta;
 pub mod estimate;
 mod incremental;
+pub mod presolve;
 pub mod preview;
 pub mod region;
 pub mod view;

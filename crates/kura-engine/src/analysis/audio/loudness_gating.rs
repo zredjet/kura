@@ -214,6 +214,12 @@ impl Analysis for LoudnessGating {
         ]
     }
 
+    /// 正規化の手前の手の実測（M17 段 3。`tests/stateful.rs` の `normalize_step_timings`、M4 Max・3 スレッド・48 kHz ステレオ
+    /// で 12.2〜13.6 ns / フレーム（5 秒は 19.0））に少し余裕を足した値。
+    fn solve_ns_per_frame(_p: &NoParams, _input: &Shape) -> f64 {
+        12.5
+    }
+
     fn estimate(_p: &NoParams, input: &Shape) -> Estimate {
         let Shape::Audio {
             rate,

@@ -149,7 +149,16 @@ pub trait Analysis: Send + Sync + 'static {
     fn stream(_p: &Self::Params, _input: &Shape) -> Option<Box<dyn AudioStream>> {
         None
     }
+    /// 形 `input` の音声を流して解き、表示を全体で描き直す 1 手のフレームあたりの時間の推定（ns。M4 Max・プール 3 スレッド・
+    /// release の実測の係数。値には効かない。エディタが「手ごとに正で描くか、流し解きを裏の仕事にするか」を決める。
+    /// docs/editing.md §18.3・§18.5。M17 段 3）。既定は状態を運ばない解析の目安。
+    fn solve_ns_per_frame(_p: &Self::Params, _input: &Shape) -> f64 {
+        DEFAULT_SOLVE_NS_PER_FRAME
+    }
 }
+
+/// 流し解きの推定の既定（ns / フレーム。[`Analysis::solve_ns_per_frame`]）。段 2 の実測の「状態を運ぶ段 0」の分。
+pub const DEFAULT_SOLVE_NS_PER_FRAME: f64 = 12.0;
 
 /// 流れの解析（M13 段 1・2：begin → feed → finish）。`feed` は頭から順に、重ならず、全チャンネルの同じ区間を渡して呼ぶ（窓の
 /// 大きさは任意。実行器・デコードはチャンクに揃える）。`finish` の結果は、全体を `Analysis::run` で解いたものと同じ。
@@ -217,6 +226,12 @@ pub trait DynAnalysis: Send + Sync {
         params: &serde_json::Value,
         input: &Shape,
     ) -> Result<Option<Box<dyn AudioStream>>, EngineError>;
+    /// 流し解きの推定（`Analysis::solve_ns_per_frame`。ns / フレーム）。
+    fn solve_ns_per_frame(
+        &self,
+        params: &serde_json::Value,
+        input: &Shape,
+    ) -> Result<f64, EngineError>;
 }
 
 struct Entry<A: Analysis>(PhantomData<fn() -> A>);
@@ -366,6 +381,15 @@ impl<A: Analysis> DynAnalysis for Entry<A> {
     ) -> Result<Option<Box<dyn AudioStream>>, EngineError> {
         let p = self.typed(params).map_err(EngineError::Invalid)?;
         Ok(A::stream(&p, input))
+    }
+
+    fn solve_ns_per_frame(
+        &self,
+        params: &serde_json::Value,
+        input: &Shape,
+    ) -> Result<f64, EngineError> {
+        let p = self.typed(params).map_err(EngineError::Invalid)?;
+        Ok(A::solve_ns_per_frame(&p, input))
     }
 }
 

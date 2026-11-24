@@ -127,9 +127,19 @@ pub struct EstimateSpec<'a> {
     /// 先に見る。その出力を書き出すなら（`outputs`）、流して書く量で数える（M13 段 3：窓の出力 ＋ エンコーダの
     /// `Encoder::stream_work_bytes` ＋ 値のダイジェストの作業領域 ＋ 遅延の入力の `resident`。書いたバイト列は持たない）。
     pub stream: Option<OutputId>,
+    /// ポートの範囲（流し解きの仕事 `PresolveJob` が、申告したノードの入力のポートを区切りで流す窓。M17 段 3）の見積もり：
+    /// ポートがノードなら、そのノードを `area` だけ描く量（範囲の描画と同じ数え方）、＋ 渡す窓の写し（区間 × チャンネル ×
+    /// 4）。`area`・`stream` より先に見て、出力は数えない。
+    pub port_area: Option<(PortRef, crate::render::region::Area)>,
 }
 
 impl<'a> EstimateSpec<'a> {
+    /// ポート `port` の値を `area` だけ描いて流す見積もりにする（[`EstimateSpec::port_area`]。M17 段 3）。
+    pub fn port_area(mut self, port: PortRef, area: crate::render::region::Area) -> Self {
+        self.port_area = Some((port, area));
+        self
+    }
+
     /// 描くだけの見積もり（入力はメモリにあって数える・書き出さない・ダイジェストを取らない）。`tasks` は並列の数。
     pub fn new(tasks: u64) -> Self {
         Self {
@@ -347,6 +357,9 @@ impl Engine {
         spec: &EstimateSpec<'_>,
         cache: Option<CacheProbe<'_>>,
     ) -> Result<MemoryEstimate, EngineError> {
+        if spec.port_area.is_some() {
+            return self.estimate_with(plan, spec, cache, false, None);
+        }
         let Some(out) = spec.stream else {
             return self.estimate_with(plan, spec, cache, false, None);
         };
@@ -436,9 +449,16 @@ impl Engine {
             input_buf.insert(*id, ledger.add(bytes));
         }
         // 描く（範囲の描画なら、後ろからの走査で描くノードと量を求めておく）
-        let region = match &spec.area {
-            Some((out, area)) => self.output_region(plan, *out, area, &hits, cache, tasks, pad)?,
-            None => None,
+        let region = match (&spec.port_area, &spec.area) {
+            (Some((PortRef::Node { id }, area)), _) => {
+                Some(self.node_region(plan, *id, area, &hits, cache, tasks)?)
+            }
+            // 計画の入力のポートは描かない（流す窓の写しだけ。下で数える）
+            (Some((PortRef::Input { .. }, _)), _) => Some(RegionCost::default()),
+            (None, Some((out, area))) => {
+                self.output_region(plan, *out, area, &hits, cache, tasks, pad)?
+            }
+            (None, None) => None,
         };
         // 流す出力（`output_stream`）は解いた結果を呼び出しをまたいで持つので、2 つ目からの窓では、表は窓の頭から生きている：
         // 描く結果をすべて頭から数えておく（保守的。M17 段 1）
@@ -466,7 +486,28 @@ impl Engine {
         // 出力：量子化した値は新しい値（量子化は音声の出力だけ）。範囲の描画は頼んだ区間のチャンクの分だけを量子化する
         // （入力をそのまま出す出力・外したノードだけの鎖・全体で描いた出力のノードも同じ。render/area.rs の `AudioFinish`）。
         // ダイジェストは出力ごとに帯を持つ（範囲の描画は頼んだ出力の描いた分だけ）
+        if let Some((port, area)) = &spec.port_area {
+            // 流す窓の写し（`read_planes`）
+            let shape = super::area::Shapes::of(plan).port(port);
+            if let Some(
+                s @ Shape::Audio {
+                    channels, frames, ..
+                },
+            ) = shape
+            {
+                let target = super::area::clip_to_canvas(area, &s);
+                ledger.add(
+                    super::audio::covered_frames(&target, frames.max())
+                        .saturating_mul(u64::from(channels))
+                        .saturating_mul(4),
+                );
+                render = render.max(ledger.live);
+            }
+        }
         for (k, (id, _, shape, quantize)) in plan.outputs.iter().enumerate() {
+            if spec.port_area.is_some() {
+                break;
+            }
             let bytes = match &spec.area {
                 Some((out, _)) if out != id => continue,
                 Some((_, area)) => match shape {
@@ -742,6 +783,40 @@ impl Engine {
             });
         }
         Ok((render, nodes))
+    }
+
+    /// ノード `node` の出力を `area` だけ描く量（[`EstimateSpec::port_area`]）。
+    fn node_region(
+        &self,
+        plan: &Plan,
+        node: NodeId,
+        area: &crate::render::region::Area,
+        hits: &Hits,
+        cache: Option<CacheProbe<'_>>,
+        tasks: u64,
+    ) -> Result<RegionCost, EngineError> {
+        let shape = super::area::Shapes::of(plan)
+            .port(&PortRef::Node { id: node })
+            .ok_or_else(|| {
+                EngineError::Internal(format!("見積もりのノード {} はありません", node.0))
+            })?;
+        let probe = match cache {
+            Some(p) => Some((super::area::PassCx::new(self, plan, p.inputs)?, p.cache)),
+            None => None,
+        };
+        let target = super::area::clip_to_canvas(area, &shape);
+        self.region_cost(
+            plan,
+            node,
+            target,
+            hits,
+            probe.as_ref(),
+            tasks,
+            0,
+            false,
+            &mut PresolveMemo::new(),
+            &BTreeSet::new(),
+        )
     }
 
     /// 範囲の描画の出力 `output`・範囲 `area` の量（入力をそのまま出す出力は None）。

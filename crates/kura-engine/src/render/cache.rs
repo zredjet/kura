@@ -284,6 +284,9 @@ pub struct NodeCache {
     chunks: BTreeMap<usize, (u32, u64)>,
     /// 呼び手が持つ値（エディタの入力・配信のために持つ全体の値など）。数えるが追い出さない。登録した順。
     externals: Vec<(Value, Vec<usize>)>,
+    /// 呼び手が持つ解析の結果（エディタが握る計画の状態の表など。M17 段 3）：鍵 → (結果, 数えるバイト数)。数えるが追い出さ
+    /// ない。項目（`entries`）と同じ鍵は持たない（登録すると項目から移す）。
+    external_analyses: BTreeMap<Fingerprint, (AnyOutput, u64)>,
     bytes: u64,
     capacity: u64,
     pins: BTreeSet<Fingerprint>,
@@ -303,6 +306,7 @@ impl NodeCache {
             tick: 0,
             chunks: BTreeMap::new(),
             externals: Vec::new(),
+            external_analyses: BTreeMap::new(),
             bytes: 0,
             capacity,
             pins: BTreeSet::new(),
@@ -369,9 +373,75 @@ impl NodeCache {
     /// 申告した解析の結果（鍵は `analysis_fingerprint`）を持っていれば true（使った順は変えない。範囲の描画の見積もりと、
     /// 流し解きが要るかの判断に使う。M13 段 1）。
     pub fn contains_analysis(&self, fp: &Fingerprint) -> bool {
-        self.entries
-            .get(fp)
-            .is_some_and(|e| matches!(e.stored, Stored::Analysis(_)))
+        self.external_analyses.contains_key(fp)
+            || self
+                .entries
+                .get(fp)
+                .is_some_and(|e| matches!(e.stored, Stored::Analysis(_)))
+    }
+
+    /// 申告した解析の結果（鍵は `analysis_fingerprint`）を、使った順を変えずに引く（呼び手が握るため。M17 段 3）。
+    pub fn peek_analysis(&self, fp: &Fingerprint) -> Option<AnyOutput> {
+        if let Some((out, _)) = self.external_analyses.get(fp) {
+            return Some(out.clone());
+        }
+        match self.entries.get(fp) {
+            Some(Entry {
+                stored: Stored::Analysis(a),
+                ..
+            }) => Some(a.clone()),
+            _ => None,
+        }
+    }
+
+    /// 呼び手が持つ解析の結果（エディタが握る計画の状態の表など。M17 段 3）を、鍵 `key`・大きさ `bytes` で数えに入れる
+    /// （追い出さない。同じ鍵の項目があれば項目から移す。同じ鍵の外の解析があれば入れ替える）。[`NodeCache::clear`] で
+    /// 外れる。数えに足したバイト数を返す。
+    pub fn register_external_analysis(
+        &mut self,
+        key: Fingerprint,
+        out: AnyOutput,
+        bytes: u64,
+    ) -> u64 {
+        self.remove(&key);
+        if let Some((_, old)) = self.external_analyses.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old);
+        }
+        self.external_analyses.insert(key, (out, bytes));
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.evict_to(self.capacity);
+        bytes
+    }
+
+    /// 外の解析を外す（数えなくなったバイト数。登録していなければ None）。
+    pub fn unregister_external_analysis(&mut self, key: &Fingerprint) -> Option<u64> {
+        let (out, bytes) = self.external_analyses.remove(key)?;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        drop(out);
+        Some(bytes)
+    }
+
+    /// 外の解析を、ふつうの項目に戻す（使った順のいちばん新しいものとして入れ、上限を超えれば古い順に追い出す。上限より
+    /// 大きければ入れない）。取り消しで前の計画に戻ったとき、残っていれば解き直さない。登録していなければ false。
+    pub fn demote_external_analysis(&mut self, key: &Fingerprint) -> bool {
+        let Some((out, bytes)) = self.external_analyses.remove(key) else {
+            return false;
+        };
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.insert(
+            *key,
+            Stored::Analysis(out),
+            Origin::Exact,
+            Vec::new(),
+            Vec::new(),
+            bytes,
+        );
+        true
+    }
+
+    /// 外の解析の鍵（登録した鍵の順）。
+    pub fn external_analysis_keys(&self) -> Vec<Fingerprint> {
+        self.external_analyses.keys().copied().collect()
     }
 
     /// 固定している指紋。
@@ -500,8 +570,11 @@ impl NodeCache {
         }
     }
 
-    /// 解析の結果を引く。
+    /// 解析の結果を引く（外の解析を含む）。
     pub(super) fn get_analysis(&mut self, fp: &Fingerprint) -> Option<AnyOutput> {
+        if let Some((out, _)) = self.external_analyses.get(fp) {
+            return Some(out.clone());
+        }
         let out = match self.entries.get(fp) {
             Some(Entry {
                 stored: Stored::Analysis(a),
@@ -570,6 +643,10 @@ impl NodeCache {
         {
             self.stats.refused += 1;
             return false;
+        }
+        // 呼び手が持つ解析と同じ鍵は入れない（同じ結果を二重に数えない）
+        if matches!(stored, Stored::Analysis(_)) && self.external_analyses.contains_key(&fp) {
+            return true;
         }
         self.remove(&fp);
         let chunks = match &stored {
