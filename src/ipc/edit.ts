@@ -20,6 +20,7 @@ import {
   type EditChangedDto,
   type EditDocDeltaDto_Serialize,
   type EditDraftDto,
+  type EditEqCurveDto,
   type EditFormatsDto,
   type EditFrameDto,
   type EditHandleDto,
@@ -199,6 +200,20 @@ export function sampleEdit(
  */
 export function snapEdit(session: string, frame: number, radius: number): Promise<EditSnapDto> {
   return unwrap(commands.editSnap(session, frame, radius));
+}
+
+/**
+ * イコライザの曲線（M17 段 2）：`audio.eq` の引数とレート・チャンネルの数で、`points` 点（2〜2,048）の対数の格子（20 Hz〜
+ * ナイキスト）のバンドごと・合成の利得（dB）と係数。式は Rust だけにあり、ここは返った点を描くのに使う。描かず、セッションも
+ * 待たない（ドラッグの間に毎回の描画で追う）。
+ */
+export function eqCurve(
+  params: JsonValue,
+  rate: number,
+  channels: number,
+  points: number,
+): Promise<EditEqCurveDto> {
+  return unwrap(commands.editEqCurve({ params, rate, channels, points }));
 }
 
 /**

@@ -67,6 +67,8 @@ pub enum ParamKind {
     Margin,
     /// キャンバスの 1 辺の長さ（`{"px": n}`・`{"scale": …}`・`"keep"`・`{"multipleOf": n}`・`"pow2"`・`"longest"`。M14 段 1）。
     CanvasLength,
+    /// イコライザのバンドの列（`[{ type, freq, gainDb, q, slope, channel, enabled }]`。M17 段 2。`ops::audio::eq`）。
+    EqBands,
 }
 
 /// 引数の単位。
@@ -250,6 +252,8 @@ impl ParamSchema {
                     Some(n) => !crate::geom::coord_ok(n),
                     None => px.is_u64(),
                 }),
+                // バンドの数・周波数・利得・Q・傾き・段の数（M17 段 2）
+                ParamKind::EqBands => crate::ops::audio::eq::bands_out_of_range(v),
                 _ => false,
             };
             if bad {
@@ -290,6 +294,7 @@ impl ParamSchema {
                 ParamKind::Float { .. } => v.is_number(),
                 ParamKind::Bool => v.is_boolean(),
                 ParamKind::Enum { .. } => v.is_string(),
+                ParamKind::EqBands => v.is_array(),
                 _ => v.is_object(),
             };
             if !typed {

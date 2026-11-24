@@ -53,6 +53,7 @@ register_ops! {
         audio::set_loop::SetLoop,
         audio::normalize::Normalize,
         audio::resample::Resample,
+        audio::eq::Eq,
     ],
     legacy: [],
     // なくした操作の最後の版（新しく作れないが、作り直しに使う。§8.4）
@@ -97,6 +98,7 @@ mod tests {
         assert_eq!(
             nonzero,
             [
+                "audio.eq",
                 "audio.fade",
                 "audio.gain",
                 "audio.mono",

@@ -62,6 +62,15 @@ pub const PAIRS: &[Pair] = &[
         reads: &[],
         check: set_loop_is_read_back,
     },
+    // M17 段 2：イコライザ。状態の表の状態と「有限でない標本があったか」を読む
+    Pair {
+        op: "audio.eq",
+        op_v: 1,
+        analysis: "audio.eq_state",
+        analysis_v: 1,
+        reads: &["states", "nonFinite"],
+        check: eq_matches_the_sequential_reference,
+    },
     // M17 段 1：試験の状態を運ぶ操作（登録しない。試験用のエンジンにだけある）。表の状態と「有限でない標本があったか」を
     // 読む（旗はそのままの位置の元の値を出すかを決める）
     Pair {
@@ -83,6 +92,19 @@ pub const UNPAIRED: &[(&str, &str)] = &[(
 /// 偽の値の作り方（操作が申告する解析ごとに、結果の欄ごと。JSON の結果は欄の一覧が結果の欄と同じであること）。
 /// バイナリの結果の解析を申告させるときは、型付きの値を変える `Perturb::Typed` で欄ごとに足す。
 pub const FAKES: &[(&str, &[FakeField])] = &[
+    (
+        "audio.eq_state",
+        &[
+            FakeField {
+                field: "states",
+                perturb: Perturb::Typed(shift_states),
+            },
+            FakeField {
+                field: "nonFinite",
+                perturb: Perturb::Typed(flip_non_finite),
+            },
+        ],
+    ),
     (
         kura_engine::testing::stateful::STATE_ID,
         &[
@@ -133,6 +155,97 @@ fn shift_states(out: &AnyOutput) -> Option<AnyOutput> {
 fn flip_non_finite(out: &AnyOutput) -> Option<AnyOutput> {
     let t = out.downcast_ref::<StateTable>()?;
     Some(Arc::new(t.perturbed(|x| x, !t.non_finite())))
+}
+
+/// イコライザ（M17 段 2）：どの例でも、出力は 1 標本ずつ順に流した参照とビット一致する（表の解析で解いた状態から区間を
+/// 描いた値が、順に流した値と同じ）。参照は推論を通したバンドの係数で、領域が替わる所だけ M/S に変換する。
+fn eq_matches_the_sequential_reference(engine: &Engine, p: &Pair) -> Result<(), String> {
+    use kura_engine::ops::audio::eq::{EqParams, Target, resolve};
+    for ex in p.examples(engine)? {
+        let input = ex.inputs[0].generate().map_err(err)?;
+        let out = p.apply(engine, ex.params.clone(), &input)?;
+        let params: EqParams = serde_json::from_value(ex.params.clone()).map_err(err)?;
+        let (Value::Audio(a), Value::Audio(got)) = (&input, &out) else {
+            return Err(format!("{}：音声ではない", ex.name));
+        };
+        let ch = a.channels();
+        let r = resolve(&params, a.rate(), ch).map_err(|e| format!("{e:?}"))?;
+        let gain = kura_engine::math::db_to_gain(params.gain_db);
+        let n = a.frames();
+        let planes: Vec<Vec<f32>> = (0..ch)
+            .map(|c| {
+                let mut v = vec![0f32; n];
+                a.read(c, 0, &mut v).map(|_| v)
+            })
+            .collect::<Result<_, _>>()
+            .map_err(err)?;
+        let ms_lane = r.has_ms() && ch == 2;
+        let mut st: Vec<Vec<Vec<[f64; 4]>>> = r
+            .bands
+            .iter()
+            .map(|b| vec![vec![[0.0; 4]; b.sections.len()]; ch.max(2)])
+            .collect();
+        for t in 0..n {
+            let mut v: Vec<f64> = planes
+                .iter()
+                .map(|q| {
+                    if q[t].is_finite() {
+                        f64::from(q[t])
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let mut ms = false;
+            for (bi, b) in r.bands.iter().enumerate() {
+                let want_ms = matches!(b.target, Target::Mid | Target::Side);
+                if ms_lane && want_ms != ms {
+                    let (x0, x1) = (v[0], v[1]);
+                    if want_ms {
+                        v[0] = (x0 + x1) * 0.5;
+                        v[1] = (x0 - x1) * 0.5;
+                    } else {
+                        v[0] = x0 + x1;
+                        v[1] = x0 - x1;
+                    }
+                    ms = want_ms;
+                }
+                let sigs: Vec<usize> = match b.target {
+                    Target::All => (0..ch).collect(),
+                    Target::Channel(c) => vec![c],
+                    Target::Mid => vec![0],
+                    Target::Side => vec![1],
+                };
+                for sig in sigs {
+                    for (si, s) in b.sections.iter().enumerate() {
+                        let z = &mut st[bi][sig][si];
+                        let x = v[sig];
+                        let y = s.b0 * x + s.b1 * z[0] + s.b2 * z[1] - s.a1 * z[2] - s.a2 * z[3];
+                        *z = [x, z[0], y, z[2]];
+                        v[sig] = y;
+                    }
+                }
+            }
+            if ms {
+                let (x0, x1) = (v[0], v[1]);
+                v[0] = x0 + x1;
+                v[1] = x0 - x1;
+            }
+            for c in 0..ch {
+                let want = if planes[c][t].is_finite() {
+                    (v[c] * gain) as f32
+                } else {
+                    planes[c][t]
+                };
+                let mut g = [0f32];
+                got.read(c, t as u64, &mut g).map_err(err)?;
+                if g[0].to_bits() != want.to_bits() {
+                    return Err(format!("{}：チャンネル {c} の {t} が参照と違う", ex.name));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 試験の状態を運ぶ操作（M17 段 1）：どの例（何も変えない例を含む）でも、出力は先頭から順に流した参照とビット一致する
@@ -208,6 +321,7 @@ pub fn kernel_registry(op: &str, v: u16) -> Option<Result<Registry, String>> {
     let mut r = Registry::empty();
     let added = match (op, v) {
         ("audio.normalize", 1) => r.add_current::<KernelOf<Normalize>>(),
+        ("audio.eq", 1) => r.add_current::<KernelOf<kura_engine::ops::audio::eq::Eq>>(),
         (kura_engine::testing::stateful::OP_ID, 1) => {
             r.add_current::<KernelOf<kura_engine::testing::stateful::Iir1Op>>()
         }

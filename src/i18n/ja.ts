@@ -865,6 +865,11 @@ export const ja = {
      * （`values[key][value]`）。カタログのすべての操作・引数・列挙の値に文言があることを Editor.test.tsx が確かめる。
      */
     ops: {
+      'audio.eq': {
+        name: 'イコライザ',
+        params: { bands: 'バンド', phase: '位相', gainDb: '出力の利得' },
+        values: { phase: { minimum: '最小位相', linear: '直線位相' } },
+      },
       'audio.fade': {
         name: 'フェード',
         params: { fadeIn: 'フェードイン', fadeOut: 'フェードアウト', curve: '曲線' },
@@ -1056,6 +1061,8 @@ export const ja = {
     noParams: '設定はありません',
     advanced: '詳細',
     strokeCount: (n: string) => `${n} 本`,
+    /** イコライザのバンドの数（M17 段 2）。 */
+    bandCount: (n: string) => `バンド ${n} 個`,
     colorCount: (n: string) => `${n} 色`,
     laterPaint: '後ろの描画の位置はそのままです',
     legacyOp: 'この操作は古い版で作られています。設定は変えられません',
@@ -1109,6 +1116,8 @@ export const ja = {
       loudnessUnmeasurable: 'ラウドネスを計れないので、そろえませんでした',
       gainLimited: 'ピークの上限に当たるので、利得を抑えました',
       nonFiniteSamples: 'NaN・∞ の標本を 0 として処理し、その位置は元の値のまま出しました',
+      bandDropped: 'イコライザのバンドを外しました',
+      frequencyClamped: 'イコライザのバンドの周波数をナイキストの手前に止めました',
     } as Record<string, string>,
     output: '出力の形式',
     outputKeep: (format: string) => `元と同じ（${format}）`,

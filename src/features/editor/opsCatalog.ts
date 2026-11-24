@@ -187,8 +187,10 @@ export function controlFor(spec: ParamSpec): ParamControl {
       return 'grid';
     case 'ratio':
       return 'ratio';
+    // イコライザのバンドの列（eqBands。M17 段 2）は、欄をスペクトルの面と右パネルで段 5 に作る。今は数だけ
     case 'strokes':
     case 'paletteEntries':
+    case 'eqBands':
       return 'count';
     case 'frameRange':
       return 'frameRange';
@@ -533,6 +535,8 @@ export function valueSummary(op: string, spec: ParamSpec, value: JsonValue): str
       if (c.mode === 'multipleOf') return t.canvasMultiple(formatCount(c.n));
       return t.canvasModes[c.mode];
     }
+    case 'eqBands':
+      return Array.isArray(value) ? t.bandCount(formatCount(value.length)) : null;
     default:
       return null;
   }

@@ -12,6 +12,7 @@
 //! - **予算**：公開した今と直前の表示の値（`resident_bytes`）を、エディタの確保の `extra` で数える（画像は数えない。
 //!   docs/editing.md §12.10）。
 
+pub mod eq_curve;
 pub mod handles;
 #[cfg(test)]
 mod handles_tests;

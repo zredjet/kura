@@ -1318,6 +1318,74 @@ pub async fn edit_snap(
     .await
 }
 
+/// イコライザの曲線のバンド 1 つ（M17 段 2）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditEqBandCurveDto {
+    /// 引数のバンドの番号（外した・段のないバンドは出さない）。
+    pub index: u32,
+    /// `freqs` の点ごとの利得（dB）。
+    pub db: Vec<f64>,
+    /// 段の係数 `[b0, b1, b2, a1, a2]`。
+    pub sections: Vec<Vec<f64>>,
+}
+
+/// イコライザの曲線（M17 段 2。`edit_eq_curve`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditEqCurveDto {
+    /// 周波数（Hz。20 Hz〜ナイキストの対数の格子）。
+    pub freqs: Vec<f64>,
+    /// 合成（全バンドの和 ＋ 出力の利得。dB）。
+    pub total: Vec<f64>,
+    pub bands: Vec<EditEqBandCurveDto>,
+}
+
+/// イコライザの曲線の頼み（M17 段 2）。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditEqCurveRequestDto {
+    /// `audio.eq` の引数（ドラッグの仮の値でよい）。
+    #[specta(type = JsonValue)]
+    pub params: serde_json::Value,
+    /// そのノードの入力のレート（表示の `nodes[].inRate`）。
+    pub rate: u32,
+    pub channels: u16,
+    /// 点の数（2〜2,048）。
+    pub points: u32,
+}
+
+/// イコライザの曲線（M17 段 2。docs/editing.md §18.5）：`audio.eq` の引数とレート・チャンネルの数で、`points` 点（2〜2,048）の
+/// 対数の格子のバンドごと・合成の利得と係数を返す。描かず、セッションも描画の錠も待たない（ドラッグの間に点・曲線を毎回の
+/// 描画で追う）。引数が読めない・範囲の外・推論で断るなら `Invalid`。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_eq_curve(request: EditEqCurveRequestDto) -> Result<EditEqCurveDto, AppError> {
+    blocking(move || {
+        let EditEqCurveRequestDto {
+            params,
+            rate,
+            channels,
+            points,
+        } = request;
+        let c = editor::audio::eq_curve::eq_curve(&params, rate, channels, points)?;
+        Ok(EditEqCurveDto {
+            freqs: c.freqs,
+            total: c.total,
+            bands: c
+                .bands
+                .into_iter()
+                .map(|b| EditEqBandCurveDto {
+                    index: u32::try_from(b.index).unwrap_or(u32::MAX),
+                    db: b.db,
+                    sections: b.sections.iter().map(|s| s.to_vec()).collect(),
+                })
+                .collect(),
+        })
+    })
+    .await
+}
+
 /// 書ける形式 1 つ（形式の表の行。M13 段 4C）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]

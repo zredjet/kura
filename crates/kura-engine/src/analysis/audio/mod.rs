@@ -1,6 +1,7 @@
 //! 音声の解析の一覧。解析を足すときは、ファイルを 1 つ作り、ここの `mod` と `register_analyses!` の `current` に
 //! 1 行ずつ足す（画像の一覧 `analysis/image/mod.rs` とは別のファイル）。
 
+pub mod eq_state;
 pub mod loop_points;
 pub mod loudness;
 pub mod loudness_gating;
@@ -26,6 +27,7 @@ crate::analysis::register_analyses! {
         peaks::PeaksAnalysis,
         silence::SilenceAnalysis,
         loop_points::LoopAnalysis,
+        eq_state::EqState,
     ],
     legacy: [],
     dropped: [],

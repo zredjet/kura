@@ -1,5 +1,6 @@
 //! 音声の操作。
 
+pub mod eq;
 pub mod fade;
 pub mod gain;
 pub mod mono;

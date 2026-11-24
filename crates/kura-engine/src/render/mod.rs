@@ -1391,6 +1391,9 @@ mod tests {
         bumped.add_current::<OpaqueBoundsV2>().unwrap();
         bumped.add_legacy::<OpaqueBounds>().unwrap();
         bumped.add_current::<LoudnessGating>().unwrap();
+        bumped
+            .add_current::<crate::analysis::audio::eq_state::EqState>()
+            .unwrap();
         check_needs(&ops, &bumped).unwrap();
         let err = check_current_needs(&ops, &bumped).unwrap_err();
         assert!(
@@ -1402,6 +1405,9 @@ mod tests {
         let mut only_legacy = AnalysisRegistry::empty();
         only_legacy.add_legacy::<OpaqueBounds>().unwrap();
         only_legacy.add_current::<LoudnessGating>().unwrap();
+        only_legacy
+            .add_current::<crate::analysis::audio::eq_state::EqState>()
+            .unwrap();
         check_needs(&ops, &only_legacy).unwrap();
         let err = check_current_needs(&ops, &only_legacy).unwrap_err();
         assert!(err.contains("（なし）"), "{err}");

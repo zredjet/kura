@@ -62,6 +62,7 @@ describe('引数の欄の種類', () => {
     expect(controlFor(param('meta.set_pivot', 'pivot'))).toBe('point');
     expect(controlFor(param('paint.actions', 'actions'))).toBe('count');
     expect(controlFor(param('palette.replace', 'entries'))).toBe('count');
+    expect(controlFor(param('audio.eq', 'bands'))).toBe('count');
   });
 
   it('音声の区間は始め・終わりの欄（指定すると全体）、標本の引数は入力の長さを初めの値にする', () => {
@@ -180,7 +181,10 @@ describe('足す操作', () => {
     const groups = addableOps('audio');
     expect(groups.map((g) => [g.category, g.ops.map((o) => o.id).sort()])).toEqual([
       ['audioTime', ['audio.fade', 'audio.set_loop', 'audio.trim']],
-      ['audioSignal', ['audio.gain', 'audio.mono', 'audio.normalize', 'audio.resample']],
+      [
+        'audioSignal',
+        ['audio.eq', 'audio.gain', 'audio.mono', 'audio.normalize', 'audio.resample'],
+      ],
     ]);
   });
 

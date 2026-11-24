@@ -203,7 +203,7 @@ fn region_on_random_documents(
             with_state += usize::from(
                 g.nodes
                     .iter()
-                    .any(|n| n.op == kura_engine::testing::stateful::OP_ID),
+                    .any(|n| n.op == kura_engine::testing::stateful::OP_ID || n.op == "audio.eq"),
             );
             checked += 1;
         }
@@ -459,7 +459,9 @@ fn audio_region_declarations_match() {
             assert_eq!(reach, Reach::SameTime);
         }
         // 状態を運ぶ操作（M17 段 1）：変わった範囲は Prefix、核の読みは表の格子に揃えた Aligned（何も変えない引数は SameTime）
-        if op.id() == kura_engine::testing::stateful::OP_ID && reach != Reach::SameTime {
+        if (op.id() == kura_engine::testing::stateful::OP_ID || op.id() == "audio.eq")
+            && reach != Reach::SameTime
+        {
             assert!(
                 matches!(
                     op.reach(p.as_ref(), &[input.shape()]).unwrap(),
@@ -473,6 +475,7 @@ fn audio_region_declarations_match() {
     assert_eq!(
         seen.into_iter().collect::<Vec<_>>(),
         [
+            "audio.eq",
             "audio.fade",
             "audio.gain",
             "audio.mono",

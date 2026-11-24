@@ -434,6 +434,8 @@ describe('文言', () => {
       loudnessUnmeasurable: true,
       gainLimited: true,
       nonFiniteSamples: true,
+      bandDropped: true,
+      frequencyClamped: true,
     };
     for (const code of Object.keys(codes)) {
       expect(t.issues[code], code).toBeTruthy();
