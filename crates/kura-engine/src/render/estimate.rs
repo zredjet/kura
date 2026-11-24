@@ -323,10 +323,10 @@ struct RegionCost {
 /// 入れ子の流し解きで何度出てきても 1 度だけ数える（M17 段 1）。
 type Held = BTreeMap<(NodeId, usize), u64>;
 
-/// 流し解きの見積もりの覚え（上流のポートのノード, 長さ）→（窓を描いて流す間の最大, その中で解いて持つ結果）。流し解きは
-/// 上流のポートの全体を流すので、外の窓によらない。入れ子の鎖で同じポートを何度も数えないようにする（k 段で 3^k 回に
-/// ならない。M17 段 1）。
-type PresolveMemo = BTreeMap<(NodeId, u64), (u64, Held)>;
+/// 流し解きの見積もりの覚え（上流のポートのノード, 長さ, すでに解いてある鍵）→（窓を描いて流す間の最大, その中で解いて
+/// 持つ結果）。流し解きは上流のポートの全体を流すので、外の窓によらない。入れ子の鎖で同じポートを何度も数えないようにする
+/// （k 段で 3^k 回にならない。M17 段 1）。
+type PresolveMemo = BTreeMap<(NodeId, u64, Vec<(NodeId, usize)>), (u64, Held)>;
 
 /// キャッシュに当たるもの（描かないノードと、量子化した出力の番号）。
 #[derive(Default)]
@@ -437,8 +437,29 @@ impl Engine {
             Some((out, area)) => self.output_region(plan, *out, area, &hits, cache, tasks, pad)?,
             None => None,
         };
-        let (mut render, nodes) =
-            self.render_stage(plan, &mut ledger, &input_buf, &hits, region.as_ref(), tasks)?;
+        // 流す出力（`output_stream`）は解いた結果を呼び出しをまたいで持つので、2 つ目からの窓では、表は窓の頭から生きている：
+        // 描く結果をすべて頭から数えておく（保守的。M17 段 1）
+        let mut pre = BTreeSet::new();
+        if let (Some(_), Some(rc)) = (streamed, region.as_ref()) {
+            let mut all = Held::new();
+            for set in rc.held.values() {
+                for (k, b) in set {
+                    let e = all.entry(*k).or_insert(0);
+                    *e = (*e).max(*b);
+                }
+            }
+            ledger.add(all.values().fold(0u64, |a, b| a.saturating_add(*b)));
+            pre = all.into_keys().collect();
+        }
+        let (mut render, nodes) = self.render_stage(
+            plan,
+            &mut ledger,
+            &input_buf,
+            &hits,
+            region.as_ref(),
+            tasks,
+            &pre,
+        )?;
         // 出力：量子化した値は新しい値（量子化は音声の出力だけ）。範囲の描画は頼んだ区間のチャンクの分だけを量子化する
         // （入力をそのまま出す出力・外したノードだけの鎖・全体で描いた出力のノードも同じ。render/area.rs の `AudioFinish`）。
         // ダイジェストは出力ごとに帯を持つ（範囲の描画は頼んだ出力の描いた分だけ）
@@ -597,6 +618,7 @@ impl Engine {
     /// 描く段の量（読み終えた入力を持った `ledger` から）：計画の順に、描くノードの値と作業領域を足し、最後の使い手のあとで
     /// 落とす。`region` があれば範囲の描画の量（描かないノードは 0、範囲を持つ音声のノードは描くチャンクの分。流し解きは核で
     /// 描く前に終わるので、描く間の量との大きいほう）。返すのは段の最大とノードごとの見積もり。
+    #[allow(clippy::too_many_arguments)]
     fn render_stage(
         &self,
         plan: &Plan,
@@ -605,13 +627,14 @@ impl Engine {
         hits: &Hits,
         region: Option<&RegionCost>,
         tasks: u64,
+        pre: &BTreeSet<(NodeId, usize)>,
     ) -> Result<(u64, Vec<NodeEstimate>), EngineError> {
         let mut render = ledger.live;
         let mut shapes: BTreeMap<NodeId, Shape> = BTreeMap::new();
         let mut node_buf: BTreeMap<NodeId, usize> = BTreeMap::new();
         let mut nodes = Vec::with_capacity(plan.nodes.len());
-        // 描画の終わりまで持つ解析の結果のうち、もう数えたもの（同じ表を 2 度数えない）
-        let mut counted: BTreeSet<(NodeId, usize)> = BTreeSet::new();
+        // 描画の終わりまで持つ解析の結果のうち、もう数えたもの（同じ表を 2 度数えない。`pre` は呼び手の帳簿が数えてある鍵）
+        let mut counted: BTreeSet<(NodeId, usize)> = pre.clone();
         let buf_of = |node_buf: &BTreeMap<NodeId, usize>, r: &PortRef| match r {
             PortRef::Input { id } => input_buf.get(id).copied(),
             PortRef::Node { id } => node_buf.get(id).copied(),
@@ -649,6 +672,16 @@ impl Engine {
                 .iter()
                 .filter(|(k, _)| k.0 != node.id && !counted.contains(k))
                 .fold(0u64, |a, (_, b)| a.saturating_add(*b));
+            // このノードの結果が呼び手の帳簿で先に数えてある（流す出力・入れ子の窓）なら、作業領域と流し解きの項から引く
+            // （同じ表を 2 度数えない）
+            let own_pre = held
+                .iter()
+                .filter(|(k, _)| k.0 == node.id && pre.contains(k))
+                .fold(0u64, |a, (_, b)| a.saturating_add(*b));
+            let (work, presolve) = (
+                work.saturating_sub(own_pre),
+                presolve.saturating_sub(own_pre),
+            );
             // 流し解きは核で描く前に終わる（入力の窓を流す間の最大と、描く間の最大の大きいほう）。描く間も、流し解きの中で
             // 解いた上流の結果は生きている
             let at = ledger.live.saturating_add(
@@ -736,6 +769,7 @@ impl Engine {
             0,
             pad,
             &mut PresolveMemo::new(),
+            &BTreeSet::new(),
         )?))
     }
 
@@ -754,6 +788,7 @@ impl Engine {
         depth: usize,
         pad: bool,
         memo: &mut PresolveMemo,
+        outside: &BTreeSet<(NodeId, usize)>,
     ) -> Result<RegionCost, EngineError> {
         use crate::value::AUDIO_CHUNK;
         let shapes = super::area::Shapes::of(plan);
@@ -834,134 +869,175 @@ impl Engine {
                 rc.held.entry(*id).or_default().insert((*id, k), bytes);
             }
         }
-        for (id, rounded) in &walk.regional {
-            let Some(node) = index.get(id) else { continue };
-            let Shape::Audio {
-                channels,
-                frames: crate::shape::Dim::Exact(n),
-                ..
-            } = node.inferred.shape
-            else {
-                continue;
-            };
-            let n = usize::try_from(n).unwrap_or(usize::MAX);
-            let frames: u64 = super::audio::chunks_covering(rounded, n)
-                .iter()
-                .map(|k| (n - k * AUDIO_CHUNK).min(AUDIO_CHUNK) as u64)
-                .sum();
-            rc.bytes.insert(
-                *id,
-                frames.saturating_mul(u64::from(channels)).saturating_mul(4),
-            );
-            // 流し解き：入力が部分の値で、解析がキャッシュにないもの
-            let mut extra = 0u64;
-            let mut inner_all = Held::new();
-            for need in &node.needs {
-                let Some(r) = node.inputs.get(need.input) else {
-                    continue;
-                };
-                let complete = match r {
-                    PortRef::Input { .. } => true,
-                    PortRef::Node { id } => complete.get(id).copied().unwrap_or(false),
-                };
-                let cached = match probe {
-                    Some((cx, cache)) => {
-                        let fp = match r {
-                            PortRef::Input { id } => cx.input_fps.get(id).copied(),
-                            PortRef::Node { id } => cx.fps.nodes.get(id).copied(),
+        // 先に解いてある鍵：呼び手の段で解いたもの（`outside`）と、計画の順で前にある描くノードが解いたもの（範囲の描画は
+        // 計画の順に描き、描くノードは申告を解いてこの描画の表に入れる。描く区間がなく解かないことのあるノード
+        // （`blank_region`）は入れない）。流し解きの窓の中では、それらを解き直さず、呼び手の帳簿が数えてある
+        let mut solved = outside.clone();
+        for planned in &plan.nodes {
+            let id = &planned.id;
+            if let Some(rounded) = walk.regional.get(id) {
+                'body: {
+                    let Some(node) = index.get(id) else {
+                        break 'body;
+                    };
+                    let Shape::Audio {
+                        channels,
+                        frames: crate::shape::Dim::Exact(n),
+                        ..
+                    } = node.inferred.shape
+                    else {
+                        break 'body;
+                    };
+                    let n = usize::try_from(n).unwrap_or(usize::MAX);
+                    let frames: u64 = super::audio::chunks_covering(rounded, n)
+                        .iter()
+                        .map(|k| (n - k * AUDIO_CHUNK).min(AUDIO_CHUNK) as u64)
+                        .sum();
+                    rc.bytes.insert(
+                        *id,
+                        frames.saturating_mul(u64::from(channels)).saturating_mul(4),
+                    );
+                    // 流し解き：入力が部分の値で、解析がキャッシュにないもの
+                    let mut extra = 0u64;
+                    let mut inner_all = Held::new();
+                    for (k, need) in node.needs.iter().enumerate() {
+                        let Some(r) = node.inputs.get(need.input) else {
+                            continue;
                         };
-                        match fp {
-                            Some(fp) => {
-                                let key = super::cache::analysis_fingerprint(
-                                    fp,
-                                    need.id,
-                                    need.v,
-                                    &need.params,
-                                )?;
-                                cache.contains_analysis(&key)
-                            }
-                            None => false,
+                        // 前のノードが解いてある（この描画の表にある）
+                        if solved.contains(&(*id, k)) {
+                            continue;
                         }
-                    }
-                    None => false,
-                };
-                if complete || cached {
-                    continue;
-                }
-                let in_shape = shapes
-                    .port(r)
-                    .ok_or_else(|| EngineError::Internal("解析する入力の形がありません".into()))?;
-                let result = self
-                    .solvable(need)?
-                    .estimate(&need.params, &in_shape)
-                    .map_or(0, |e| e.bytes);
-                let (window, inner_held): (u64, Held) = match (r, in_shape) {
-                    (
-                        PortRef::Node { id: up },
-                        Shape::Audio {
-                            frames: crate::shape::Dim::Exact(m),
-                            ..
-                        },
-                    ) if depth < plan.nodes.len() => {
-                        if let Some(known) = memo.get(&(*up, m)) {
-                            known.clone()
-                        } else {
-                            // 窓 0 の区間だけでは窓ごとの最大にならない（縮めるリサンプルでは、間の窓が上流のノードごとに
-                            // 1 チャンク多く掛かる）ので、どの窓でも超えない数え方（`stream_windows_bound`）の最大
-                            let (mut most, mut inner_held) = (0u64, Held::new());
-                            for (window, pad) in stream_windows_bound(m) {
-                                let inner = self.region_cost(
-                                    plan,
-                                    *up,
-                                    window,
-                                    hits,
-                                    probe,
-                                    tasks,
-                                    depth + 1,
-                                    pad,
-                                    memo,
-                                )?;
-                                let mut fresh = Ledger::default();
-                                let inputs: BTreeMap<InputId, usize> =
-                                    plan.inputs.keys().map(|k| (*k, fresh.add(0))).collect();
-                                let at = self
-                                    .render_stage(
-                                        plan,
-                                        &mut fresh,
-                                        &inputs,
-                                        hits,
-                                        Some(&inner),
-                                        tasks,
-                                    )?
-                                    .0;
-                                most = most.max(at);
-                                for set in inner.held.values() {
-                                    for (k, b) in set {
-                                        let e = inner_held.entry(*k).or_insert(0);
-                                        *e = (*e).max(*b);
+                        let complete = match r {
+                            PortRef::Input { .. } => true,
+                            PortRef::Node { id } => complete.get(id).copied().unwrap_or(false),
+                        };
+                        let cached = match probe {
+                            Some((cx, cache)) => {
+                                let fp = match r {
+                                    PortRef::Input { id } => cx.input_fps.get(id).copied(),
+                                    PortRef::Node { id } => cx.fps.nodes.get(id).copied(),
+                                };
+                                match fp {
+                                    Some(fp) => {
+                                        let key = super::cache::analysis_fingerprint(
+                                            fp,
+                                            need.id,
+                                            need.v,
+                                            &need.params,
+                                        )?;
+                                        cache.contains_analysis(&key)
                                     }
+                                    None => false,
                                 }
                             }
-                            memo.insert((*up, m), (most, inner_held.clone()));
-                            (most, inner_held)
+                            None => false,
+                        };
+                        if complete || cached {
+                            continue;
+                        }
+                        let in_shape = shapes.port(r).ok_or_else(|| {
+                            EngineError::Internal("解析する入力の形がありません".into())
+                        })?;
+                        let result = self
+                            .solvable(need)?
+                            .estimate(&need.params, &in_shape)
+                            .map_or(0, |e| e.bytes);
+                        let (window, inner_held): (u64, Held) = match (r, in_shape) {
+                            (
+                                PortRef::Node { id: up },
+                                Shape::Audio {
+                                    frames: crate::shape::Dim::Exact(m),
+                                    ..
+                                },
+                            ) if depth < plan.nodes.len() => {
+                                let memo_key = (*up, m, solved.iter().copied().collect::<Vec<_>>());
+                                if let Some(known) = memo.get(&memo_key) {
+                                    known.clone()
+                                } else {
+                                    // 窓 0 の区間だけでは窓ごとの最大にならない（縮めるリサンプルでは、間の窓が上流のノードごとに
+                                    // 1 チャンク多く掛かる）ので、どの窓でも超えない数え方（`stream_windows_bound`）の最大
+                                    let (mut most, mut inner_held) = (0u64, Held::new());
+                                    for (window, pad) in stream_windows_bound(m) {
+                                        let inner = self.region_cost(
+                                            plan,
+                                            *up,
+                                            window,
+                                            hits,
+                                            probe,
+                                            tasks,
+                                            depth + 1,
+                                            pad,
+                                            memo,
+                                            &solved,
+                                        )?;
+                                        let mut fresh = Ledger::default();
+                                        let inputs: BTreeMap<InputId, usize> = plan
+                                            .inputs
+                                            .keys()
+                                            .map(|k| (*k, fresh.add(0)))
+                                            .collect();
+                                        let at = self
+                                            .render_stage(
+                                                plan,
+                                                &mut fresh,
+                                                &inputs,
+                                                hits,
+                                                Some(&inner),
+                                                tasks,
+                                                &solved,
+                                            )?
+                                            .0;
+                                        most = most.max(at);
+                                        for set in inner.held.values() {
+                                            for (k, b) in set {
+                                                let e = inner_held.entry(*k).or_insert(0);
+                                                *e = (*e).max(*b);
+                                            }
+                                        }
+                                    }
+                                    memo.insert(memo_key, (most, inner_held.clone()));
+                                    (most, inner_held)
+                                }
+                            }
+                            _ => (0, Held::new()),
+                        };
+                        extra = extra.saturating_add(window).saturating_add(result);
+                        for (k, b) in inner_held {
+                            let e = inner_all.entry(k).or_insert(0);
+                            *e = (*e).max(b);
                         }
                     }
-                    _ => (0, Held::new()),
-                };
-                extra = extra.saturating_add(window).saturating_add(result);
-                for (k, b) in inner_held {
-                    let e = inner_all.entry(k).or_insert(0);
-                    *e = (*e).max(b);
+                    if extra > 0 {
+                        rc.presolve.insert(*id, extra);
+                    }
+                    if !inner_all.is_empty() {
+                        let set = rc.held.entry(*id).or_default();
+                        for (k, b) in inner_all {
+                            let e = set.entry(k).or_insert(0);
+                            *e = (*e).max(b);
+                        }
+                    }
                 }
             }
-            if extra > 0 {
-                rc.presolve.insert(*id, extra);
-            }
-            if !inner_all.is_empty() {
-                let set = rc.held.entry(*id).or_default();
-                for (k, b) in inner_all {
-                    let e = set.entry(k).or_insert(0);
-                    *e = (*e).max(b);
+            // このノードが解いた鍵（描くノードで、区間があるか全体で描くもの）
+            if rc.drawn.contains(id) && planned.enabled && !planned.needs.is_empty() {
+                let solves = match (walk.regional.get(id), planned.inferred.shape) {
+                    (
+                        Some(rounded),
+                        Shape::Audio {
+                            frames: crate::shape::Dim::Exact(n),
+                            ..
+                        },
+                    ) => usize::try_from(n)
+                        .is_ok_and(|n| !super::audio::chunks_covering(rounded, n).is_empty()),
+                    (Some(_), _) => false,
+                    (None, _) => true,
+                };
+                if solves {
+                    for k in 0..planned.needs.len() {
+                        solved.insert((*id, k));
+                    }
                 }
             }
         }

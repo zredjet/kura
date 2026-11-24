@@ -474,7 +474,7 @@ fn nested_estimates_grow_linearly() {
     let p = |i: usize| params(0.3 + i as f64 / 50.0, -0.6, 8_000, false, C);
     let table = Iir1State::estimate(&p(0).state(), &input.shape()).bytes;
     assert!(table > 2 << 20, "{table}");
-    let peaks: Vec<u64> = (1..=7)
+    let peaks: Vec<u64> = (1..=12)
         .map(|k| {
             let iirs: Vec<Iir1Params> = (0..k).map(p).collect();
             let g = chain(&[("audio.gain", json!({ "db": -2.0 }))], &iirs);
@@ -485,11 +485,21 @@ fn nested_estimates_grow_linearly() {
             engine.estimate(&plan, &spec, None).unwrap().peak
         })
         .collect();
-    // 1 段ふやすごとの増え方は、表 1 つと窓（16 チャンク）の値の分くらいで、深さによらない
+    // 1 段ふやすごとの増え方は、表 1 つと窓（16 チャンク）の値の分くらいで、深さによらない（増え自体が段ごとに表の分ずつ
+    // 大きくなると 2 乗。見直しで見つけた）
     let step = 2 * table + 2 * 16 * C * 4 * 4;
-    for w in peaks.windows(2) {
-        assert!(w[1] <= w[0] + step, "{peaks:?}（1 段で {step} まで）");
+    let rises: Vec<u64> = peaks
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .collect();
+    for r in &rises {
+        assert!(*r <= step, "{peaks:?}（1 段で {step} まで）");
     }
+    let (first, last) = (rises[1], rises[rises.len() - 1]);
+    assert!(
+        last <= first + table / 2,
+        "増えが深さで伸びる：{rises:?}（表 {table}）"
+    );
 }
 
 /// 測り（M17 段 1。`--release -- --ignored --nocapture`、長さは `KURA_STATEFUL_SECS`（既定 300 秒））：48 kHz ステレオの合成の
