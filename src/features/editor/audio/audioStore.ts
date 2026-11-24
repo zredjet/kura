@@ -203,6 +203,8 @@ export interface AudioEditorState {
    * 前の山からのドラッグ）ときは `node` が null。
    */
   eqLocal: { node: number | null; bands: EqBand[]; ticket: number | null } | null;
+  /** キーの手のあとに読み上げる選んだバンドの読み（面の `aria-live`）。 */
+  eqAnnounce: string;
 }
 
 const IDLE_PLAY: AudioPlayState = { status: 'idle', mode: 'cursor' };
@@ -231,6 +233,7 @@ function initialState(
     eqBand: null,
     eqHover: null,
     eqLocal: null,
+    eqAnnounce: '',
     spectrum: keep?.spectrum ?? loadSpectrumSettings(),
   };
 }
@@ -387,6 +390,7 @@ export interface AudioCheck {
   attach(parts: {
     player: EditorPlayer;
     controller: WaveController;
+    spectrum: SpectrumController;
     session: () => string | null;
   }): void;
   sent?(seq: number, steps: readonly EditStepDto[]): void;
@@ -836,7 +840,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     unsubscribe,
   };
   current = rt;
-  checkHook?.attach({ player, controller, session: () => ctx.session() });
+  checkHook?.attach({ player, controller, spectrum, session: () => ctx.session() });
   return {
     begin() {
       const s = useAudioStore.getState();

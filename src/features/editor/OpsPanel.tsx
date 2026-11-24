@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { type ComponentType, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
 import { ChevronUpIcon } from '../../components/icons/ChevronUpIcon';
@@ -169,7 +169,24 @@ export interface ParamTime {
  * 選んだ操作の引数パネル（`ParamSchema` から組む。表示の条件・「詳細」・指摘・後ろの描画の知らせ）。`size` は欄の既定値
  * （矩形・点・大きさを「指定する」にしたとき・長さを px にしたとき）に使う。
  */
-function ParamsPanel({ size, time }: { size: ParamSize; time?: ParamTime }) {
+/**
+ * 引数の欄の差し込み（種類のモジュールが渡す。核は音声のストアを読まない）：`eqBands` はイコライザのバンドの列の欄、
+ * `hidden` はその操作のその引数を出さない（段 7 まで押せない「直線位相」の位相の欄など）。
+ */
+export interface ParamFieldOverrides {
+  eqBands?: ComponentType<{ node: number }>;
+  hidden?(op: string, key: string): boolean;
+}
+
+function ParamsPanel({
+  size,
+  time,
+  fields,
+}: {
+  size: ParamSize;
+  time?: ParamTime;
+  fields?: ParamFieldOverrides;
+}) {
   const selected = useEditorStore((s) => s.selected);
   const node = useEditorStore((s) => (s.selected === null ? undefined : s.doc.nodes[s.selected]));
   const doc = useEditorStore((s) => s.doc);
@@ -185,21 +202,28 @@ function ParamsPanel({ size, time }: { size: ParamSize; time?: ParamTime }) {
   if (!desc) {
     body = <p className={styles.opsHint}>{latest ? t.legacyOp : t.unknownOp}</p>;
   } else {
-    const { basic, advanced } = visibleParams(desc, params);
+    const shownParams = visibleParams(desc, params);
+    const keep = (spec: (typeof shownParams.basic)[number]) => !fields?.hidden?.(node.op, spec.key);
+    const basic = shownParams.basic.filter(keep);
+    const advanced = shownParams.advanced.filter(keep);
+    const EqBands = fields?.eqBands;
     // ノードと引数で key する（別のノードを選んだら欄を作り直し、前のノードの手元の値を持ち越さない）
-    const field = (spec: (typeof basic)[number]) => (
-      <ParamField
-        key={`${node.id}:${spec.key}`}
-        node={node.id}
-        op={node.op}
-        spec={spec}
-        value={paramValue(params, spec)}
-        issues={all}
-        size={size}
-        count={node.log?.field === spec.key ? node.log.count : null}
-        time={time ? { rate: time.rate(node.id), frames: time.frames(node.id) } : undefined}
-      />
-    );
+    const field = (spec: (typeof basic)[number]) =>
+      spec.kind.type === 'eqBands' && EqBands ? (
+        <EqBands key={`${node.id}:${spec.key}`} node={node.id} />
+      ) : (
+        <ParamField
+          key={`${node.id}:${spec.key}`}
+          node={node.id}
+          op={node.op}
+          spec={spec}
+          value={paramValue(params, spec)}
+          issues={all}
+          size={size}
+          count={node.log?.field === spec.key ? node.log.count : null}
+          time={time ? { rate: time.rate(node.id), frames: time.frames(node.id) } : undefined}
+        />
+      );
     body =
       basic.length + advanced.length === 0 ? (
         <p className={styles.opsHint}>{t.noParams}</p>
@@ -365,10 +389,12 @@ export function OpsPanel({
   size = null,
   time,
   output,
+  fields,
 }: {
   size?: ParamSize;
   time?: ParamTime;
   output?: ReactNode;
+  fields?: ParamFieldOverrides;
 }) {
   return (
     <div className={styles.ops}>
@@ -378,7 +404,7 @@ export function OpsPanel({
         <AddOpButton />
       </div>
       <div className={styles.paramsScroll}>
-        <ParamsPanel size={size} time={time} />
+        <ParamsPanel size={size} time={time} fields={fields} />
         <Warnings />
       </div>
       {output ?? <FormatOutputRow />}

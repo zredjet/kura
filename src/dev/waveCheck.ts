@@ -15,7 +15,13 @@
  */
 
 import { audioRuntime } from '../features/asset/audioRuntime';
-import type { AudioCheck } from '../features/editor/audio/audioStore';
+import {
+  type AudioCheck,
+  eqTargetParams,
+  useAudioStore,
+} from '../features/editor/audio/audioStore';
+import { eqJson } from '../features/editor/audio/eqModel';
+import type { SpectrumController } from '../features/editor/audio/spectrumController';
 import type {
   CrossfadeRecord,
   EditorPlayer,
@@ -24,7 +30,7 @@ import type {
 import type { WaveController } from '../features/editor/audio/waveController';
 import { commands } from '../ipc/bindings';
 import type { ContextLike } from '../lib/assetAudio';
-import type { EditStepDto } from '../ipc/edit';
+import { eqCurve, type EditStepDto } from '../ipc/edit';
 import { runCrossfadeCheck, runEditorSeamCheck } from './seamCheck';
 import { stats } from './tileCheck';
 
@@ -173,6 +179,49 @@ export function contextCheck(player: EditorPlayer): unknown {
   };
 }
 
+/**
+ * スペクトルの面の数（M17 段 5。docs/editing.md §18.9 の目標：点・曲線・「前 ＋ 曲線」の後が次の描画の内、アナライザ 60 fps・
+ * 再生位置とのずれ 1 hop の内）：`frames` 回描き直して描く時間、イコライザの曲線の往復、再生中なら出したフレームのずれと
+ * タイルがなかった回数。スペクトルの面を出して（再生しながらでも）`__kuraSpectrumCheck()` で測る。
+ */
+export async function runSpectrumBench(
+  s: SpectrumController,
+  frames = BENCH_FRAMES,
+): Promise<unknown> {
+  const times: number[] = [];
+  const offsets: number[] = [];
+  let missing = 0;
+  s.renderProbe = (ms) => times.push(ms);
+  s.frameProbe = (o) => {
+    if (o === null) missing++;
+    else offsets.push(o);
+  };
+  for (let i = 0; i < frames; i++) {
+    s.invalidate();
+    await nextFrame();
+  }
+  s.renderProbe = null;
+  s.frameProbe = null;
+  const curve: number[] = [];
+  const eq = eqTargetParams();
+  const view = useAudioStore.getState().view;
+  if (eq && view) {
+    for (let i = 0; i < 10; i++) {
+      const t0 = performance.now();
+      await eqCurve(eqJson(eq.params), view.rate, view.channels, 512);
+      curve.push(performance.now() - t0);
+    }
+  }
+  return {
+    frames: times.length,
+    draw: stats(times),
+    over16ms: times.filter((t) => t > 16.7).length,
+    curve: curve.length > 0 ? stats(curve) : null,
+    offsetHops: offsets.length > 0 ? stats(offsets) : null,
+    missingTiles: missing,
+  };
+}
+
 /** 音声エディタの自己点検を作る（`audioStore.ts` が開くたびに `attach` する）。 */
 export function createAudioCheck(): AudioCheck {
   const trips = new RoundTrips();
@@ -204,6 +253,8 @@ export function createAudioCheck(): AudioCheck {
       const w = window as unknown as Record<string, unknown>;
       w.__kuraWaveCheck = () => runWaveBench(p.controller).then((r) => send('edit-wave', r));
       w.__kuraContextCheck = () => send('edit-context', contextCheck(p.player));
+      w.__kuraSpectrumCheck = () =>
+        runSpectrumBench(p.spectrum).then((r) => send('edit-spectrum', r));
     },
     sent(seq, steps) {
       if (steps.some(docStep)) trips.sent(seq, stepKind(steps), performance.now());

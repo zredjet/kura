@@ -13,6 +13,7 @@ import {
   useAudioStore,
   usableChannel,
 } from './audioStore';
+import { SPECTRUM_READING_ID } from './AudioCapsule';
 import { dbText, freqText } from './eqModel';
 import { SPECTRUM_POINTER } from './spectrumPointer';
 import { noteOf } from './spectrumMath';
@@ -201,6 +202,7 @@ export function SpectrumStage() {
   const [stripHeight, setStripHeight] = useState(0);
   const [hover, setHover] = useState<{ x: number; y: number; lines: string[] } | null>(null);
   const pointer = useRef<number | null>(null);
+  const announce = useAudioStore((s) => s.eqAnnounce);
 
   // 帯の高さ：上部の下から目盛りと 1 段
   useLayoutEffect(() => {
@@ -341,6 +343,8 @@ export function SpectrumStage() {
         style={{ top: stripHeight }}
         role="group"
         aria-label={ts.face}
+        aria-describedby={SPECTRUM_READING_ID}
+        data-spectrum-face=""
         // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 面はキーを取るまとまり
         tabIndex={0}
         onPointerDown={onPointerDown}
@@ -364,6 +368,9 @@ export function SpectrumStage() {
         onBlur={sealEq}
       >
         <canvas ref={canvasRef} className={styles.wave} aria-hidden="true" />
+        <span className={styles.srOnly} aria-live="polite">
+          {announce}
+        </span>
         {hover && (
           <div
             className={styles.specHover}

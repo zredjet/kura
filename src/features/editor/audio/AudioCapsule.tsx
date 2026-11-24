@@ -25,6 +25,7 @@ import {
   setSnapZero,
   setTrimFrame,
 } from './audioTools';
+import { bandSummary, useEqBands } from './EqBandsField';
 import { targetNode } from './handles';
 import { TimeField } from './TimeField';
 import { Transport } from './Transport';
@@ -246,8 +247,36 @@ function LoopFields({ rate, frames }: { rate: number; frames: number }) {
  * 下のガラスのカプセル（再生バーの位置）を 2 段にする：上の段に再生の操作と道具の切り替え、下の段に今の道具の欄（時刻
  * の欄は時間で入れ、下に標本の位置。使い方の一言は欄の下の行）。左下・右下の表示と重ならない帯の中に置く。
  */
+/**
+ * スペクトルのときの下の段（M17 段 5）：選んだバンドの読み（文字だけ）と使い方の一言（カプセルの幅は増やさず、一言は
+ * その幅で省略する）。面の読み上げ（`aria-describedby`）も同じ読みを使う。
+ */
+function SpectrumFields() {
+  const node = useEditorStore((s) => targetNode(s.doc, s.selected, 'audio.eq'));
+  return (
+    <div className={styles.specFields}>
+      <span id={SPECTRUM_READING_ID} className={styles.specReading}>
+        {node === null ? ja.editor.audio.spectrum.usage : <BandReading node={node} />}
+      </span>
+      {node !== null && <span className={styles.specUsage}>{ja.editor.audio.spectrum.usage}</span>}
+    </div>
+  );
+}
+
+/** 選んだバンドの読み。 */
+function BandReading({ node }: { node: number }) {
+  const bands = useEqBands(node);
+  const band = useAudioStore((s) => s.eqBand);
+  const b = band === null ? undefined : bands[band];
+  return <>{b && band !== null ? bandSummary(b, band) : ja.editor.audio.spectrum.noBand}</>;
+}
+
+/** 選んだバンドの読みの要素の ID（面の `aria-describedby`）。 */
+export const SPECTRUM_READING_ID = 'kura-spectrum-reading';
+
 export function AudioCapsule() {
   const tool = useAudioStore((s) => s.tool);
+  const face = useAudioStore((s) => s.face);
   const rate = useAudioStore((s) => s.view?.rate ?? 0);
   const frames = useAudioStore((s) => s.view?.frames ?? 0);
   return (
@@ -262,10 +291,11 @@ export function AudioCapsule() {
         <AudioToolSwitch />
       </div>
       <div className={styles.toolFields}>
-        {tool === 'select' && <SelectFields rate={rate} frames={frames} />}
-        {tool === 'trim' && <TrimFields rate={rate} />}
-        {tool === 'fade' && <FadeFields rate={rate} frames={frames} />}
-        {tool === 'loop' && <LoopFields rate={rate} frames={frames} />}
+        {face === 'spectrum' && <SpectrumFields />}
+        {face === 'wave' && tool === 'select' && <SelectFields rate={rate} frames={frames} />}
+        {face === 'wave' && tool === 'trim' && <TrimFields rate={rate} />}
+        {face === 'wave' && tool === 'fade' && <FadeFields rate={rate} frames={frames} />}
+        {face === 'wave' && tool === 'loop' && <LoopFields rate={rate} frames={frames} />}
       </div>
     </div>
   );

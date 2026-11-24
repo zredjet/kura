@@ -38,6 +38,7 @@ import {
   useAudioStore,
 } from './audioStore';
 import { cancelAudioDrag, confirmTrim, selectAudioTool, setInOut } from './audioTools';
+import { spectrumKey } from './spectrumKeys';
 import { SPECTRUM_POINTER } from './spectrumPointer';
 
 const TOOL_KEYS: Record<string, AudioTool> = { s: 'select', t: 'trim', f: 'fade', r: 'loop' };
@@ -82,6 +83,9 @@ function down(e: KeyboardEvent, key: string): boolean | null {
     confirmTrim();
     return true;
   }
+  // スペクトルの面・バンドの表の行のキー（⌥ で細かく、を核へ回す前に取る。M17 段 5）
+  const spectrum = spectrumKey(e, key);
+  if (spectrum !== null) return spectrum;
   if (e.altKey) return null;
   if (key === ' ') {
     if (!e.repeat) togglePlay();

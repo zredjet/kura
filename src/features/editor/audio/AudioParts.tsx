@@ -9,16 +9,26 @@ import { formatCount } from '../../../lib/format';
 import { channelsText, khz } from '../../asset/describe';
 import editorStyles from '../Editor.module.css';
 import { originalFormatOf, useEditorStore } from '../editorStore';
-import { FormatOutputRow, OpsPanel, type ParamTime } from '../OpsPanel';
+import { FormatOutputRow, OpsPanel, type ParamFieldOverrides, type ParamTime } from '../OpsPanel';
 import { outputChoice } from '../formats';
 import styles from './Audio.module.css';
 import { AUDIO_FORMATS, type AudioCaps, capsOf, lossesFor, type AudioLoss } from './audioFormats';
 import { type AudioFace, audioZoom, setAudioFace, useAudioStore } from './audioStore';
 import { freqParts } from './spectrumMath';
+import { EqBandsField } from './EqBandsField';
 import { LoudnessSection } from './LoudnessSection';
 import { timeText } from './timeText';
 
 export { AudioCapsule } from './AudioCapsule';
+
+/**
+ * 右パネルの引数の欄の差し込み（M17 段 5）：イコライザのバンドの列はバンドの表、位相の欄は段 7（直線位相）まで出さない
+ * （「直線」は推論で断られるので押せるボタンを置かない）。
+ */
+const EQ_FIELDS: ParamFieldOverrides = {
+  eqBands: EqBandsField,
+  hidden: (op, key) => op === 'audio.eq' && key === 'phase',
+};
 
 /*
  * 音声エディタの殻に置く部品（design.md §3.1 の「音声エディタ」の案文。M13 の段 6）：名前の下の一行、左下のカーソル・
@@ -244,6 +254,7 @@ export function AudioOps() {
   return (
     <OpsPanel
       time={time}
+      fields={EQ_FIELDS}
       output={
         <>
           <LoudnessSection />

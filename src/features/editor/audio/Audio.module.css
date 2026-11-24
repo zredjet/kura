@@ -414,3 +414,127 @@
   white-space: nowrap;
   pointer-events: none;
 }
+
+/* ===== イコライザのバンドの表（右パネル。M17 段 5） ===== */
+
+.eqBands {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.eqBandsHead {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+/* 8 行を超えたら表の中でスクロール */
+.eqTable {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  max-height: calc(8 * (var(--h-chip) + var(--space-0-5)));
+  overflow-y: auto;
+}
+
+.eqRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.eqRowButton {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--h-chip);
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.eqRowButton[aria-pressed='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-primary);
+}
+
+.eqIndex {
+  flex: none;
+  min-width: var(--space-3);
+  color: var(--text-tertiary);
+}
+
+.eqAdd,
+.eqRemove {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  align-self: flex-start;
+  height: var(--h-chip);
+  padding: 0 var(--space-2-5);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.eqAdd:disabled {
+  color: var(--text-tertiary);
+}
+
+.eqSelected {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--stroke-1);
+}
+
+.eqNumber {
+  width: 88px;
+  height: var(--h-chip);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-sm);
+  background: var(--fill-1);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* スペクトルのときのカプセルの下の段：選んだバンドの読みと使い方の一言（一言はカプセルの幅で省略） */
+.specFields {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
+  font-size: var(--text-xs);
+}
+
+.specReading {
+  flex: none;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.specUsage {
+  min-width: 0;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

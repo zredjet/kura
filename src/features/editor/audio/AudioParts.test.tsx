@@ -361,3 +361,87 @@ describe('スペクトルの面（M17 段 5）', () => {
     expect(screen.getByRole('button', { name: a.spectrum.resetHold })).toBeInTheDocument();
   });
 });
+
+describe('イコライザのバンドの表とキー（M17 段 5）', () => {
+  const eqNode = (bands: unknown[]): EditNodeDto =>
+    ({
+      id: 5,
+      op: 'audio.eq',
+      v: 1,
+      enabled: true,
+      params: { bands, phase: 'minimum', gainDb: 0 },
+      log: null,
+    }) as unknown as EditNodeDto;
+  const bell = (freq: number, gainDb: number, enabled = true) => ({
+    type: 'bell',
+    freq,
+    gainDb,
+    q: 1,
+    slope: 12,
+    channel: 'all',
+    enabled,
+  });
+
+  beforeEach(() => {
+    useAudioStore.setState({ eqBand: null, eqLocal: null, eqAnnounce: '' });
+  });
+
+  it('右パネル：「n バンドのうち m が有効」・行（押すと選ぶ）・オンのスイッチ・バンドを足す・選んだバンドの欄。位相の欄は出さない', () => {
+    openState([eqNode([bell(1_000, -5), bell(4_000, 3, false)])]);
+    useEditorStore.setState({ selected: 5 });
+    render(<Editor />);
+    const s = a.spectrum;
+    expect(screen.getByText(s.bandCount(2, 1))).toBeInTheDocument();
+    expect(screen.queryByText(t.ops['audio.eq']?.params.phase ?? '位相')).toBeNull();
+    const rows = within(screen.getByRole('list', { name: s.bands })).getAllByRole('button');
+    expect(rows).toHaveLength(2);
+    fireEvent.click(rows[1] as HTMLElement);
+    expect(useAudioStore.getState().eqBand).toBe(1);
+    expect(screen.getByRole('group', { name: /バンド 2/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('switch', { name: s.bandEnabled(2) }));
+    expect(useAudioStore.getState().eqLocal?.bands[1]?.enabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: s.addBand }));
+    expect(useAudioStore.getState().eqLocal?.bands).toHaveLength(3);
+    expect(useAudioStore.getState().eqBand).toBe(2);
+  });
+
+  it('面のキー：選んだバンドを ←→ で周波数・↑↓ で利得・⌫ で消す、[ ] で前・次。選んでいなければ何もしない。行の ↑↓ でバンドを移る', () => {
+    openState([eqNode([bell(1_000, 0), bell(4_000, 0)])]);
+    useEditorStore.setState({ selected: 5 });
+    useAudioStore.setState({ face: 'spectrum' });
+    render(<Editor />);
+    const face = screen.getByRole('group', { name: a.spectrum.face });
+    const key = (target: HTMLElement, k: string, init: KeyboardEventInit = {}) =>
+      fireEvent.keyDown(target, { key: k, bubbles: true, ...init });
+    key(face, 'ArrowRight');
+    expect(useAudioStore.getState().eqLocal).toBeNull();
+    key(face, ']');
+    expect(useAudioStore.getState().eqBand).toBe(0);
+    key(face, 'ArrowRight');
+    expect(useAudioStore.getState().eqLocal?.bands[0]?.freq).toBeCloseTo(1_000 * 2 ** (1 / 12), 6);
+    key(face, 'ArrowUp', { shiftKey: true });
+    expect(useAudioStore.getState().eqLocal?.bands[0]?.gainDb).toBeCloseTo(2, 9);
+    expect(useAudioStore.getState().eqAnnounce).toContain('バンド 1');
+    key(face, 'Backspace');
+    expect(useAudioStore.getState().eqLocal?.bands).toHaveLength(1);
+    // 行のキー
+    useAudioStore.setState({ eqLocal: null, eqBand: null });
+    const rows = within(screen.getByRole('list', { name: a.spectrum.bands })).getAllByRole(
+      'button',
+    );
+    key(rows[0] as HTMLElement, 'ArrowDown');
+    expect(useAudioStore.getState().eqBand).toBe(1);
+  });
+
+  it('スペクトルのときのカプセルの下の段：選んだバンドの読みと使い方の一言', () => {
+    openState([eqNode([bell(2_800, -5)])]);
+    useEditorStore.setState({ selected: 5 });
+    useAudioStore.setState({ face: 'spectrum', eqBand: 0 });
+    render(<Editor />);
+    const capsule = screen.getByRole('toolbar', { name: t.toolSettings });
+    expect(capsule.textContent).toContain(
+      a.spectrum.bandReading(1, 'ベル · 2.80 kHz · −5.0 dB · Q 1.00'),
+    );
+    expect(screen.getByText(a.spectrum.usage)).toBeInTheDocument();
+  });
+});

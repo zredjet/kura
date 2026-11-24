@@ -208,6 +208,9 @@ export class SpectrumController {
   private readonly scheduler: WaveScheduler;
   private readonly now: () => number;
   private disposed = false;
+  /** 自己点検（`VITE_KURA_CHECK`）：描く時間（ms）と、再生中の 1 回ごとの出したフレームのずれ（hop）・タイルがなかったか。 */
+  renderProbe: ((ms: number) => void) | null = null;
+  frameProbe: ((offsetHops: number | null) => void) | null = null;
 
   constructor(private readonly options: SpectrumOptions = {}) {
     this.fetch = options.fetch ?? fetchBytes;
@@ -656,6 +659,7 @@ export class SpectrumController {
       else holdMax(acc, col);
     }
     if (acc) this.lastFrame[side] = j;
+    if (side === 'post') this.frameProbe?.(acc ? Math.abs(pf / port.hop - j) : null);
     return acc ? this.tilted(acc) : null;
   }
 
@@ -887,6 +891,9 @@ export class SpectrumController {
     const h = Math.round(this.size.h * this.dpr);
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
+    const probe = this.renderProbe;
+    const t0 = probe ? performance.now() : 0;
     this.options.draw?.(canvas, this.scene());
+    if (probe) probe(performance.now() - t0);
   }
 }
