@@ -43,6 +43,14 @@ import {
   type EditSourcePieceDto,
   type EditSpanDto,
   type EditSpansChangeDto,
+  type EditSpecAverageDto,
+  type EditSpecAveragePhaseDto,
+  type EditSpecAverageRequestDto,
+  type EditSpecAverageStatusDto,
+  type EditSpecChannelDto,
+  type EditSpecPortDto,
+  type EditSpecRequestDto,
+  type EditSpecSideDto,
   type EditStatusDto,
   type EditStepDto_Deserialize,
   type EditStepResultDto_Serialize,
@@ -104,6 +112,14 @@ export type {
   EditSourcePieceDto,
   EditSpanDto,
   EditSpansChangeDto,
+  EditSpecAverageDto,
+  EditSpecAveragePhaseDto,
+  EditSpecAverageRequestDto,
+  EditSpecAverageStatusDto,
+  EditSpecChannelDto,
+  EditSpecPortDto,
+  EditSpecRequestDto,
+  EditSpecSideDto,
   EditStatusDto,
   EditVersionDto,
   EditPendingSaveDto,
@@ -222,6 +238,18 @@ export function eqCurve(
  */
 export function measureEdit(session: string): Promise<EditLoudnessStateDto> {
   return unwrap(commands.editMeasure(session));
+}
+
+/**
+ * スペクトルの区間の平均と最大（M17 段 4。`kura-spec/1`）：今の rev の出力の区間（出力のフレーム）の帯ごとの平均（パワーの
+ * 領域）と最大（dB）。求めるチャンクが少なければその場で `ready`、多ければ予約して `measuring`（`work: true` の表示を頼み続け、
+ * 表示の結果の `specAverage` が `ready` になったら頼み直す）。
+ */
+export function specAverageEdit(
+  session: string,
+  request: EditSpecAverageRequestDto,
+): Promise<EditSpecAverageDto> {
+  return unwrap(commands.editSpecAverage(session, request));
 }
 
 /** エディタを閉じる（キャッシュ・予算の取り置きを外す）。今のセッションでなければ Rust は何もしない。 */

@@ -5,6 +5,7 @@ import {
   editInputPcmUrl,
   editPcmUrl,
   editPeaksUrl,
+  editSpecUrl,
   editTileUrl,
   fileUrl,
   hasThumb,
@@ -105,6 +106,35 @@ describe('URL', () => {
     ['x', 1, 256, 0],
   ])('波形の段のタイルの指定 %s/%s/%s/%s は断る', (session, rev, bin, tile) => {
     expect(() => editPeaksUrl(session, rev, bin, tile)).toThrow(RangeError);
+  });
+
+  it('音声エディタのスペクトルのタイル（M17 段 4）', () => {
+    const key = '0123456789abcdef0123456789abcdef';
+    expect(editSpecUrl('0a1b', key, { type: 'sum' }, 3)).toBe(
+      `kura://localhost/edit/0a1b/spec/${key}/sum/3`,
+    );
+    expect(editSpecUrl('0a1b', key, { type: 'index', index: 1 }, 0)).toBe(
+      `kura://localhost/edit/0a1b/spec/${key}/1/0`,
+    );
+    expect(editSpecUrl('0a1b', key, { type: 'mid' }, 9)).toBe(
+      `kura://localhost/edit/0a1b/spec/${key}/m/9`,
+    );
+    expect(editSpecUrl('0a1b', key, { type: 'side' }, 9)).toBe(
+      `kura://localhost/edit/0a1b/spec/${key}/s/9`,
+    );
+  });
+
+  it.each([
+    ['AB', '0123456789abcdef0123456789abcdef', 0, 0],
+    ['ab', '0123456789ABCDEF0123456789ABCDEF', 0, 0],
+    ['ab', '0123456789abcdef', 0, 0],
+    ['ab', '0123456789abcdef0123456789abcdef', -1, 0],
+    ['ab', '0123456789abcdef0123456789abcdef', 0.5, 0],
+    ['ab', '0123456789abcdef0123456789abcdef', 0xfffd, 0],
+    ['ab', '0123456789abcdef0123456789abcdef', 0, -1],
+    ['ab', '0123456789abcdef0123456789abcdef', 0, 1.5],
+  ])('スペクトルのタイルの指定 %s/%s/%s/%s は断る', (session, key, index, chunk) => {
+    expect(() => editSpecUrl(session, key, { type: 'index', index }, chunk)).toThrow(RangeError);
   });
 
   it('サムネイルがあるのは ready と stale（作り直すまで今の絵を出す）', () => {

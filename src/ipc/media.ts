@@ -3,6 +3,8 @@
  * `kura://` の文字列はこのファイルの外に書かない（media.test.ts が見張る。.claude/rules/frontend.md）。
  */
 
+import type { EditSpecChannelDto } from './bindings';
+
 const BASE = 'kura://localhost';
 
 /** アニメの帯の並べ方の版（Rust の `asset::anim::ANIM_V`。並べ方を変えたら上げる）。 */
@@ -161,4 +163,48 @@ export function editPeaksUrl(session: string, rev: number, bin: number, tile: nu
     );
   }
   return `${BASE}/edit/${session}/${rev}/peaks/${bin}/${tile}`;
+}
+
+/** スペクトルのポートの鍵（32 字の小文字の 16 進）。 */
+const SPEC_KEY = /^[0-9a-f]{32}$/;
+/** チャンネルの番号の上限（Rust の `chan_code` の 0xFFFC）。 */
+const MAX_SPEC_INDEX = 0xfffc;
+
+/** スペクトルのチャンネルの URL の綴り（番号の 10 進・`m`・`s`・`sum`）。範囲の外は null。 */
+export function specChannelToken(channel: EditSpecChannelDto): string | null {
+  switch (channel.type) {
+    case 'index':
+      return Number.isSafeInteger(channel.index) &&
+        channel.index >= 0 &&
+        channel.index <= MAX_SPEC_INDEX
+        ? String(channel.index)
+        : null;
+    case 'mid':
+      return 'm';
+    case 'side':
+      return 's';
+    case 'sum':
+      return 'sum';
+  }
+}
+
+/**
+ * 音声エディタのスペクトルのタイル：`/edit/{session}/spec/{key}/{channel}/{chunk}`（immutable。M17 段 4）。`key` は表示の結果の
+ * `spec[].key`（ポートの指紋の頭。32 字の小文字の 16 進）、`channel` はそのポートのチャンネル、`chunk` はポートのチャンク
+ * （65,536 フレーム）の番号。並びは `src/features/editor/audio/specTiles.ts` の `parseEditSpecTile`。置き場から追い出された
+ * タイルは 404 なので、表示を頼み直す。形が合わなければ RangeError。
+ */
+export function editSpecUrl(
+  session: string,
+  key: string,
+  channel: EditSpecChannelDto,
+  chunk: number,
+): string {
+  const token = specChannelToken(channel);
+  if (!SESSION_ID.test(session) || !SPEC_KEY.test(key) || token === null || !isCount(chunk)) {
+    throw new RangeError(
+      `スペクトルのタイルの指定が正しくありません：${session}/${key}/${token ?? '?'}/${chunk}`,
+    );
+  }
+  return `${BASE}/edit/${session}/spec/${key}/${token}/${chunk}`;
 }
