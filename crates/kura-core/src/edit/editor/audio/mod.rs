@@ -436,9 +436,7 @@ impl Editor {
         );
         // 区間の平均の予約（タイルのあと。操作中は進めない）
         if let Some(l) = limit.as_mut().filter(|_| !avp.interacting) {
-            let mut key = [0u8; 16];
-            key.copy_from_slice(&out_fp.0.0[..16]);
-            self.advance_spec_average(st, &plan, key, l, &mut progress, ticket);
+            self.advance_spec_average(st, &plan, l, &mut progress, ticket);
         }
         let settled = !avp.interacting && !st.session.is_provisional();
         if let Some(a) = st.audio.as_mut() {
@@ -715,9 +713,13 @@ impl Editor {
             // スペクトルのタイルの置き場（M17 段 4）
             views.saturating_add(peaks).saturating_add(p.spec.bytes())
         };
-        // 波形の段の作りかけと、スペクトルのチャンクの要約（M17 段 4）
+        // 波形の段の作りかけと、スペクトルのチャンク・まとまりの要約（M17 段 4）
         let run = st.audio.as_ref().map_or(0, |a| {
-            a.peaks.run_bytes().saturating_add(a.spec.summaries.bytes())
+            a.peaks
+                .run_bytes()
+                .saturating_add(a.spec.summaries.bytes())
+                .saturating_add(a.spec.groups.0.bytes())
+                .saturating_add(a.spec.params_bytes())
         });
         // 流し解きの作りかけ（進めている仕事の結果の見積もり）と、解けた結果のうちキャッシュにないもの（仕事だけが持つ。
         // キャッシュにあるものはキャッシュが数える）

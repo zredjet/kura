@@ -54,6 +54,14 @@ pub(super) fn node_port(plan: &Plan, node: NodeId, side: PortSide) -> Result<Por
     }
 }
 
+impl Plan {
+    /// ノード `node` の `side` のポート（入力 0 はそのノードの最初の入力。計画にないノード・入力のないノードの入力は
+    /// `BadInput`）。見積もりの `EstimateSpec::port_area` に渡す。
+    pub fn node_port(&self, node: NodeId, side: PortSide) -> Result<PortRef, EngineError> {
+        node_port(self, node, side)
+    }
+}
+
 impl Engine {
     /// ノード `node` の `side` のポートの指紋（[`Engine::fingerprints`] の `nodes` の値。入力 0 は、その先のノードの指紋か計画の
     /// 入力の指紋）。同じ指紋のポートは同じ値（外したノードの出力は入力と同じ指紋）。

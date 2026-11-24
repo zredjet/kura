@@ -1,11 +1,13 @@
 //! スペクトルの区間の平均と最大（M17 段 4。`edit_spec_average`。docs/editing.md §18.4）。
 //!
-//! - 区間は出力のフレーム [start, end) で受け、中心がその中に入るフレーム（`kura-spec/1` のフレーム）の帯の値 P を使う。
-//!   平均はパワーの領域で、チャンクごとの部分和（チャンクの中はフレームの順に f64 で足したもの）をチャンクの順に足して
-//!   フレームの数で割る。最大は帯ごとの P の最大。どちらも dB（f32。−120 dB で止める）で返す。値は区間と出力だけで決まり、
-//!   要約を覚えているか・どこで区切ったかによらない。
-//! - 区間にすっぽり入るチャンクは、チャンクの要約（帯ごとの和・最大・フレームの数。タイルを作るときにも覚える。
-//!   [`SUMMARY_BYTES`] の LRU）を使い、端のチャンクだけフレームを求める。選び直しても端のチャンクだけで済む。
+//! - 区間は出力のフレーム [start, end) で受け（ノードのポートなら時間の写しでポートのフレームに写した区間の包み）、中心が
+//!   その中に入るフレーム（`kura-spec/1` のフレーム）の帯の値 P を使う。平均はパワーの領域で、和は 3 段で決まった順に f64 で
+//!   足す：チャンクの中はフレームの順、まとまり（[`SUMMARY_GROUP`] チャンクずつ、チャンクの番号で揃える）の中はチャンクの順、
+//!   全体はまとまりの順（どれも 0 から）。これをフレームの数で割る。最大は帯ごとの P の最大。どちらも dB（f32。−120 dB で
+//!   止める）で返す。値は区間と出力だけで決まり、要約を覚えているか・どこで区切ったかによらない。
+//! - 区間にすっぽり入るまとまりはまとまりの要約（[`GROUP_BYTES`] の LRU）、すっぽり入るチャンクはチャンクの要約（帯ごとの
+//!   和・最大・フレームの数。タイルを作るときにも覚える。[`SUMMARY_BYTES`] の LRU）を使い、端のチャンクだけフレームを
+//!   求める。60 分を求めたあとに選び直しても、端のまとまりの中の要約のないチャンクだけで済む。
 //! - その場で求めるのは、求めるチャンクの数がタイルの作りの速さの見積もりで [`SYNC_BUDGET`] に収まるときだけ（流し解きの間は
 //!   その場で求めない）。収まらなければ予約して（[`MAX_AVERAGE_RUNS`] つまで。前と後）`measuring` を返し、裏の仕事の区切りで
 //!   タイルのあとに進める（操作中は進めない）。出力が変わった（鍵が違う）予約は捨てる。結果は [`AVERAGE_RESULTS`] 件の LRU。
@@ -23,20 +25,21 @@ use kura_engine::render::Plan;
 use kura_engine::{EngineError, Monitor};
 
 use super::super::{Editor, EditorEnv, EditorError, State, editor_of};
-use super::audio_shape;
 use super::slice::{Limit, Pace, WorkProgress};
-use super::spec::{SpecSide, TileKey, chan_code, key_hex};
+use super::spec::{Port, SpecSide, TileKey, chan_code, group_chunks, key_hex};
 
 /// チャンクの要約の置き場の上限（バイト）。48 kHz の 1 チャンネルで 1 チャンク 8 KB ほど（約 500 チャンク・12 分）。
 pub const SUMMARY_BYTES: u64 = 4 << 20;
+/// まとまりの要約の置き場の上限（バイト）。48 kHz で約 260 まとまり（約 95 分）。
+pub const GROUP_BYTES: u64 = 2 << 20;
+/// まとまりのチャンクの数（チャンクの番号 16g〜16g + 15。和の順を決める。変えると値が変わる）。
+pub const SUMMARY_GROUP: u64 = 16;
 /// 覚える結果の数。
 pub const AVERAGE_RESULTS: usize = 8;
 /// 予約できる区間の数（前と後）。
 pub const MAX_AVERAGE_RUNS: usize = 2;
 /// その場で求める見積もりの上限。
 pub const SYNC_BUDGET: Duration = Duration::from_millis(25);
-/// 1 回のまとまりで求めるチャンクの数の上限。
-const MAX_GROUP_CHUNKS: u64 = 8;
 
 /// チャンク 1 つの要約（帯ごとの P の和（フレームの順）・最大と、フレームの数）。
 #[derive(Debug, Clone, PartialEq)]
@@ -60,16 +63,42 @@ impl Summary {
     }
 }
 
-/// チャンクの要約の置き場（使った順の LRU）。
-#[derive(Default)]
+/// 要約の置き場（使った順の LRU。鍵の最後はチャンクかまとまりの番号）。
 pub(crate) struct SummaryStore {
     map: BTreeMap<TileKey, (u64, Arc<Summary>)>,
     order: BTreeMap<u64, TileKey>,
     tick: u64,
     bytes: u64,
+    cap: u64,
+}
+
+impl Default for SummaryStore {
+    /// チャンクの要約の置き場。
+    fn default() -> Self {
+        Self::with_cap(SUMMARY_BYTES)
+    }
+}
+
+/// まとまりの要約の置き場。
+pub(crate) struct GroupStore(pub(crate) SummaryStore);
+
+impl Default for GroupStore {
+    fn default() -> Self {
+        Self(SummaryStore::with_cap(GROUP_BYTES))
+    }
 }
 
 impl SummaryStore {
+    fn with_cap(cap: u64) -> Self {
+        Self {
+            map: BTreeMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
+            bytes: 0,
+            cap,
+        }
+    }
+
     pub(crate) fn get(&mut self, key: &TileKey) -> Option<Arc<Summary>> {
         let (old, s) = self.map.get(key).map(|(t, s)| (*t, s.clone()))?;
         self.order.remove(&old);
@@ -94,7 +123,7 @@ impl SummaryStore {
         self.bytes = self.bytes.saturating_add(s.bytes());
         self.order.insert(self.tick, key);
         self.map.insert(key, (self.tick, s));
-        while self.bytes > SUMMARY_BYTES {
+        while self.bytes > self.cap {
             let Some((_, k)) = self.order.pop_first() else {
                 break;
             };
@@ -220,10 +249,9 @@ impl Acc {
 /// 予約した区間の求めかけ。
 pub(crate) struct AverageRun {
     request: SpecAverageRequest,
-    key: [u8; 16],
+    /// 求めるポート（頼んだときの計画で解いたもの）。
+    port: Port,
     params: Arc<SpecParams>,
-    /// ポートの長さ。
-    len: u64,
     /// フレームの区間。
     j0: u64,
     j1: u64,
@@ -231,12 +259,20 @@ pub(crate) struct AverageRun {
     next: u64,
     end: u64,
     first: u64,
+    /// 全体の和（まとまりの順）。
     acc: Acc,
+    /// 足しているまとまりと、その中の和（チャンクの順）。
+    group: Option<(u64, Acc)>,
 }
 
 impl AverageRun {
     fn average_key(&self) -> AverageKey {
-        (self.key, chan_code(self.request.channel), self.j0, self.j1)
+        (
+            self.port.key,
+            chan_code(self.request.channel),
+            self.j0,
+            self.j1,
+        )
     }
 
     fn progress(&self) -> f64 {
@@ -250,18 +286,82 @@ impl AverageRun {
     /// 求めるチャンク c のフレームの区間（ポートのフレームの番号）と、チャンクがすっぽり入るか。
     fn chunk_frames(&self, c: u64) -> ((u64, u64), bool) {
         let per = self.params.frames_per_chunk();
-        let total = self.params.frames(self.len);
+        let total = self.params.frames(self.port.frames);
         let (ca, cb) = ((c * per).min(total), ((c + 1) * per).min(total));
         let (fa, fb) = (ca.max(self.j0), cb.min(self.j1));
         ((fa, fb), fa == ca && fb == cb)
     }
 
-    /// 要約にないチャンク（端と、すっぽり入るが要約のないもの）の数。
-    fn missing(&self, summaries: &SummaryStore) -> u64 {
+    /// まとまり g が区間にすっぽり入るか。
+    fn group_whole(&self, g: u64) -> bool {
+        let per = self.params.frames_per_chunk();
+        let total = self.params.frames(self.port.frames);
+        let ga = g
+            .saturating_mul(SUMMARY_GROUP)
+            .saturating_mul(per)
+            .min(total);
+        let gb = (g + 1)
+            .saturating_mul(SUMMARY_GROUP)
+            .saturating_mul(per)
+            .min(total);
+        ga < gb && self.j0 <= ga && gb <= self.j1
+    }
+
+    /// 要約で済まないチャンク（端と、すっぽり入るが要約のないもの。要約のあるまとまりの中は数えない）の数。
+    fn missing(&self, chunks: &SummaryStore, groups: &SummaryStore) -> u64 {
         let code = chan_code(self.request.channel);
-        (self.next..self.end)
-            .filter(|&c| !(self.chunk_frames(c).1 && summaries.contains(&(self.key, code, c))))
-            .count() as u64
+        let (mut n, mut c) = (0u64, self.next);
+        while c < self.end {
+            let g = c / SUMMARY_GROUP;
+            if c == g * SUMMARY_GROUP
+                && self.group_whole(g)
+                && groups.contains(&(self.port.key, code, g))
+            {
+                c = (g + 1) * SUMMARY_GROUP;
+                continue;
+            }
+            if !(self.chunk_frames(c).1 && chunks.contains(&(self.port.key, code, c))) {
+                n += 1;
+            }
+            c += 1;
+        }
+        n
+    }
+
+    /// 足しているまとまりを全体の和に足して閉じる（すっぽり入るまとまりなら要約として返す）。
+    fn close_group(&mut self) -> Option<(u64, Summary)> {
+        let (g, acc) = self.group.take()?;
+        self.acc.add(&acc.sum, &acc.max, acc.frames);
+        if !self.group_whole(g) {
+            return None;
+        }
+        Some((
+            g,
+            Summary {
+                sum: acc.sum,
+                max: acc.max,
+                frames: acc.frames,
+            },
+        ))
+    }
+
+    /// まとまり g の和に足す（まとまりが替われば前のまとまりを閉じ、その要約を返す）。
+    fn add_to_group(
+        &mut self,
+        g: u64,
+        sum: &[f64],
+        max: &[f64],
+        frames: u64,
+    ) -> Option<(u64, Summary)> {
+        let closed = if self.group.as_ref().is_some_and(|(cur, _)| *cur != g) {
+            self.close_group()
+        } else {
+            None
+        };
+        let bands = self.params.bands().len();
+        let (_, acc) = self.group.get_or_insert_with(|| (g, Acc::new(bands)));
+        acc.add(sum, max, frames);
+        closed
     }
 }
 
@@ -368,8 +468,30 @@ impl Editor {
     ) -> Result<bool, EngineError> {
         let code = chan_code(run.request.channel);
         let chan = run.request.channel;
+        let key = run.port.key;
+        // 閉じたまとまりの要約を覚える
+        let keep_group = |st: &mut State, closed: Option<(u64, Summary)>| {
+            if let (Some((g, sm)), Some(a)) = (closed, st.audio.as_mut()) {
+                a.spec.groups.0.put((key, code, g), Arc::new(sm));
+            }
+        };
         while run.next < run.end {
             let c = run.next;
+            let g = c / SUMMARY_GROUP;
+            // すっぽり入って要約のあるまとまり
+            if c == g * SUMMARY_GROUP && run.group_whole(g) {
+                let s = st
+                    .audio
+                    .as_mut()
+                    .and_then(|a| a.spec.groups.0.get(&(key, code, g)));
+                if let Some(s) = s {
+                    let closed = run.close_group();
+                    keep_group(st, closed);
+                    run.acc.add(&s.sum, &s.max, s.frames);
+                    run.next = ((g + 1) * SUMMARY_GROUP).min(run.end);
+                    continue;
+                }
+            }
             let ((fa, fb), whole) = run.chunk_frames(c);
             if fa >= fb {
                 run.next += 1;
@@ -379,9 +501,10 @@ impl Editor {
                 && let Some(s) = st
                     .audio
                     .as_mut()
-                    .and_then(|a| a.spec.summaries.get(&(run.key, code, c)))
+                    .and_then(|a| a.spec.summaries.get(&(key, code, c)))
             {
-                run.acc.add(&s.sum, &s.max, s.frames);
+                let closed = run.add_to_group(g, &s.sum, &s.max, s.frames);
+                keep_group(st, closed);
                 run.next += 1;
                 continue;
             }
@@ -389,48 +512,51 @@ impl Editor {
                 return Err(EngineError::Canceled);
             }
             let pace = st.audio.as_ref().map(|a| a.spec.pace).unwrap_or_default();
-            let n = grant(&pace, MAX_GROUP_CHUNKS);
+            let n = grant(&pace, group_chunks(&run.params, run.port.channels));
             if n == 0 {
                 return Ok(false);
             }
             let started = Instant::now();
             let done = if whole {
-                // すっぽり入って要約のないチャンクを続けて n まで（タイルも作って置く）
+                // すっぽり入って要約のないチャンクを、まとまりをまたがずに続けて n まで（タイルも作って置く）
+                let stop = ((g + 1) * SUMMARY_GROUP).min(run.end);
                 let mut c1 = c + 1;
-                while c1 < run.end && c1 - c < n {
+                while c1 < stop && c1 - c < n {
                     let has = st
                         .audio
                         .as_ref()
-                        .is_some_and(|a| a.spec.summaries.contains(&(run.key, code, c1)));
+                        .is_some_and(|a| a.spec.summaries.contains(&(key, code, c1)));
                     if !run.chunk_frames(c1).1 || has {
                         break;
                     }
                     c1 += 1;
                 }
-                let (a, b) = run.params.needed_span(c, c1, run.len);
-                let planes = self.output_samples(st, plan, None, a, b, mon)?;
+                let (a, b) = run.params.needed_span(c, c1, run.port.frames);
+                let planes = self.port_samples(st, plan, None, &run.port, a, b, mon)?;
                 let input = SpecInput {
                     start: a,
-                    len: run.len,
+                    len: run.port.frames,
                     planes: &planes,
                 };
                 let params = run.params.clone();
                 let chunks = self
                     .runtime
                     .preview(|_| params.chunks(&input, chan, c, c1, mon))?;
-                self.keep_chunks(st, &params, chan, run.key, &chunks);
+                // 要約だけを覚える（タイルを置くと、見えている所のタイルを追い出す）
+                self.keep_chunks(st, &params, chan, key, &chunks, false);
                 for ch in &chunks {
-                    run.acc.add(&ch.sum, &ch.max, u64::from(ch.frames));
+                    let closed = run.add_to_group(g, &ch.sum, &ch.max, u64::from(ch.frames));
+                    keep_group(st, closed);
                 }
                 run.next = c1;
                 c1 - c
             } else {
                 // 端のチャンク：区間に入るフレームだけ
-                let (a, b) = run.params.frames_span(fa, fb, run.len);
-                let planes = self.output_samples(st, plan, None, a, b, mon)?;
+                let (a, b) = run.params.frames_span(fa, fb, run.port.frames);
+                let planes = self.port_samples(st, plan, None, &run.port, a, b, mon)?;
                 let input = SpecInput {
                     start: a,
-                    len: run.len,
+                    len: run.port.frames,
                     planes: &planes,
                 };
                 let params = run.params.clone();
@@ -445,7 +571,8 @@ impl Editor {
                         max[k] = kura_engine::math::max(max[k], p);
                     }
                 }
-                run.acc.add(&sum, &max, fb - fa);
+                let closed = run.add_to_group(g, &sum, &max, fb - fa);
+                keep_group(st, closed);
                 run.next = c + 1;
                 1
             };
@@ -454,16 +581,17 @@ impl Editor {
                 a.spec.pace.note(done, started.elapsed());
             }
         }
+        let closed = run.close_group();
+        keep_group(st, closed);
         Ok(true)
     }
 
-    /// 予約した区間の平均を裏の仕事の区切りで進める（タイルのあと。操作中は呼ばない）。`key` は今の出力の鍵で、違う鍵の
-    /// 予約は捨てる。
+    /// 予約した区間の平均を裏の仕事の区切りで進める（タイルのあと。操作中は呼ばない）。ポートの鍵が今の計画で解いた鍵と
+    /// 違う予約は捨てる。
     pub(in crate::edit::editor) fn advance_spec_average(
         &self,
         st: &mut State,
         plan: &Plan,
-        key: [u8; 16],
         limit: &mut Limit,
         progress: &mut WorkProgress,
         ticket: &Ticket,
@@ -471,8 +599,11 @@ impl Editor {
         let Some(a) = st.audio.as_mut() else {
             return;
         };
-        a.spec.average.runs.retain(|r| r.key == key);
         let mut runs = std::mem::take(&mut a.spec.average.runs);
+        runs.retain(|r| {
+            self.resolve_port(st, plan, r.request.node, r.request.side)
+                .is_some_and(|p| p.key == r.port.key)
+        });
         let mut kept = Vec::new();
         let mut stop = false;
         for mut run in runs.drain(..) {
@@ -502,6 +633,12 @@ impl Editor {
                 Err(e) if matches!(e.root(), EngineError::Canceled) => {
                     kept.push(run);
                     stop = true;
+                }
+                // ポートに届く申告した解析がまだ手元にない：解けるまで待つ
+                Err(e) if matches!(e.root(), EngineError::Unsupported(_)) => {
+                    kept.push(run);
+                    stop = true;
+                    progress.blocked = true;
                 }
                 Err(e) => {
                     let state = SpecAverageState::Failed {
@@ -542,45 +679,34 @@ pub fn spec_average(
     if st.audio.is_none() {
         return Err(invalid("音声ではありません"));
     }
-    if request.node.is_some() || request.side != SpecSide::Output {
-        return Err(invalid("ノードの前後のスペクトルはまだ選べません"));
-    }
     let plan = st.plan.clone();
-    let full = plan
-        .output_shapes()
-        .into_iter()
-        .find(|(o, _)| *o == st.output)
-        .map(|(_, s)| s)
-        .ok_or_else(|| EditorError::Failed("文書に出力がありません".into()))?;
-    let (rate, channels, len) =
-        audio_shape(&full).ok_or_else(|| invalid("長さの分からない音声は求められません"))?;
-    if !request.channel.valid_for(usize::from(channels)) {
+    let port = editor
+        .resolve_port(st, &plan, request.node, request.side)
+        .ok_or_else(|| invalid("このポートのスペクトルは求められません"))?;
+    if !request.channel.valid_for(usize::from(port.channels)) {
         return Err(invalid("このチャンネルの数では選べないチャンネルです"));
     }
-    let fps = editor
-        .runtime
-        .preview(|e| e.fingerprints(&plan, &st.inputs))
-        .map_err(|e| EditorError::from_engine("出力の指紋を求められません", e))?;
-    let fp = fps
-        .outputs
-        .iter()
-        .find(|(o, _)| *o == st.output)
-        .map(|(_, f)| *f)
-        .ok_or_else(|| EditorError::Failed("出力の指紋がありません".into()))?;
-    let mut key = [0u8; 16];
-    key.copy_from_slice(&fp.0.0[..16]);
     let Some(a) = st.audio.as_mut() else {
         return Err(invalid("音声ではありません"));
     };
     let params = a
         .spec
-        .params(rate)
+        .params(port.rate)
         .map_err(|e| EditorError::from_engine("スペクトルの式を作れません", e))?;
-    let (j0, j1) = frame_range(&params, request.start, request.end, len);
+    // 出力の区間をポートに写した区間の包み（下流の写しが飛び飛びになる操作（中を切る・つなぐ）が入ると、出力にない区間も
+    // 入る。今の時間の写しの操作（trim・resample・ループ）では 1 区分）
+    let mapped = port.to_port(&[(request.start, request.end)]);
+    let (ps, pe) = mapped
+        .iter()
+        .fold((u64::MAX, 0u64), |(a, b), (x, y)| (a.min(*x), b.max(*y)));
+    let (j0, j1) = frame_range(&params, ps, pe, port.frames);
     let code = chan_code(request.channel);
-    let avg_key = (key, code, j0, j1);
+    let avg_key = (port.key, code, j0, j1);
     a.spec.average.track(request, avg_key);
-    if let Some(state) = a.spec.average.result(&avg_key) {
+    // 覚えた値（失敗は覚えていても求め直す：予算や源の読みの誤りは一時のことがある）
+    if let Some(state) = a.spec.average.result(&avg_key)
+        && matches!(state, SpecAverageState::Ready(_))
+    {
         return Ok(state);
     }
     if let Some(r) = a
@@ -602,24 +728,31 @@ pub fn spec_average(
     };
     let mut run = AverageRun {
         request: request.clone(),
-        key,
+        port,
         params: params.clone(),
-        len,
         j0,
         j1,
         next: first,
         end,
         first,
         acc: Acc::new(params.bands().len()),
+        group: None,
     };
-    // 流し解きの間（M17 段 3）はその場で求めない（今の計画は解き終えるまで流せない）
+    // 流し解きの間（M17 段 3）と、ポートに届く申告した解析が手元にないときはその場で求めない（錠の中で入力の全体を
+    // 流し解かない）
     let solving = a.solve.is_some();
-    let missing = run.missing(&a.spec.summaries);
-    let sync = !solving && (missing == 0 || a.spec.pace.fit(SYNC_BUDGET, missing) >= missing);
-    if !sync {
+    let missing = run.missing(&a.spec.summaries, &a.spec.groups.0);
+    let fits = missing == 0 || a.spec.pace.fit(SYNC_BUDGET, missing) >= missing;
+    let sync = !solving && fits && editor.port_solved(st, &plan, &run.port);
+    let reserve = |st: &mut State, run: AverageRun| -> SpecAverageState {
         let progress = run.progress();
-        a.spec.average.reserve(run);
-        return Ok(SpecAverageState::Measuring { progress });
+        if let Some(a) = st.audio.as_mut() {
+            a.spec.average.reserve(run);
+        }
+        SpecAverageState::Measuring { progress }
+    };
+    if !sync {
+        return Ok(reserve(st, run));
     }
     let mut progress = WorkProgress::default();
     let mon = editor.cancel.as_ref();
@@ -627,6 +760,12 @@ pub fn spec_average(
     let state = match r {
         Ok(_) => SpecAverageState::Ready(run.acc.values()),
         Err(e) if matches!(e.root(), EngineError::Canceled) => return Err(EditorError::Canceled),
+        Err(e) if matches!(e.root(), EngineError::Unsupported(_)) => {
+            // 求めかけの続きを裏の仕事で
+            let state = reserve(st, run);
+            editor.count_resident(st);
+            return Ok(state);
+        }
         Err(e) => SpecAverageState::Failed {
             message: EditorError::from_engine("スペクトルの平均を求められません", e).to_string(),
         },
@@ -634,6 +773,8 @@ pub fn spec_average(
     if let Some(a) = st.audio.as_mut() {
         a.spec.average.remember(avg_key, state.clone());
     }
+    // その場で覚えた要約を取り置きに数える
+    editor.count_resident(st);
     Ok(state)
 }
 

@@ -37,6 +37,11 @@ fn twiddle(k: usize, len: usize) -> (f64, f64) {
 }
 
 impl RealFft {
+    /// 表のバイト数（ビット逆順・回転の表）。
+    pub fn resident_bytes(&self) -> u64 {
+        (self.rev.len() * 4 + (self.tw.len() + self.half.len()) * 16) as u64
+    }
+
     /// 長さ `n`（2 の冪、4 以上、2^24 以下）。
     pub fn new(n: usize) -> Result<Self, EngineError> {
         if n < 4 || !n.is_power_of_two() || n > 1 << 24 {

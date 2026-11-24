@@ -9,12 +9,15 @@
 //!   はそれを読むだけ（描かない・状態の錠を待たない）。鍵はポートの指紋の頭 16 バイトとチャンネルとチャンクで、中身は
 //!   変わらない（immutable）。追い出されたら 404 で、フロントは頼み直す。
 //! - 1 回の頼みで作る量：裏の仕事の頼み（`work`）は区切りの締め切りの残りで（流し解きのあと、波形の段の前）、ほかの頼み
-//!   （手・表示）は `INLINE_CHUNKS` チャンクまで。操作中は出力のポート（手ごとに鍵が変わる「後」）は作らない（画面は前 ＋
-//!   曲線で描く）。残りは `pending` で知らせ、フロントは裏の仕事を頼む。
-//! - 出力のポートの標本は、公開した表示の値が覆っていればそこから読み、覆っていなければ出力を区間で流す（`stream_audio`。
-//!   読みは源の LRU に入れない）。窓の前後 2N を足す。
-//! - 部分の作り直し：出力のポートは「タイルを作った鍵」からの変わった区間を貯め（形が変われば全体）、新しい鍵では、貯めた
-//!   区間 ±(4N − hop) に掛からないチャンクのタイルを前の鍵から写す（値は同じ）。
+//!   （手・表示）は `INLINE_CHUNKS` チャンクまで。操作中は向きが出力のポート（手ごとに鍵が変わる「後」）は作らない（画面は
+//!   前 ＋ 曲線で描く）。残りは `pending` で知らせ、フロントは裏の仕事を頼む。
+//! - ポートは [`Port`]（`Editor::resolve_port`）：文書の出力か、出力の時間の写しの連鎖（`Plan::time_chain`）にあるノードの
+//!   入力 0・出力。鍵はポートの指紋（`Engine::fingerprints`・`Engine::port_fingerprint`）、写しはポートより下流の連鎖の
+//!   `source_map`。文書の出力の標本は、公開した表示の値が覆っていればそこから読み、覆っていなければ出力を区間で流す
+//!   （`stream_audio`）。ノードのポートは `Engine::stream_node_port` で流す（ポートに届く申告した解析が手元になければ
+//!   断られるので、作らずに `pending` のまま）。どちらも読みは源の LRU に入れず、窓の前後 2N を足す。
+//! - 部分の作り直し：文書の出力は「タイルを作った鍵」からの変わった区間を貯め（形が変われば全体）、新しい鍵では、貯めた
+//!   区間 ±(4N − hop) に掛からないチャンクのタイルを前の鍵から写す（値は同じ）。ノードのポートは作り直す。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,9 +26,10 @@ use std::time::Instant;
 use kura_engine::audio::source::read_through;
 use kura_engine::audio::spec::{SPEC_VERSION, SpecChannel, SpecChunk, SpecInput, SpecParams};
 use kura_engine::audio::stream::{AudioSink, StreamInfo};
-use kura_engine::doc::NodeId;
+use kura_engine::doc::{NodeId, PortRef};
 use kura_engine::render::Plan;
 use kura_engine::render::estimate::{EstimateSpec, Source};
+use kura_engine::render::port::PortSide;
 use kura_engine::render::region::{Area, PartialValue, Spans};
 use kura_engine::value::AUDIO_CHUNK;
 use kura_engine::{EngineError, Monitor};
@@ -33,8 +37,8 @@ use kura_engine::{EngineError, Monitor};
 use super::super::view::AudioViewport;
 use super::super::{Editor, State, settle};
 use super::slice::{Limit, Pace, WorkProgress};
-use super::spec_average::{AverageJob, Summary, SummaryStore};
-use super::timeline::SourcePiece;
+use super::spec_average::{AverageJob, GroupStore, Summary, SummaryStore};
+use super::timeline::{self, SourcePiece};
 use super::{ChangedSpans, audio_shape};
 
 /// 公開の置き場の上限（バイト）。
@@ -45,6 +49,23 @@ pub const MAX_SPEC_PORTS: usize = 2;
 pub const INLINE_CHUNKS: u64 = 2;
 /// 1 回のまとまりで作るチャンクの数の上限。
 const MAX_GROUP_CHUNKS: u64 = 8;
+/// 1 回のまとまりの一時の作業領域（流した標本と帯の値の行）の上限（バイト）。まとまりのチャンクの数をこれで切る。取り置きには
+/// 数えない（区切りの中だけで持つ）。
+pub const WORK_BYTES: u64 = 8 << 20;
+
+/// 1 つのポートの 1 回の頼みで受け付けるチャンクの数：置き場の半分をポートの数で分けた量に入るタイルの数（頼みの順で切る）。
+/// 頼んだタイルが、同じ頼みで作るほかのタイルに追い出されないようにする。
+pub fn max_chunks(p: &SpecParams) -> u64 {
+    let tile = TILE_HEADER as u64 + p.frames_per_chunk() * p.bands().len() as u64;
+    (SPEC_STORE_BYTES / 2 / MAX_SPEC_PORTS as u64 / tile.max(1)).max(1)
+}
+
+/// 1 回のまとまりで作るチャンクの数（[`MAX_GROUP_CHUNKS`] と、作業領域 [`WORK_BYTES`] に入る数の小さいほう。1 以上）。
+pub fn group_chunks(p: &SpecParams, channels: u16) -> u64 {
+    let rows = p.work_bytes(0, p.frames_per_chunk());
+    let planes = u64::from(channels) * AUDIO_CHUNK as u64 * 4;
+    (WORK_BYTES / rows.saturating_add(planes).max(1)).clamp(1, MAX_GROUP_CHUNKS)
+}
 /// タイルの形式の印。
 pub const TILE_MAGIC: &[u8; 4] = b"kst1";
 /// タイルの頭の長さ（バイト）。
@@ -87,6 +108,8 @@ pub struct SpecPortInfo {
     pub bands: u32,
     /// 出力のフレーム → ポートのフレームの写しの区分（`in` がポート）。
     pub map: Vec<SourcePiece>,
+    /// 1 回の頼みで受け付けるチャンクの数（[`max_chunks`]。超えた分は頼みの順で切り、`ready`・`pending` に入らない）。
+    pub max_chunks: u64,
     /// 置き場にあるチャンクの区間（チャンクの番号の半開区間）。
     pub ready: Vec<(u64, u64)>,
     /// 頼んだ区間のうち、まだ作っていないチャンクがある。
@@ -275,11 +298,45 @@ pub(crate) struct SpecJob {
     lineage: Option<Lineage>,
     /// チャンクの要約（区間の平均）。
     pub(crate) summaries: SummaryStore,
+    /// まとまりの要約（区間の平均）。
+    pub(crate) groups: GroupStore,
     /// 区間の平均の予約と結果。
     pub(crate) average: AverageJob,
+    /// 前の頼みのポートごとの鍵（操作中に、鍵が変わったポートを作らないため）。
+    last_keys: Vec<(Option<NodeId>, SpecSide, [u8; 16])>,
 }
 
 impl SpecJob {
+    /// 持っている式の表のバイト数（取り置きに数える）。
+    pub(crate) fn params_bytes(&self) -> u64 {
+        self.params
+            .values()
+            .map(|p| p.resident_bytes())
+            .fold(0, u64::saturating_add)
+    }
+
+    /// ポートの前の鍵を `key` に替え、前の鍵と同じだったか（初めてなら偽）。
+    fn same_key(&mut self, node: Option<NodeId>, side: SpecSide, key: [u8; 16]) -> bool {
+        match self
+            .last_keys
+            .iter_mut()
+            .find(|(n, s, _)| *n == node && *s == side)
+        {
+            Some(e) => {
+                let same = e.2 == key;
+                e.2 = key;
+                same
+            }
+            None => {
+                self.last_keys.push((node, side, key));
+                if self.last_keys.len() > 2 * MAX_SPEC_PORTS {
+                    self.last_keys.remove(0);
+                }
+                false
+            }
+        }
+    }
+
     /// レートの式（作ったものを使い回す）。
     pub(super) fn params(&mut self, rate: u32) -> Result<Arc<SpecParams>, EngineError> {
         if let Some(p) = self.params.get(&rate) {
@@ -392,7 +449,150 @@ fn runs(mut chunks: Vec<u64>) -> Vec<(u64, u64)> {
     out
 }
 
+/// 頼みのポート（文書の出力か、ノードの入力 0・出力）を今の計画で解いたもの。
+#[derive(Debug, Clone)]
+pub(crate) struct Port {
+    pub(crate) node: Option<NodeId>,
+    pub(crate) side: SpecSide,
+    /// 見積もりのポート（ノードのとき）。
+    port_ref: Option<PortRef>,
+    /// ポートの鍵（指紋の頭 16 バイト）。
+    pub(crate) key: [u8; 16],
+    pub(crate) rate: u32,
+    pub(crate) channels: u16,
+    /// ポートの長さ（フレーム）。
+    pub(crate) frames: u64,
+    /// 出力のフレーム → ポートのフレームの写しの区分。
+    pub(crate) map: Vec<SourcePiece>,
+}
+
+impl Port {
+    /// 出力のフレームの区間の列を、ポートのフレームの区間の列に写す（区分の中は比で写し、頭は切り捨て・終わりは切り上げ）。
+    pub(crate) fn to_port(&self, spans: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for &(a, b) in spans {
+            for p in &self.map {
+                let (x, y) = (a.max(p.out_start), b.min(p.out_end));
+                if x >= y {
+                    continue;
+                }
+                let scale = |d: u64, up: bool| -> u64 {
+                    let num = u128::from(d) * u128::from(p.in_rate);
+                    let den = u128::from(p.out_rate.max(1));
+                    let q = if up { num.div_ceil(den) } else { num / den };
+                    u64::try_from(q).unwrap_or(u64::MAX)
+                };
+                let s = p.in_start.saturating_add(scale(x - p.out_start, false));
+                let e = p.in_start.saturating_add(scale(y - p.out_start, true));
+                if s < e {
+                    out.push((s, e.min(self.frames)));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl From<SpecSide> for PortSide {
+    fn from(s: SpecSide) -> Self {
+        match s {
+            SpecSide::Input => Self::Input,
+            SpecSide::Output => Self::Output,
+        }
+    }
+}
+
 impl Editor {
+    /// 頼みのポートを計画 `plan` で解く：ノードがなければ文書の出力（向きは出力だけ）、あればそのノードの入力 0・出力（出力の
+    /// 時間の写しの連鎖にあるノードだけ）。写せない（`Unknown`・`Reset`）・長さの分からないポートは None。
+    pub(in crate::edit::editor) fn resolve_port(
+        &self,
+        st: &State,
+        plan: &Plan,
+        node: Option<NodeId>,
+        side: SpecSide,
+    ) -> Option<Port> {
+        let Some(node) = node else {
+            if side != SpecSide::Output {
+                return None;
+            }
+            let full = plan
+                .output_shapes()
+                .into_iter()
+                .find(|(o, _)| *o == st.output)
+                .map(|(_, s)| s)?;
+            let (rate, channels, frames) = audio_shape(&full)?;
+            let fps = self
+                .runtime
+                .preview(|e| e.fingerprints(plan, &st.inputs))
+                .ok()?;
+            let fp = fps
+                .outputs
+                .iter()
+                .find(|(o, _)| *o == st.output)
+                .map(|(_, f)| *f)?;
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&fp.0.0[..16]);
+            return Some(Port {
+                node: None,
+                side,
+                port_ref: None,
+                key,
+                rate,
+                channels,
+                frames,
+                map: vec![SourcePiece {
+                    out_start: 0,
+                    out_end: frames,
+                    in_start: 0,
+                    in_rate: rate,
+                    out_rate: rate,
+                }],
+            });
+        };
+        let chain = plan.time_chain(st.output)?;
+        let i = chain.iter().position(|l| l.node == node)?;
+        let (shape, rest) = match side {
+            SpecSide::Input => (chain[i].input, &chain[i..]),
+            SpecSide::Output => (chain[i].output, &chain[i + 1..]),
+        };
+        let port_ref = plan.node_port(node, side.into()).ok()?;
+        let (rate, channels, frames) = audio_shape(&shape)?;
+        let map = timeline::source_map(rest, &shape)?;
+        let fp = self
+            .runtime
+            .preview(|e| e.port_fingerprint(plan, &st.inputs, node, side.into()))
+            .ok()?;
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&fp.0.0[..16]);
+        Some(Port {
+            node: Some(node),
+            side,
+            port_ref: Some(port_ref),
+            key,
+            rate,
+            channels,
+            frames,
+            map,
+        })
+    }
+
+    /// ポートに届く申告した解析がすべて手元にあるか（なければ流すと断られる・錠の中で流し解く）。
+    pub(in crate::edit::editor) fn port_solved(
+        &self,
+        st: &State,
+        plan: &Plan,
+        port: &Port,
+    ) -> bool {
+        let missing = self.runtime.preview(|e| match port.node {
+            None => e.missing_solves(plan, &st.inputs, &st.cache, st.output),
+            Some(node) => {
+                e.missing_port_solves(plan, &st.inputs, &st.cache, node, port.side.into())
+            }
+        });
+        missing.is_ok_and(|m| !m.unstreamable && m.tasks.is_empty())
+    }
+
     /// 表示の頼みのスペクトル（モジュールの説明）：`plan` は表示の計画、`shown` はその表示の値。`limit` は裏の仕事の区切り
     /// （None は手・表示の頼み）。頼みのポートの状態を返す。
     #[allow(clippy::too_many_arguments)]
@@ -409,10 +609,6 @@ impl Editor {
         let mut infos = Vec::new();
         let mut inline = INLINE_CHUNKS;
         for req in avp.spec.iter().take(MAX_SPEC_PORTS) {
-            // 今はノードの入力・出力は指せない（段 4 のポートの口を足すまで）。文書の出力だけ
-            if req.node.is_some() {
-                continue;
-            }
             let Some(info) = self.spec_port(
                 st,
                 plan,
@@ -444,31 +640,28 @@ impl Editor {
         progress: &mut WorkProgress,
         mon: &dyn Monitor,
     ) -> Option<SpecPortInfo> {
-        let full = plan
-            .output_shapes()
-            .into_iter()
-            .find(|(o, _)| *o == st.output)
-            .map(|(_, s)| s)?;
-        let (rate, channels, frames) = audio_shape(&full)?;
-        if !req.channel.valid_for(usize::from(channels)) {
+        let port = self.resolve_port(st, plan, req.node, req.side)?;
+        if !req.channel.valid_for(usize::from(port.channels)) {
             return None;
         }
-        let fps = self
-            .runtime
-            .preview(|e| e.fingerprints(plan, &st.inputs))
-            .ok()?;
-        let fp = fps
-            .outputs
-            .iter()
-            .find(|(o, _)| *o == st.output)
-            .map(|(_, f)| *f)?;
-        let mut key = [0u8; 16];
-        key.copy_from_slice(&fp.0.0[..16]);
+        let key = port.key;
         let code = chan_code(req.channel);
-        let params = st.audio.as_mut()?.spec.params(rate).ok()?;
-        let wanted = wanted_chunks(&req.spans, frames);
-        // 部分の作り直し：前の鍵のタイルのうち、変わった区間に掛からないものを写す
-        let lineage = st.audio.as_ref().and_then(|a| a.spec.lineage.clone());
+        let params = st.audio.as_mut()?.spec.params(port.rate).ok()?;
+        // 置き場に収まる数まで（頼みの順で切る）
+        let cap = max_chunks(&params);
+        let mut wanted = wanted_chunks(&port.to_port(&req.spans), port.frames);
+        wanted.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+        let group = group_chunks(&params, port.channels);
+        // 操作中は、前の頼みから鍵が変わったポート（ドラッグしているノードより下流。後は手ごとに変わる）を作らない（画面は
+        // 前 ＋ 曲線で描く）
+        let same_key = st.audio.as_mut()?.spec.same_key(req.node, req.side, key);
+        let may_build = !avp.interacting || same_key;
+        // 部分の作り直し（文書の出力だけ）：前の鍵のタイルのうち、変わった区間に掛からないものを写す
+        let lineage = st
+            .audio
+            .as_ref()
+            .and_then(|a| a.spec.lineage.clone())
+            .filter(|_| port.node.is_none());
         if let Some(l) = lineage.filter(|l| l.cur == key && l.base != key) {
             let pad = (params.n() * kura_engine::audio::spec::LONG - params.hop()) as u64;
             let mut p = self.lock_published();
@@ -489,17 +682,15 @@ impl Editor {
                 .filter(|c| !p.spec.contains(&(key, code, *c)))
                 .collect()
         };
-        // 操作中は出力のポート（後）を作らない
-        let may_build = !avp.interacting;
         let mut built_any = false;
         let mut left = missing.clone();
         while may_build && !left.is_empty() {
             let want = match limit.as_deref_mut() {
                 Some(l) => {
                     let pace = st.audio.as_ref().map(|a| a.spec.pace).unwrap_or_default();
-                    l.grant(&pace, MAX_GROUP_CHUNKS)
+                    l.grant(&pace, group)
                 }
-                None => (*inline).min(MAX_GROUP_CHUNKS),
+                None => (*inline).min(group),
             };
             if want == 0 {
                 break;
@@ -511,18 +702,7 @@ impl Editor {
                 c1 += 1;
             }
             let started = Instant::now();
-            match self.build_output_tiles(
-                st,
-                plan,
-                shown,
-                &params,
-                req.channel,
-                key,
-                frames,
-                c0,
-                c1,
-                mon,
-            ) {
+            match self.build_tiles(st, plan, shown, &port, &params, req.channel, c0, c1, mon) {
                 Ok(()) => {
                     built_any = true;
                     let n = c1 - c0;
@@ -537,81 +717,137 @@ impl Editor {
                 }
                 Err(e) if matches!(e.root(), EngineError::Canceled) => break,
                 Err(err) => {
-                    tracing::warn!(%err, "スペクトルのタイルを作れません");
+                    // ポートに届く申告した解析がまだない（流し解きの前）ときは断られる。ほかは知らせる
+                    if !matches!(err.root(), EngineError::Unsupported(_)) {
+                        tracing::warn!(%err, "スペクトルのタイルを作れません");
+                    }
                     progress.blocked = true;
                     break;
                 }
             }
         }
-        if built_any && let Some(a) = st.audio.as_mut() {
+        if built_any
+            && port.node.is_none()
+            && let Some(a) = st.audio.as_mut()
+        {
             // 作った鍵を部分の作り直しの元にする
             if let Some(l) = a.spec.lineage.as_mut().filter(|l| l.cur == key) {
                 l.base = key;
                 l.dirty = Dirty::Spans(Vec::new());
             }
         }
-        let ready = {
+        // 置き場と照らして決める（作ったあとに追い出されたものは作っていないのと同じ）
+        let (ready, pending) = {
             let p = self.lock_published();
-            runs(
-                wanted
-                    .iter()
-                    .copied()
-                    .filter(|c| p.spec.contains(&(key, code, *c)))
-                    .collect(),
-            )
+            let have: Vec<u64> = wanted
+                .iter()
+                .copied()
+                .filter(|c| p.spec.contains(&(key, code, *c)))
+                .collect();
+            let pending = have.len() < wanted.len();
+            (runs(have), pending)
         };
         Some(SpecPortInfo {
-            node: None,
+            node: port.node,
             side: req.side,
             channel: req.channel,
             key: key_hex(&key),
-            rate,
-            frames,
+            rate: port.rate,
+            frames: port.frames,
             n: params.n() as u32,
             hop: params.hop() as u32,
             bands: params.bands().len() as u32,
-            map: vec![SourcePiece {
-                out_start: 0,
-                out_end: frames,
-                in_start: 0,
-                in_rate: rate,
-                out_rate: rate,
-            }],
+            map: port.map.clone(),
+            max_chunks: cap,
             ready,
-            pending: !left.is_empty(),
+            pending,
         })
     }
 
-    /// 出力のチャンク [c0, c1) のタイルを作って公開の置き場に入れ、チャンクの要約を覚える。
+    /// ポートのチャンク [c0, c1) のタイルを作って公開の置き場に入れ、チャンクの要約を覚える。
     #[allow(clippy::too_many_arguments)]
-    fn build_output_tiles(
+    fn build_tiles(
         &self,
         st: &mut State,
         plan: &Plan,
         shown: &PartialValue,
+        port: &Port,
         params: &SpecParams,
         chan: SpecChannel,
-        key: [u8; 16],
-        frames: u64,
         c0: u64,
         c1: u64,
         mon: &dyn Monitor,
     ) -> Result<(), EngineError> {
-        let (a, b) = params.needed_span(c0, c1, frames);
-        let planes = self.output_samples(st, plan, Some(shown), a, b, mon)?;
+        let (a, b) = params.needed_span(c0, c1, port.frames);
+        let planes = self.port_samples(st, plan, Some(shown), port, a, b, mon)?;
         let input = SpecInput {
             start: a,
-            len: frames,
+            len: port.frames,
             planes: &planes,
         };
         let chunks = self
             .runtime
             .preview(|_| params.chunks(&input, chan, c0, c1, mon))?;
-        self.keep_chunks(st, params, chan, key, &chunks);
+        self.keep_chunks(st, params, chan, port.key, &chunks, true);
         Ok(())
     }
 
-    /// 作ったチャンクのタイルを公開の置き場に入れ、要約を覚える。
+    /// ポートの標本の区間 [a, b)（チャンネル × 区間）：文書の出力は [`Self::output_samples`]、ノードのポートは区間で流す
+    /// （`Engine::stream_node_port`。ポートに届く申告した解析が手元になければ `Unsupported`。読みは源の LRU に入れない）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn port_samples(
+        &self,
+        st: &mut State,
+        plan: &Plan,
+        shown: Option<&PartialValue>,
+        port: &Port,
+        a: u64,
+        b: u64,
+        mon: &dyn Monitor,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        let (Some(node), Some(port_ref)) = (port.node, port.port_ref) else {
+            return self.output_samples(st, plan, shown, a, b, mon);
+        };
+        let len = usize::try_from(b.saturating_sub(a))
+            .map_err(|_| EngineError::Limit("スペクトルの区間が長すぎます".into()))?;
+        let planes = vec![vec![0f32; len]; usize::from(port.channels)];
+        if len == 0 {
+            return Ok(planes);
+        }
+        let spec = EstimateSpec::new(0)
+            .all_inputs(plan, Source::Held)
+            .port_area(port_ref, Area::span(a, b));
+        let admitted =
+            self.runtime
+                .admit_preview(plan, spec, &st.inputs, &mut st.cache, &mut st.lease);
+        if let Err(e) = admitted {
+            settle(st);
+            return Err(EngineError::Limit(format!("スペクトルの区間の確保：{e}")));
+        }
+        let mut sink = Collect { start: a, planes };
+        let spans = Spans::one(a, b);
+        let side = PortSide::from(port.side);
+        let (inputs, cache) = (&st.inputs, &mut st.cache);
+        let r = self.runtime.preview(|e| {
+            read_through(|| {
+                e.stream_node_port(
+                    plan,
+                    inputs,
+                    cache,
+                    node,
+                    side,
+                    Some(&spans),
+                    &mut sink,
+                    mon,
+                )
+            })
+        });
+        settle(st);
+        r?;
+        Ok(sink.planes)
+    }
+
+    /// 作ったチャンクの要約を覚え、`tiles` なら公開の置き場にタイルを入れる。
     pub(super) fn keep_chunks(
         &self,
         st: &mut State,
@@ -619,9 +855,10 @@ impl Editor {
         chan: SpecChannel,
         key: [u8; 16],
         chunks: &[SpecChunk],
+        tiles: bool,
     ) {
         let code = chan_code(chan);
-        {
+        if tiles {
             let mut p = self.lock_published();
             for c in chunks {
                 p.spec
@@ -669,12 +906,26 @@ impl Editor {
             }
             return Ok(planes);
         }
+        // 出力に届く申告した解析が手元になければ流さない（描画の中の流し解きで、錠の中で入力の全体を流すため。ノードの
+        // ポートの `stream_node_port` と同じ守り）
+        let missing = self
+            .runtime
+            .preview(|e| e.missing_solves(plan, &st.inputs, &st.cache, st.output))?;
+        if missing.unstreamable || !missing.tasks.is_empty() {
+            return Err(EngineError::Unsupported(
+                "出力を描くのに要る解析がまだ解けていません".into(),
+            ));
+        }
         let spec = EstimateSpec::new(0)
             .all_inputs(plan, Source::Held)
             .area(st.output, Area::span(a, b));
-        self.runtime
-            .admit_preview(plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
-            .map_err(|e| EngineError::Limit(format!("スペクトルの区間の確保：{e}")))?;
+        let admitted =
+            self.runtime
+                .admit_preview(plan, spec, &st.inputs, &mut st.cache, &mut st.lease);
+        if let Err(e) = admitted {
+            settle(st);
+            return Err(EngineError::Limit(format!("スペクトルの区間の確保：{e}")));
+        }
         let mut sink = Collect { start: a, planes };
         let mut spans = Spans::new();
         spans.push(a, b);
@@ -764,6 +1015,39 @@ mod tests {
         assert!(s.contains(&([0; 16], 0, 0)), "引いたものは残る");
         assert!(!s.contains(&([0; 16], 0, 1)), "いちばん古いものを追い出す");
         assert!(s.bytes() <= SPEC_STORE_BYTES);
+    }
+
+    /// タイルの並びは共有のベクタ（`tests/vectors/edit/spec_tile.json`）と同じ。
+    #[test]
+    fn tiles_match_the_shared_vector() {
+        let raw = include_str!("../../../../tests/vectors/edit/spec_tile.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let tiles = v["tiles"].as_array().unwrap();
+        assert_eq!(tiles.len(), 3);
+        for t in tiles {
+            let n = |k: &str| t[k].as_u64().unwrap();
+            let p = SpecParams::for_rate(n("rate") as u32).unwrap();
+            assert_eq!((p.n() as u64, p.hop() as u64), (n("n"), n("hop")));
+            assert_eq!(p.bands().len() as u64, n("bands"));
+            let chan = parse_chan_token(t["token"].as_str().unwrap()).unwrap();
+            assert_eq!(u64::from(chan_code(chan)), n("channel"));
+            let frames = n("frames") as usize;
+            let chunk = SpecChunk {
+                chunk: n("chunk"),
+                first_frame: n("firstFrame"),
+                frames: frames as u32,
+                data: (0..frames * p.bands().len())
+                    .map(|i| ((i * 37 + 11) % 256) as u8)
+                    .collect(),
+                sum: Vec::new(),
+                max: Vec::new(),
+            };
+            assert_eq!(n("firstFrame"), n("chunk") * p.frames_per_chunk());
+            assert_eq!(
+                crate::library::hex(&tile_bytes(&p, chan, &chunk)),
+                t["hex"].as_str().unwrap()
+            );
+        }
     }
 
     /// 頼んだ区間のチャンクは頼みの順に重ねずに、長さで切る。半開区間にまとめる。

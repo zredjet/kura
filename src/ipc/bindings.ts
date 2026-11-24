@@ -1860,7 +1860,7 @@ export type EditSpecAveragePhaseDto = { type: "idle" } | { type: "measuring"; pr
 
 /**  スペクトルの区間の平均の頼み（M17 段 4）。 */
 export type EditSpecAverageRequestDto = {
-	/**  ノード（null は文書の出力。今は出力だけ）。 */
+	/**  ノード（null は文書の出力で、向きは `output`。ノードは出力の時間の写しの連鎖にあるものだけ）。 */
 	node: number | null,
 	side: EditSpecSideDto,
 	channel: EditSpecChannelDto,
@@ -1899,6 +1899,8 @@ export type EditSpecPortDto = {
 	bands: number,
 	/**  出力のフレーム → ポートのフレームの写しの区分（`in` がポート）。 */
 	map: EditSourcePieceDto[],
+	/**  1 回の頼みで受け付けるチャンクの数（置き場に収まる数。超えた分は頼みの順で切り、`ready`・`pending` に入らない）。 */
+	maxChunks: number,
 	/**  置き場にあるチャンクの番号の区間（半開）。 */
 	ready: EditSpanDto[],
 	/**  まだ作っていないチャンクがある（フロントは `work: true` を頼む）。 */
@@ -1907,7 +1909,7 @@ export type EditSpecPortDto = {
 
 /**  スペクトルの頼み 1 つ（M17 段 4）。 */
 export type EditSpecRequestDto = {
-	/**  ノード（null は文書の出力。今は出力だけ）。 */
+	/**  ノード（null は文書の出力で、向きは `output`。ノードは出力の時間の写しの連鎖にあるものだけ）。 */
 	node: number | null,
 	side: EditSpecSideDto,
 	channel: EditSpecChannelDto,

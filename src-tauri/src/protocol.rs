@@ -1209,6 +1209,63 @@ mod tests {
         ] {
             assert_eq!(get(&with, path.clone()).status(), status, "{path}");
         }
+        // スペクトルのタイル（M17 段 4。immutable）：表示の頼みの spec で作ったものだけ
+        let spec_vp = Viewport::Audio(editor::AudioViewport {
+            spec: vec![editor::audio::spec::SpecRequest {
+                node: None,
+                side: editor::audio::spec::SpecSide::Output,
+                channel: kura_engine::audio::spec::SpecChannel::Sum,
+                spans: vec![(0, 70_000)],
+            }],
+            work: false,
+            ..editor::AudioViewport::idle()
+        });
+        let out = editor::view(&env, &s, &spec_vp).unwrap();
+        let key = match &out.view {
+            ViewOutcome::Shown(ViewInfo::Audio(info)) => {
+                assert_eq!(info.spec[0].ready, vec![(0, 2)], "{:?}", info.spec[0]);
+                info.spec[0].key.clone()
+            }
+            other => panic!("音声を表示できませんでした: {other:?}"),
+        };
+        let tile = get(&with, format!("/edit/{s}/spec/{key}/sum/1"));
+        assert_eq!(tile.status(), StatusCode::OK);
+        assert_eq!(&tile.body()[..4], b"kst1");
+        assert_eq!(
+            header_of(&tile, "content-type").as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(header_of(&tile, "cache-control").as_deref(), IMMUTABLE);
+        assert_decorated(&tile, &origin, "spec");
+        let spec_head = reply(
+            Some(&with),
+            &request("HEAD", &format!("/edit/{s}/spec/{key}/sum/0"), &[]),
+            &origin,
+            true,
+        );
+        assert_eq!(spec_head.status(), StatusCode::OK);
+        assert!(spec_head.body().is_empty());
+        for path in [
+            format!("/edit/{s}/spec/{key}/sum/2"),
+            format!("/edit/{s}/spec/{key}/0/0"),
+            format!("/edit/{s}/spec/{}/sum/0", "0".repeat(32)),
+            format!("/edit/abc/spec/{key}/sum/0"),
+            format!("/edit/{s}/spec/{key}/sum/00"),
+        ] {
+            assert_eq!(
+                get(&with, path.clone()).status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        let no_engine = Served {
+            layout: session.library().layout(),
+            engine: None,
+        };
+        assert_eq!(
+            get(&no_engine, format!("/edit/{s}/spec/{key}/sum/0")).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         let head = reply(
             Some(&with),
             &request("HEAD", &format!("/edit/{s}/{rev}/pcm/0-10"), &[]),

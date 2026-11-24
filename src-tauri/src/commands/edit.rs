@@ -152,7 +152,7 @@ impl From<kura_core::edit::editor::audio::spec::SpecSide> for EditSpecSideDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditSpecRequestDto {
-    /// ノード（null は文書の出力。今は出力だけ）。
+    /// ノード（null は文書の出力で、向きは `output`。ノードは出力の時間の写しの連鎖にあるものだけ）。
     pub node: Option<u32>,
     pub side: EditSpecSideDto,
     pub channel: EditSpecChannelDto,
@@ -800,7 +800,7 @@ pub struct EditAudioViewDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditSpecAverageRequestDto {
-    /// ノード（null は文書の出力。今は出力だけ）。
+    /// ノード（null は文書の出力で、向きは `output`。ノードは出力の時間の写しの連鎖にあるものだけ）。
     pub node: Option<u32>,
     pub side: EditSpecSideDto,
     pub channel: EditSpecChannelDto,
@@ -929,6 +929,8 @@ pub struct EditSpecPortDto {
     pub bands: u32,
     /// 出力のフレーム → ポートのフレームの写しの区分（`in` がポート）。
     pub map: Vec<EditSourcePieceDto>,
+    /// 1 回の頼みで受け付けるチャンクの数（置き場に収まる数。超えた分は頼みの順で切り、`ready`・`pending` に入らない）。
+    pub max_chunks: u64,
     /// 置き場にあるチャンクの番号の区間（半開）。
     pub ready: Vec<EditSpanDto>,
     /// まだ作っていないチャンクがある（フロントは `work: true` を頼む）。
@@ -948,6 +950,7 @@ impl From<kura_core::edit::editor::audio::spec::SpecPortInfo> for EditSpecPortDt
             hop: p.hop,
             bands: p.bands,
             map: p.map.into_iter().map(Into::into).collect(),
+            max_chunks: p.max_chunks,
             ready: p.ready.into_iter().map(span).collect(),
             pending: p.pending,
         }
@@ -2258,6 +2261,7 @@ mod tests {
                     hop: 1024,
                     bands: 491,
                     map: Vec::new(),
+                    max_chunks: 135,
                     ready: vec![(0, 2)],
                     pending: false,
                 }],
@@ -2282,7 +2286,8 @@ mod tests {
             json["view"]["spec"],
             json!([{ "node": null, "side": "output", "channel": { "type": "side" },
                      "key": "00112233445566778899aabbccddeeff", "rate": 48000, "frames": 96000, "n": 4096,
-                     "hop": 1024, "bands": 491, "map": [], "ready": [{ "start": 0, "end": 2 }], "pending": false }])
+                     "hop": 1024, "bands": 491, "map": [], "maxChunks": 135, "ready": [{ "start": 0, "end": 2 }],
+                     "pending": false }])
         );
         assert_eq!(
             json["view"]["specAverage"],

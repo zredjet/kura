@@ -157,9 +157,10 @@ fn output_tiles_match_the_whole_render() {
     );
 }
 
-/// A29：操作中（ドラッグの途中）は出力のポート（後）を作らない。選べないチャンネル（モノラルの M）は応えに出さない。
+/// A29：操作中（ドラッグの途中）は、前の頼みから鍵が変わったポート（手ごとに変わる後）を作らない。鍵が変わらなければ作る。
+/// 選べないチャンネル（モノラルの M）は応えに出さない。
 #[test]
-fn interacting_does_not_build_the_output() {
+fn interacting_does_not_build_changed_ports() {
     let env = Env::new();
     let frames = 140 * C;
     let id = add_audio(&env.lib, &noise_wav(8_000, 1, frames, 52), "wav");
@@ -168,14 +169,24 @@ fn interacting_does_not_build_the_output() {
         .open_with(id, vp(&view, &[], SpecChannel::Sum, false, false))
         .session
         .clone();
+    // 操作中の手で鍵が変わる：作らない
+    let out = env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -1.0 }))],
+        &vp(&view, &[(0, C)], SpecChannel::Sum, false, true),
+    );
+    let port = &shown_audio(&out.view).spec[0];
+    assert!(port.ready.is_empty());
+    assert!(port.pending);
+    // 操作中でも鍵が前の頼みと同じなら作る
     let out = env.step(
         &s,
         Vec::new(),
         &vp(&view, &[(0, C)], SpecChannel::Sum, false, true),
     );
     let port = &shown_audio(&out.view).spec[0];
-    assert!(port.ready.is_empty());
-    assert!(port.pending);
+    assert_eq!(port.ready, vec![(0, 1)]);
+    assert!(!port.pending);
     let out = env.step(
         &s,
         Vec::new(),
@@ -206,14 +217,23 @@ fn unchanged_chunks_are_copied_to_the_new_key() {
         ],
         &vp(&view, &[], SpecChannel::Sum, false, false),
     );
-    let spans = [(20 * C, 22 * C)];
-    let out = env.step(
-        &s,
-        Vec::new(),
-        &vp(&view, &spans, SpecChannel::Sum, false, false),
-    );
-    let before = shown_audio(&out.view).spec[0].clone();
-    assert_eq!(before.ready, vec![(20, 22)]);
+    // 20〜21 と、尾の手前の 137（フェードを 2C にすると変わる 138C の手前の 4N − hop に掛かる）
+    let spans = [(20 * C, 22 * C), (137 * C, 138 * C)];
+    let mut before = None;
+    for _ in 0..4 {
+        let out = env.step(
+            &s,
+            Vec::new(),
+            &vp(&view, &spans, SpecChannel::Sum, false, false),
+        );
+        let p = shown_audio(&out.view).spec[0].clone();
+        if !p.pending {
+            before = Some(p);
+            break;
+        }
+    }
+    let before = before.expect("作り終える");
+    assert_eq!(before.ready, vec![(20, 22), (137, 138)]);
     // 尾のフェードを 2 チャンクに：鍵は変わるが、20〜21 のチャンクは写す
     let out = env.step(
         &s,
@@ -222,14 +242,38 @@ fn unchanged_chunks_are_copied_to_the_new_key() {
     );
     let after = shown_audio(&out.view).spec[0].clone();
     assert_ne!(after.key, before.key);
-    assert_eq!(after.ready, vec![(20, 22)], "操作中でも写したものは出す");
-    assert!(!after.pending);
+    assert_eq!(
+        after.ready,
+        vec![(20, 22)],
+        "操作中でも写したものは出す。変わった区間 ±(4N − hop) に掛かる 137 は写さない"
+    );
+    assert!(after.pending);
+    // 写した値は、新しい文書を全体で描いたものと同じ（変わった区間 ±(4N − hop) の外なので）
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 1)
+        .unwrap();
+    g.push_linear("audio.fade", 1, fade(2 * C), 1).unwrap();
+    let want = want_tiles(&bytes, &g, SpecChannel::Sum, &[20, 21]);
     for c in 20..22 {
-        assert_eq!(
-            served(&env, &s, &after.key, SpecChannel::Sum, c),
-            served(&env, &s, &before.key, SpecChannel::Sum, c)
-        );
+        let tile = served(&env, &s, &after.key, SpecChannel::Sum, c);
+        assert_eq!(tile, served(&env, &s, &before.key, SpecChannel::Sum, c));
+        assert_eq!(tile.unwrap(), want[(c - 20) as usize]);
     }
+    // 鍵が変わらない次の頼みでは 137 を作り直し、新しい文書の値になる
+    let out = env.step(
+        &s,
+        Vec::new(),
+        &vp(&view, &spans, SpecChannel::Sum, false, false),
+    );
+    assert_eq!(
+        shown_audio(&out.view).spec[0].ready,
+        vec![(20, 22), (137, 138)]
+    );
+    let want = want_tiles(&bytes, &g, SpecChannel::Sum, &[137]);
+    assert_eq!(
+        served(&env, &s, &after.key, SpecChannel::Sum, 137).unwrap(),
+        want[0]
+    );
     // 全体を変える手：写さない（操作中なので作りもしない）
     let out = env.step(
         &s,
@@ -300,21 +344,30 @@ fn want_average(
         .frame_bands(&input, chan, j0, j1, &kura_engine::NoMonitor)
         .unwrap();
     let bands = p.bands().len();
+    // チャンクの中はフレームの順、まとまり（16 チャンク）の中はチャンクの順、全体はまとまりの順
+    let group = super::spec_average::SUMMARY_GROUP;
     let (mut sum, mut max) = (vec![0.0f64; bands], vec![0.0f64; bands]);
     let mut j = j0;
     while j < j1 {
-        let e = ((j / per + 1) * per).min(j1);
-        let mut part = vec![0.0f64; bands];
-        for row in &rows[(j - j0) as usize..(e - j0) as usize] {
-            for k in 0..bands {
-                part[k] += row[k];
-                max[k] = kura_engine::math::max(max[k], row[k]);
+        let ge = ((j / per / group + 1) * group * per).min(j1);
+        let mut gpart = vec![0.0f64; bands];
+        while j < ge {
+            let e = ((j / per + 1) * per).min(ge);
+            let mut part = vec![0.0f64; bands];
+            for row in &rows[(j - j0) as usize..(e - j0) as usize] {
+                for k in 0..bands {
+                    part[k] += row[k];
+                    max[k] = kura_engine::math::max(max[k], row[k]);
+                }
             }
+            for k in 0..bands {
+                gpart[k] += part[k];
+            }
+            j = e;
         }
         for k in 0..bands {
-            sum[k] += part[k];
+            sum[k] += gpart[k];
         }
-        j = e;
     }
     let db = |x: f64| -> f32 {
         if x <= 0.0 {
@@ -361,12 +414,8 @@ fn averages_match_the_whole_render() {
     assert_eq!(st.len(), 1);
     assert_eq!(st[0].phase, SpecAveragePhase::Ready);
     assert_eq!(st[0].request, avg_req(SpecChannel::Side, a, b));
-    // すっぽり入ったチャンク 11 のタイルも置いた
-    assert!(served(&env, &s, &st[0].key, SpecChannel::Side, 11).is_some());
-    assert!(
-        served(&env, &s, &st[0].key, SpecChannel::Side, 10).is_none(),
-        "端のチャンクのタイルは作らない"
-    );
+    // 平均の道はタイルを置かない（見えている所のタイルを追い出さない。要約だけを覚える）
+    assert!(served(&env, &s, &st[0].key, SpecChannel::Side, 11).is_none());
     // 選び直す：端だけ（すっぽり入る 11 は要約から）
     pace(&env, &s, std::time::Duration::ZERO);
     let (a2, b2) = (10 * C + 6_000, 12 * C + 1);
@@ -380,11 +429,14 @@ fn averages_match_the_whole_render() {
         panic!("空");
     };
     assert_eq!(e.frames, 0);
-    // 選べないチャンネル・ノードの前後は断る
+    // 選べないチャンネル・連鎖にないノード・文書の出力の入力側は断る
     assert!(spec_average(&env.env(), &s, &avg_req(SpecChannel::Index(2), 0, 9)).is_err());
     let mut node = avg_req(SpecChannel::Sum, 0, 9);
-    node.node = Some(kura_engine::doc::NodeId(1));
+    node.node = Some(kura_engine::doc::NodeId(9));
     assert!(spec_average(&env.env(), &s, &node).is_err());
+    let mut input = avg_req(SpecChannel::Sum, 0, 9);
+    input.side = SpecSide::Input;
+    assert!(spec_average(&env.env(), &s, &input).is_err());
 }
 
 /// A32：求めるチャンクが多い区間は予約して `measuring` を返し、裏の仕事の区切りで進めて（表示の情報の `work`）、終えると
@@ -470,4 +522,284 @@ fn long_averages_run_in_the_background() {
     let out = env.step(&s, Vec::new(), &work(true));
     let info = shown_audio(&out.view);
     assert_eq!(info.spec_average[0].phase, SpecAveragePhase::Idle);
+}
+
+/// ノードのポートの頼み（区間は出力のフレーム）。
+fn port_req(node: u32, side: SpecSide, chan: SpecChannel, spans: &[(u64, u64)]) -> SpecRequest {
+    SpecRequest {
+        node: Some(kura_engine::doc::NodeId(node)),
+        side,
+        channel: chan,
+        spans: spans.to_vec(),
+    }
+}
+
+fn vp_ports(
+    view: &[(u64, u64)],
+    reqs: Vec<SpecRequest>,
+    work: bool,
+    interacting: bool,
+) -> Viewport {
+    Viewport::Audio(AudioViewport {
+        spans: view.to_vec(),
+        work,
+        interacting,
+        spec: reqs,
+        ..AudioViewport::idle()
+    })
+}
+
+/// A33：ノードの入力・出力（前と後）のタイル：区間は出力のフレームで頼み、下流の時間の写し（trim）でポートのフレームに写す
+/// （応えに写しの区分）。値はそのノードまでの文書を全体で描いたものと同じ。操作中は前（入力）だけを作り、後（出力）は作らない。
+/// 連鎖にないノードは応えに出さない。
+#[test]
+fn node_ports_follow_the_time_map() {
+    let env = Env::new();
+    let frames = 140 * C;
+    let bytes = noise_wav(8_000, 1, frames, 71);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let view = [(0, C)];
+    let s = env.open_with(id, spans(&view)).session.clone();
+    let shift = 3 * C + 100;
+    let gain = json!({ "db": -2.0 });
+    env.step(
+        &s,
+        vec![
+            add(0, "audio.gain", gain.clone()),
+            add(1, "audio.trim", json!({ "start": shift, "end": null })),
+            add(2, "audio.gain", json!({ "db": 1.0 })),
+        ],
+        &spans(&view),
+    );
+    let want_out = [(10 * C, 12 * C)];
+    let reqs = vec![
+        port_req(1, SpecSide::Input, SpecChannel::Index(0), &want_out),
+        port_req(1, SpecSide::Output, SpecChannel::Index(0), &want_out),
+    ];
+    let mut info = None;
+    for _ in 0..4 {
+        script(&env, &s, 20);
+        let out = env.step(&s, Vec::new(), &vp_ports(&view, reqs.clone(), true, false));
+        let i = shown_audio(&out.view).clone();
+        if i.spec.iter().all(|p| !p.pending) {
+            info = Some(i);
+            break;
+        }
+    }
+    let info = info.expect("作り終える");
+    assert_eq!(info.spec.len(), 2);
+    let (before, after) = (&info.spec[0], &info.spec[1]);
+    assert_eq!(before.frames, frames);
+    assert_eq!(before.map[0].in_start, shift);
+    // 出力 10C..12C はポートの 13C+100..15C+100：チャンク 13〜15
+    assert_eq!(before.ready, vec![(13, 16)]);
+    assert_eq!(after.ready, vec![(13, 16)]);
+    assert_ne!(before.key, after.key);
+    let original = want_tiles(
+        &bytes,
+        &Graph::new_single(),
+        SpecChannel::Index(0),
+        &[13, 14, 15],
+    );
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, gain, 1).unwrap();
+    let gained = want_tiles(&bytes, &g, SpecChannel::Index(0), &[13, 14, 15]);
+    for (i, c) in (13..16).enumerate() {
+        assert_eq!(
+            served(&env, &s, &before.key, SpecChannel::Index(0), c).unwrap(),
+            original[i]
+        );
+        assert_eq!(
+            served(&env, &s, &after.key, SpecChannel::Index(0), c).unwrap(),
+            gained[i]
+        );
+    }
+    // 操作中に gain を動かす手：鍵の変わらない前（入力）は作り、鍵の変わった後（出力）は作らない
+    let far = [(50 * C, 50 * C + 10)];
+    let reqs = vec![
+        port_req(1, SpecSide::Input, SpecChannel::Index(0), &far),
+        port_req(1, SpecSide::Output, SpecChannel::Index(0), &far),
+    ];
+    let out = env.step(
+        &s,
+        vec![set(1, json!({ "db": -5.0 }))],
+        &vp_ports(&view, reqs, false, true),
+    );
+    let info = shown_audio(&out.view);
+    assert_eq!(info.spec[0].ready, vec![(53, 54)]);
+    assert!(info.spec[1].ready.is_empty() && info.spec[1].pending);
+    // 連鎖にないノード
+    let out = env.step(
+        &s,
+        Vec::new(),
+        &vp_ports(
+            &view,
+            vec![port_req(9, SpecSide::Input, SpecChannel::Index(0), &far)],
+            false,
+            false,
+        ),
+    );
+    assert!(shown_audio(&out.view).spec.is_empty());
+}
+
+/// A34：ノードの入力の区間の平均：出力の区間をポートに写して求め、値はそのノードまでの文書の全体の描画から求めたものと同じ。
+#[test]
+fn node_port_averages_follow_the_time_map() {
+    let env = Env::new();
+    let frames = 140 * C;
+    let bytes = noise_wav(8_000, 2, frames, 72);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let view = [(0, C)];
+    let s = env.open_with(id, spans(&view)).session.clone();
+    let shift = 2 * C + 7;
+    env.step(
+        &s,
+        vec![
+            add(0, "audio.trim", json!({ "start": shift, "end": null })),
+            add(1, "audio.gain", json!({ "db": -4.0 })),
+        ],
+        &spans(&view),
+    );
+    pace(&env, &s, std::time::Duration::ZERO);
+    let mut req = avg_req(SpecChannel::Mid, 5 * C + 3, 6 * C + 900);
+    req.node = Some(kura_engine::doc::NodeId(2));
+    req.side = SpecSide::Input;
+    let r = avg(&env, &s, &req);
+    let SpecAverageState::Ready(v) = r else {
+        panic!("その場で求める: {r:?}");
+    };
+    // gain の入力は trim の出力（元を shift だけずらしたもの）：出力の区間はそのまま
+    let mut g = Graph::new_single();
+    g.push_linear("audio.trim", 1, json!({ "start": shift, "end": null }), 1)
+        .unwrap();
+    assert_eq!(
+        v,
+        want_average(&bytes, &g, SpecChannel::Mid, 5 * C + 3, 6 * C + 900)
+    );
+    // trim の入力（元）：元のフレームに写す
+    pace(&env, &s, std::time::Duration::ZERO);
+    req.node = Some(kura_engine::doc::NodeId(1));
+    let r = avg(&env, &s, &req);
+    let SpecAverageState::Ready(v) = r else {
+        panic!("その場で求める: {r:?}");
+    };
+    assert_eq!(
+        v,
+        want_average(
+            &bytes,
+            &Graph::new_single(),
+            SpecChannel::Mid,
+            5 * C + 3 + shift,
+            6 * C + 900 + shift
+        )
+    );
+}
+
+/// A35：短い音声（全体を描く）は、公開した表示の値から読んで作る（流さない）。値は全体の描画にかけたものと同じ。
+#[test]
+fn short_audio_reads_the_shown_value() {
+    let env = Env::new();
+    let frames = 70_000;
+    let bytes = noise_wav(8_000, 2, frames, 81);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open_with(id, spans(&[])).session.clone();
+    let gain = json!({ "db": -3.0 });
+    env.step(&s, vec![add(0, "audio.gain", gain.clone())], &spans(&[]));
+    let out = env.step(
+        &s,
+        Vec::new(),
+        &vp(&[], &[(0, frames)], SpecChannel::Sum, false, false),
+    );
+    let port = &shown_audio(&out.view).spec[0];
+    assert_eq!(port.ready, vec![(0, 2)], "{port:?}");
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, gain, 1).unwrap();
+    let want = want_tiles(&bytes, &g, SpecChannel::Sum, &[0, 1]);
+    for c in 0..2 {
+        assert_eq!(
+            served(&env, &s, &port.key, SpecChannel::Sum, c).unwrap(),
+            want[c as usize]
+        );
+    }
+}
+
+/// A36：1 つのポートの 1 回の頼みは、置き場に収まる数（`max_chunks`）まで頼みの順で切る（作ったタイルが同じ頼みのほかの
+/// タイルに追い出されない）。`pending` は置き場と照らして決める。
+#[test]
+fn requests_are_capped_to_the_store() {
+    let env = Env::new();
+    let frames = 140 * C;
+    let id = add_audio(&env.lib, &noise_wav(8_000, 1, frames, 91), "wav");
+    let view = [(0, C)];
+    let s = env
+        .open_with(id, vp(&view, &[], SpecChannel::Sum, false, false))
+        .session
+        .clone();
+    let cap = super::spec::max_chunks(&SpecParams::for_rate(8_000).unwrap());
+    assert!((10..60).contains(&cap), "{cap}");
+    let want = [(5 * C, (5 + cap + 20) * C)];
+    let mut port = None;
+    for _ in 0..40 {
+        script(&env, &s, 50);
+        let out = env.step(
+            &s,
+            Vec::new(),
+            &vp(&view, &want, SpecChannel::Sum, true, false),
+        );
+        let p = shown_audio(&out.view).spec[0].clone();
+        if !p.pending {
+            port = Some(p);
+            break;
+        }
+    }
+    let port = port.expect("作り終える");
+    assert_eq!(port.max_chunks, cap);
+    assert_eq!(port.ready, vec![(5, 5 + cap)]);
+    // 置き場から追い出されていない
+    for c in 5..5 + cap {
+        assert!(
+            served(&env, &s, &port.key, SpecChannel::Sum, c).is_some(),
+            "{c}"
+        );
+    }
+}
+
+/// A37：下流に resample があるノードのポート：出力のフレームをレートの比でポートのフレームに写し（区分の in_rate・out_rate）、
+/// 値はそのノードまでの文書を全体で描いたものと同じ。
+#[test]
+fn node_ports_follow_a_resample() {
+    let env = Env::new();
+    let frames = 70 * C;
+    let bytes = noise_wav(8_000, 1, frames, 92);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let view = [(0, C)];
+    let s = env.open_with(id, spans(&view)).session.clone();
+    let gain = json!({ "db": -2.0 });
+    env.step(
+        &s,
+        vec![
+            add(0, "audio.gain", gain.clone()),
+            add(1, "audio.resample", json!({ "rate": 16_000 })),
+        ],
+        &spans(&view),
+    );
+    // 出力（16 kHz）の 20C..22C は gain の出力（8 kHz）の 10C..11C
+    let reqs = vec![port_req(
+        1,
+        SpecSide::Output,
+        SpecChannel::Index(0),
+        &[(20 * C, 22 * C)],
+    )];
+    let out = env.step(&s, Vec::new(), &vp_ports(&view, reqs, false, false));
+    let port = shown_audio(&out.view).spec[0].clone();
+    assert_eq!((port.rate, port.frames), (8_000, frames));
+    assert_eq!((port.map[0].in_rate, port.map[0].out_rate), (8_000, 16_000));
+    assert_eq!(port.ready, vec![(10, 11)]);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, gain, 1).unwrap();
+    let want = want_tiles(&bytes, &g, SpecChannel::Index(0), &[10]);
+    assert_eq!(
+        served(&env, &s, &port.key, SpecChannel::Index(0), 10).unwrap(),
+        want[0]
+    );
 }

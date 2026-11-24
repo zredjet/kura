@@ -199,7 +199,12 @@ fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
         crate::edit::editor::audio::spec::parse_key_hex(key)?;
         let channel = parts.next()?;
         crate::edit::editor::audio::spec::parse_chan_token(channel)?;
-        let chunk = parse_decimal(parts.next()?)?;
+        // チャンクの番号は頭に 0 を付けない（immutable なので、同じ中身を指す別の URL を作らない。チャンネルの綴りと揃える）
+        let chunk_text = parts.next()?;
+        if chunk_text.len() > 1 && chunk_text.starts_with('0') {
+            return None;
+        }
+        let chunk = parse_decimal(chunk_text)?;
         if parts.next().is_some() {
             return None;
         }
@@ -699,6 +704,7 @@ mod tests {
             format!("/edit/3fa9c0de/spec/{}/0/1", key.to_uppercase()),
             format!("/edit/3fa9c0de/spec/{}/0/1", &key[..30]),
             format!("/edit/3fa9c0de/7/spec/{key}/0/1"),
+            format!("/edit/3fa9c0de/spec/{key}/0/007"),
         ] {
             assert_eq!(parse_route(&bad), None, "{bad}");
         }

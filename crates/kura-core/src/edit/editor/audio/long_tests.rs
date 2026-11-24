@@ -644,3 +644,135 @@ fn sixty_minutes_eq_solves_in_the_background() {
         );
     }
 }
+
+/// 手測り（M17 段 4）：60 分・48 kHz ステレオの WAV に gain を足した文書で、スペクトルのタイル（和）を表示の頼みに添えた
+/// 1 手の応え、裏の仕事で 48 チャンクのタイルを作り終えるまで、全体（⌘A）の区間の平均を裏の仕事で求め終えるまでを出す
+/// （プール 2 スレッド・予算 2 GiB）。
+///
+/// `cargo test --release -p kura-core --lib sixty_minutes_spectrum -- --ignored --nocapture`
+#[test]
+#[ignore = "60 分の WAV を書く（約 660 MB）。--release で回す"]
+fn sixty_minutes_spectrum() {
+    use super::spec::{SpecRequest, SpecSide};
+    use super::spec_average::{
+        SpecAveragePhase, SpecAverageRequest, SpecAverageState, spec_average,
+    };
+    use kura_engine::audio::spec::SpecChannel;
+
+    let env = Env::with(Arc::new(Budgeted(2 << 30)));
+    let frames = 60 * 60 * RATE;
+    let tmp = env.lib.layout().staging_dir().join("long.wav");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    let hash = write_wav(&tmp, frames);
+    let path = env.lib.layout().content_path(&hash, "wav");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as i64;
+    let id = insert(&env, hash, "wav", size);
+    let c = kura_engine::value::AUDIO_CHUNK as u64;
+    let at = 10 * 60 * RATE / c * c;
+    let view = |spec: &[(u64, u64)], work: bool, interacting: bool| {
+        Viewport::Audio(AudioViewport {
+            spans: vec![(at, at + 4 * c)],
+            work,
+            interacting,
+            spec: vec![SpecRequest {
+                node: None,
+                side: SpecSide::Output,
+                channel: SpecChannel::Sum,
+                spans: spec.to_vec(),
+            }],
+            ..AudioViewport::idle()
+        })
+    };
+    let s = env.open_with(id, view(&[], false, false)).session.clone();
+    env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -3.0 }))],
+        &view(&[], false, false),
+    );
+    // 見えている 4 チャンク：手の応えで 2 チャンク
+    let t = Instant::now();
+    let out = env.step(&s, Vec::new(), &view(&[(at, at + 4 * c)], false, false));
+    let first = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(shown_audio(&out.view).spec[0].ready.len(), 1);
+    // 48 チャンクを裏の仕事で
+    let want = [(at, at + 48 * c)];
+    let (mut slices, mut most) = (0u32, 0.0f64);
+    let total = Instant::now();
+    loop {
+        let t = Instant::now();
+        let out = env.step(&s, Vec::new(), &view(&want, true, false));
+        most = most.max(t.elapsed().as_secs_f64() * 1e3);
+        slices += 1;
+        if !shown_audio(&out.view).spec[0].pending {
+            break;
+        }
+        assert!(slices < 10_000);
+    }
+    println!(
+        "タイル（和）：2 チャンクを添えた手の応え {first:.1} ms・48 チャンクを区切り {slices} 回（1 回の最大 {most:.1} ms）・{:.2} 秒",
+        total.elapsed().as_secs_f64()
+    );
+    // 全体の区間の平均
+    let req = SpecAverageRequest {
+        node: None,
+        side: SpecSide::Output,
+        channel: SpecChannel::Sum,
+        start: 0,
+        end: frames,
+    };
+    let t = Instant::now();
+    let r = spec_average(&env.env(), &s, &req).unwrap();
+    let first = t.elapsed().as_secs_f64() * 1e3;
+    assert!(matches!(r, SpecAverageState::Measuring { .. }), "{r:?}");
+    let (mut slices, mut most) = (0u32, 0.0f64);
+    let total = Instant::now();
+    loop {
+        let t = Instant::now();
+        let out = env.step(&s, Vec::new(), &view(&[], true, false));
+        most = most.max(t.elapsed().as_secs_f64() * 1e3);
+        slices += 1;
+        if shown_audio(&out.view).spec_average[0].phase == SpecAveragePhase::Ready {
+            break;
+        }
+        assert!(slices < 100_000);
+    }
+    let secs = total.elapsed().as_secs_f64();
+    let SpecAverageState::Ready(v) = spec_average(&env.env(), &s, &req).unwrap() else {
+        panic!("覚えた値");
+    };
+    assert_eq!(v.frames, frames.div_ceil(1024));
+    println!(
+        "全体の平均（和）：予約の応え {first:.1} ms・区切り {slices} 回（1 回の最大 {most:.1} ms）・{secs:.2} 秒"
+    );
+    // 選び直し（まとまり・チャンクの要約から、端のまとまりだけ）
+    let total = Instant::now();
+    let r = spec_average(
+        &env.env(),
+        &s,
+        &SpecAverageRequest {
+            start: 5 * c + 123,
+            end: frames - 77,
+            ..req
+        },
+    )
+    .unwrap();
+    let sync = matches!(r, SpecAverageState::Ready(_));
+    let mut slices = 0u32;
+    if !sync {
+        loop {
+            let out = env.step(&s, Vec::new(), &view(&[], true, false));
+            slices += 1;
+            if shown_audio(&out.view).spec_average[0].phase == SpecAveragePhase::Ready {
+                break;
+            }
+            assert!(slices < 10_000);
+        }
+    }
+    println!(
+        "選び直し：{}・区切り {slices} 回・{:.1} ms",
+        if sync { "その場" } else { "予約" },
+        total.elapsed().as_secs_f64() * 1e3
+    );
+}

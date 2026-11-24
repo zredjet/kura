@@ -208,6 +208,26 @@ impl SpecParams {
         &self.bands
     }
 
+    /// 持っている表（帯・窓・FFT の表）のバイト数の見積もり（呼び手の取り置きに数える）。
+    pub fn resident_bytes(&self) -> u64 {
+        let f64s = self.window.len() + self.long_window.len();
+        let fft = self
+            .short
+            .resident_bytes()
+            .saturating_add(self.long.resident_bytes());
+        ((self.bands.len() * std::mem::size_of::<SpecBand>() + f64s * 8) as u64).saturating_add(fft)
+    }
+
+    /// フレーム [j0, j1) の帯の値（[`Self::frame_bands`]）を求める間の作業領域の見積もり（行と長い窓の行。f64）。
+    pub fn work_bytes(&self, j0: u64, j1: u64) -> u64 {
+        let frames = j1.saturating_sub(j0);
+        let longs = frames / LONG as u64 + 2;
+        frames
+            .saturating_add(longs)
+            .saturating_mul(self.bands.len() as u64)
+            .saturating_mul(8)
+    }
+
     /// 長さ `len` のフレームの数（中心が長さの内のもの）。
     pub fn frames(&self, len: u64) -> u64 {
         len.div_ceil(self.hop as u64)
@@ -356,9 +376,12 @@ impl SpecParams {
             SpecChannel::Mid | SpecChannel::Side => vec![0, 1],
             SpecChannel::Sum => (0..input.planes.len()).collect(),
         };
+        if j1 <= j0 {
+            return Ok(Vec::new());
+        }
         let hop = self.hop as i64;
         let l = LONG as u64;
-        let (l0, l1) = (j0 / l * l, j1.div_ceil(l) * l);
+        let (l0, l1) = (j0 / l * l, j1.div_ceil(l).saturating_mul(l));
         // 長い窓（4 の倍数のフレーム l0, l0+4, …, l1）
         let long_count = ((l1 - l0) / l + 1) as usize;
         let longs = crate::determinism::par_blocks(long_count, mon, |i| {
@@ -466,12 +489,21 @@ impl SpecParams {
     ) -> Result<Vec<SpecChunk>, EngineError> {
         let per = self.frames_per_chunk();
         let total = self.frames(input.len);
-        let (j0, j1) = ((c0 * per).min(total), (c1 * per).min(total));
+        if c1 <= c0 {
+            return Ok(Vec::new());
+        }
+        let (j0, j1) = (
+            c0.saturating_mul(per).min(total),
+            c1.saturating_mul(per).min(total),
+        );
         let rows = self.frame_bands(input, chan, j0, j1, mon)?;
         let bands = self.bands.len();
         let mut out = Vec::new();
         for c in c0..c1 {
-            let (a, b) = ((c * per).min(total), ((c + 1) * per).min(total));
+            let (a, b) = (
+                c.saturating_mul(per).min(total),
+                c.saturating_add(1).saturating_mul(per).min(total),
+            );
             if a >= b {
                 break;
             }
@@ -754,6 +786,37 @@ mod tests {
                 .unwrap();
             assert_eq!(some, want, "{j0}..{j1}");
         }
+    }
+
+    /// 逆さ・空の区間は空（あふれない）。表と作業領域の見積もりは 0 でない。
+    #[test]
+    fn empty_ranges_and_sizes() {
+        let p = SpecParams::for_rate(48_000).unwrap();
+        let planes = vec![vec![0.0f32; 10]];
+        let input = SpecInput {
+            start: 0,
+            len: 10,
+            planes: &planes,
+        };
+        let ch = SpecChannel::Index(0);
+        assert!(
+            p.frame_bands(&input, ch, 5, 3, &NoMonitor)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            p.frame_bands(&input, ch, 4, 4, &NoMonitor)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(p.chunks(&input, ch, 3, 1, &NoMonitor).unwrap().is_empty());
+        assert!(
+            p.chunks(&input, ch, u64::MAX - 1, u64::MAX, &NoMonitor)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(p.resident_bytes() > (4 * 4_096 * 8) as u64);
+        assert_eq!(p.work_bytes(0, 64), (64 + 18) * 491 * 8);
     }
 
     /// 測り（`--release -- --ignored --nocapture`。`RAYON_NUM_THREADS=3`）：48 kHz ステレオの和で、1 チャンク・8 チャンクの
