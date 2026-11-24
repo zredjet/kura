@@ -126,7 +126,16 @@
   gap: 1px;
 }
 
+/* 名前と「● 未保存」の印（名前は印を残して省略する） */
+.nameRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
 .title {
+  min-width: 0;
   font-size: var(--text-xl);
   font-weight: var(--weight-semibold);
   white-space: nowrap;
@@ -134,10 +143,33 @@
   text-overflow: ellipsis;
 }
 
+.unsaved {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.unsaved::before {
+  content: '';
+  width: var(--space-1-5);
+  height: var(--space-1-5);
+  border-radius: var(--radius-pill);
+  background: currentColor;
+}
+
+/* 情報の行は末尾から省略する */
 .meta {
+  min-width: 0;
   font-size: var(--text-sm);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 道具のカプセル（高さ 36px・ボタン 28px。オンは --fill-pressed） */

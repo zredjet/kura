@@ -66,12 +66,11 @@ export function ImageTools() {
   );
 }
 
-/** 「64 × 64 · PNG · 未保存」。 */
+/** 「64 × 64 · PNG」（「未保存」は名前の横の印）。 */
 export function ImageMeta() {
   const view = useImageStore((s) => s.view);
   const source = useEditorStore((s) => s.source);
   const item = useEditorStore((s) => s.item);
-  const dirty = useEditorStore((s) => s.status?.dirty ?? false);
   const w = view?.fullWidth ?? source?.width ?? item?.width ?? null;
   const h = view?.fullHeight ?? source?.height ?? item?.height ?? null;
   // アイテムの今のファイルの形式（source.format は画素の形式で、ファイルの形式ではない。元と違う形式で保存したあとは
@@ -80,7 +79,6 @@ export function ImageMeta() {
   const meta = [
     w !== null && h !== null ? t.size(formatCount(w), formatCount(h)) : null,
     format || null,
-    dirty ? t.unsaved : null,
   ]
     .filter(Boolean)
     .join(' · ');

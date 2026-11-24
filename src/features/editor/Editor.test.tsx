@@ -115,12 +115,13 @@ describe('画像エディタの画面', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('上部に名前・「64 × 64 · PNG · 未保存」・道具、下に道具の設定、右下に倍率、右に操作の並び', () => {
+  it('上部に名前と「● 未保存」の印・「64 × 64 · PNG」・道具、下に道具の設定、右下に倍率、右に操作の並び', () => {
     openState();
     const { container } = render(<Editor />);
     expect(container.querySelector('[data-editor]')).not.toBeNull();
     expect(screen.getByText('hero.png')).toBeInTheDocument();
-    expect(screen.getByText(`${t.size('64', '32')} · PNG · ${t.unsaved}`)).toBeInTheDocument();
+    expect(screen.getByText(t.unsaved)).toBeInTheDocument();
+    expect(screen.getByText(`${t.size('64', '32')} · PNG`)).toBeInTheDocument();
     const pen = screen.getByRole('button', { name: t.withKey(t.toolNames.pen, 'B') });
     expect(pen).toHaveAttribute('aria-pressed', 'true');
     fireEvent.click(screen.getByRole('button', { name: t.withKey(t.toolNames.fill, 'G') }));

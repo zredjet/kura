@@ -120,14 +120,13 @@ afterEach(() => {
 });
 
 describe('音声エディタの画面', () => {
-  it('上部に名前・「48 kHz · 16 ビット · ステレオ · 0:02.000 · WAV · 未保存」・道具、下に再生と選択の欄、左下にカーソル、右下に表示の幅', () => {
+  it('上部に名前と「● 未保存」の印・「48 kHz · 16 ビット · ステレオ · 0:02.000 · WAV」・道具、下に再生と選択の欄、左下にカーソル、右下に表示の幅', () => {
     openState();
     render(<Editor />);
     expect(screen.getByRole('region', { name: a.label })).toBeInTheDocument();
     expect(screen.getByText('loop.wav')).toBeInTheDocument();
-    expect(
-      screen.getByText(`48 kHz · 16 ビット · ステレオ · 0:02.000 · WAV · ${t.unsaved}`),
-    ).toBeInTheDocument();
+    expect(screen.getByText(t.unsaved)).toBeInTheDocument();
+    expect(screen.getByText('48 kHz · 16 ビット · ステレオ · 0:02.000 · WAV')).toBeInTheDocument();
     const select = screen.getByRole('button', { name: t.withKey(a.toolNames.select, 'S') });
     expect(select).toHaveAttribute('aria-pressed', 'true');
     // 下のカプセル：再生の操作と選択の欄

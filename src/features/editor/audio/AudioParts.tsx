@@ -38,13 +38,12 @@ function lossyFormat(format: string | null): boolean {
   return capsOf(format)?.lossless === false;
 }
 
-/** 「48 kHz · 24 ビット · ステレオ · 3:12.500 · WAV · 未保存」（レート・チャンネル・長さは今の出力、ビットは元）。 */
+/** 「48 kHz · 24 ビット · ステレオ · 3:12.500 · WAV」（レート・チャンネル・長さは今の出力、ビットは元。「未保存」は名前の横の印）。 */
 export function AudioMeta() {
   const view = useAudioStore((s) => s.view);
   const source = useAudioStore((s) => s.source);
   const item = useEditorStore((s) => s.item);
   const originalFormat = useEditorStore(originalFormatOf);
-  const dirty = useEditorStore((s) => s.status?.dirty ?? false);
   const rate = view?.rate ?? source?.rate ?? null;
   const channels = view?.channels ?? source?.channels ?? null;
   const frames = view?.frames ?? source?.frames ?? null;
@@ -63,9 +62,7 @@ export function AudioMeta() {
           ),
         ]
       : [];
-  const meta = [...parts, format || null, dirty ? ja.editor.unsaved : null]
-    .filter(Boolean)
-    .join(' · ');
+  const meta = [...parts, format || null].filter(Boolean).join(' · ');
   return <span className={editorStyles.meta}>{meta}</span>;
 }
 

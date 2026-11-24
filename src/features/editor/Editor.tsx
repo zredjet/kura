@@ -186,11 +186,15 @@ function SaveControls() {
   );
 }
 
-/** 上部：閉じる・名前（と種類ごとの一行）・種類ごとの道具・右パネルの「情報」・保存。 */
+/**
+ * 上部：閉じる・名前と「● 未保存」の印（と種類ごとの一行）・種類ごとの道具・右パネルの「情報」・保存。印は 2 つのエディタで
+ * 同じ所に出す（ADR-232。情報の行は末尾から省略する）。
+ */
 function TopBar({ ui }: { ui: EditorKindUi }) {
   const item = useEditorStore((s) => s.item);
   const panel = useEditorStore((s) => s.panel);
   const recipe = useEditorStore((s) => s.recipe);
+  const dirty = useEditorStore((s) => s.status?.dirty ?? false);
   return (
     <div className={styles.top} data-editor-top="" data-tauri-drag-region>
       <button
@@ -203,9 +207,12 @@ function TopBar({ ui }: { ui: EditorKindUi }) {
         <ChevronLeftIcon size={16} strokeWidth={2} />
       </button>
       <div className={styles.heading} data-tauri-drag-region>
-        <span className={styles.title}>
-          {recipe ? ja.recipeEditor.banner(recipe.name, item?.title ?? '') : (item?.title ?? '')}
-        </span>
+        <div className={styles.nameRow} data-tauri-drag-region>
+          <span className={styles.title}>
+            {recipe ? ja.recipeEditor.banner(recipe.name, item?.title ?? '') : (item?.title ?? '')}
+          </span>
+          {dirty && <span className={styles.unsaved}>{t.unsaved}</span>}
+        </div>
         <ui.Meta />
       </div>
       <ui.Tools />
