@@ -914,6 +914,8 @@ impl Editor {
         for input in st.inputs.values() {
             st.cache.register_external(&input.value);
         }
+        // 握る計画の結果（古い計画の道。M17 段 3）は入れ直す
+        self.rehold(st);
         if let Err(err) = st.lease.settle(&mut st.cache) {
             tracing::warn!(%err, "エディタの確保を戻せませんでした");
         }
@@ -1226,41 +1228,45 @@ fn apply_steps(e: &Engine, st: &mut State, steps: Vec<Step>) -> (Vec<NodeId>, Op
                 .and_then(|edit| commit_checked(e, st, edit, CommitMode::Step)),
             Step::Handle { handle, node, mode } => {
                 let chain = handle_chain(e, st, &handle, node);
-                let output = st
-                    .plan
-                    .output_shapes()
-                    .into_iter()
-                    .find(|(id, _)| *id == st.output)
-                    .map(|(_, s)| s);
-                output
-                    .ok_or_else(|| EngineError::Internal("文書に出力がありません".into()))
-                    .and_then(|output| {
-                        audio::handles::handle_edit(
-                            e,
-                            &chain,
-                            &output,
-                            st.session.head(),
-                            &handle,
-                            node,
-                        )
-                    })
-                    .and_then(|edit| {
-                        // 外したノードを直す手（引数と有効を 1 手で替える Replace）は、続く同じノードの引数の手（SetParams）
-                        // と同じまとめの鍵にする（数の欄からの merge の手が 1 手にまとまり、⌘Z 1 回で外す前に戻る）
-                        let replace = matches!(edit, Edit::Replace { .. });
-                        preview_checked(e, st, edit)?;
-                        if let (true, Some(id)) = (replace, node) {
-                            st.session.merge_preview_as_params(id);
-                        }
-                        match mode {
-                            audio::handles::HandleMode::Preview => Ok(None),
-                            audio::handles::HandleMode::Commit(m) => {
-                                let c = st.session.commit_preview(m)?;
-                                ensure_plan(e, st).map_err(EngineError::Invalid)?;
-                                Ok(c.created)
+                if let Some(err) = audio::solve::handle_blocked(st, &chain) {
+                    Err(err)
+                } else {
+                    let output = st
+                        .plan
+                        .output_shapes()
+                        .into_iter()
+                        .find(|(id, _)| *id == st.output)
+                        .map(|(_, s)| s);
+                    output
+                        .ok_or_else(|| EngineError::Internal("文書に出力がありません".into()))
+                        .and_then(|output| {
+                            audio::handles::handle_edit(
+                                e,
+                                &chain,
+                                &output,
+                                st.session.head(),
+                                &handle,
+                                node,
+                            )
+                        })
+                        .and_then(|edit| {
+                            // 外したノードを直す手（引数と有効を 1 手で替える Replace）は、続く同じノードの引数の手（SetParams）
+                            // と同じまとめの鍵にする（数の欄からの merge の手が 1 手にまとまり、⌘Z 1 回で外す前に戻る）
+                            let replace = matches!(edit, Edit::Replace { .. });
+                            preview_checked(e, st, edit)?;
+                            if let (true, Some(id)) = (replace, node) {
+                                st.session.merge_preview_as_params(id);
                             }
-                        }
-                    })
+                            match mode {
+                                audio::handles::HandleMode::Preview => Ok(None),
+                                audio::handles::HandleMode::Commit(m) => {
+                                    let c = st.session.commit_preview(m)?;
+                                    ensure_plan(e, st).map_err(EngineError::Invalid)?;
+                                    Ok(c.created)
+                                }
+                            }
+                        })
+                }
             }
         };
         match r {
@@ -2024,6 +2030,9 @@ fn finish_open(
             peaks: audio::peaks::PeaksJob::new(base),
             measure: audio::measure::MeasureJob::default(),
             last_area: Default::default(),
+            held: None,
+            solve: None,
+            stale: false,
             #[cfg(test)]
             script: None,
         }

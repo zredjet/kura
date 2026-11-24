@@ -699,6 +699,10 @@ pub struct EditAudioViewDto {
     pub drawn_nodes: u64,
     /// 描くのにかかった時間（ミリ秒）。
     pub ms: f64,
+    /// 流し解きの進み（0〜1。M17 段 3）。null でなければ、頭の文書の流し解きを裏で進めていて、この表示（`rev`）は最後に
+    /// 公開した rev の計画で描いた頭より古いもの。フロントは古い表示として当て（手元の値・枠を戻さない）、`work: true` を
+    /// 頼み続ける（ドラッグ中も手が止まったら）。解き終えると新しい rev の表示になる。
+    pub solving: Option<f64>,
 }
 
 impl From<AudioViewInfo> for EditAudioViewDto {
@@ -729,6 +733,7 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             warnings: v.warnings,
             drawn_nodes: v.drawn_nodes,
             ms: v.ms,
+            solving: v.solving,
         }
     }
 }
@@ -1893,11 +1898,13 @@ mod tests {
                 warnings: Vec::new(),
                 drawn_nodes: 1,
                 ms: 2.0,
+                solving: Some(0.25),
             },
         ))));
         let json = serde_json::to_value(audio).unwrap();
         assert_eq!(json["view"]["type"], json!("audio"));
         assert_eq!(json["view"]["loop"], json!({ "start": 10, "end": 90000 }));
+        assert_eq!(json["view"]["solving"], json!(0.25));
         assert_eq!(json["view"]["samplesId"], json!("0123456789abcdef"));
         assert_eq!(json["view"]["workStalled"], json!(true));
         assert_eq!(

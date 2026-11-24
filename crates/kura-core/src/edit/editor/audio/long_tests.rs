@@ -571,3 +571,76 @@ fn a18_sixty_minutes_one_step_draws_only_the_spans() {
     );
     assert!(env.engine.current_editor().is_none());
 }
+
+/// M17 段 3 の手測り：60 分の WAV（48 kHz ステレオ）に 8 段の EQ を足し、引数を変えた手が古い rev の表示を返すまでの時間、
+/// 裏の仕事の区切り（40 ms）の数・1 回の最大・解き終えるまでの合計を出す（プール 2 スレッド・予算 2 GiB）。
+///
+/// `cargo test --release -p kura-core --lib sixty_minutes_eq -- --ignored --nocapture`
+#[test]
+#[ignore = "60 分の WAV を書く（約 660 MB）。--release で回す"]
+fn sixty_minutes_eq_solves_in_the_background() {
+    let env = Env::with(Arc::new(Budgeted(2 << 30)));
+    let frames = 60 * 60 * RATE;
+    let tmp = env.lib.layout().staging_dir().join("long.wav");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    let hash = write_wav(&tmp, frames);
+    let path = env.lib.layout().content_path(&hash, "wav");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as i64;
+    let id = insert(&env, hash, "wav", size);
+    let c = kura_engine::value::AUDIO_CHUNK as u64;
+    let at = 10 * 60 * RATE / c * c;
+    let view = |work: bool, interacting: bool| {
+        Viewport::Audio(AudioViewport {
+            spans: vec![(at, at + 4 * c)],
+            work,
+            interacting,
+            ..AudioViewport::idle()
+        })
+    };
+    let s = env.open_with(id, view(false, false)).session.clone();
+    let eq = |g: f64| {
+        let bands: Vec<serde_json::Value> = [
+            60.0, 120.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0,
+        ]
+        .iter()
+        .map(|f| json!({ "type": "bell", "freq": f, "gainDb": g, "q": 1.2 }))
+        .collect();
+        json!({ "bands": bands, "phase": "minimum", "gainDb": 0.0 })
+    };
+    // 最初の EQ：前に公開した表示（EQ なし）で描きながら解く
+    for (round, g) in [(0, 3.0), (1, 4.5)] {
+        let t = Instant::now();
+        let out = if round == 0 {
+            env.step(&s, vec![add(0, "audio.eq", eq(g))], &view(false, false))
+        } else {
+            env.step(&s, vec![set(1, eq(g))], &view(false, true))
+        };
+        let first = t.elapsed().as_secs_f64() * 1e3;
+        let info = shown_audio(&out.view);
+        assert!(info.solving.is_some(), "裏の仕事にならない");
+        let (mut slices, mut most) = (0u32, 0.0f64);
+        let total = Instant::now();
+        loop {
+            let t = Instant::now();
+            let out = env.step(&s, Vec::new(), &view(true, round == 1));
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            most = most.max(ms);
+            slices += 1;
+            if shown_audio(&out.view).solving.is_none() {
+                break;
+            }
+            assert!(slices < 10_000);
+        }
+        println!(
+            "{}：手の応え {first:.1} ms・区切り {slices} 回（1 回の最大 {most:.1} ms）・解き終えるまで {:.2} 秒",
+            if round == 0 {
+                "EQ を足す"
+            } else {
+                "引数を変える（ドラッグ中）"
+            },
+            total.elapsed().as_secs_f64()
+        );
+    }
+}

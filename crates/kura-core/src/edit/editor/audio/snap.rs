@@ -80,10 +80,20 @@ pub fn snap(
             issues: Vec::new(),
         });
     }
+    // 流し解きの間（握る計画で描いた表示を出している間。M17 段 3）は、表示の rev とその計画で読む（今の計画で描くと錠の中で
+    // 入力の全体を流し直す）
+    let (plan, rev) = match st
+        .audio
+        .as_ref()
+        .filter(|a| a.stale)
+        .and_then(|a| a.held.as_ref())
+    {
+        Some(h) => (h.plan.clone(), h.rev),
+        None => (st.plan.clone(), st.session.rev().0),
+    };
     let Some(Shape::Audio {
         channels, frames, ..
-    }) = st
-        .plan
+    }) = plan
         .output_shapes()
         .into_iter()
         .find(|(id, _)| *id == st.output)
@@ -106,11 +116,9 @@ pub fn snap(
     }
     let channels = usize::from(channels);
     let span = Area::span(a, b);
-    let rev = st.session.rev().0;
     let planes = match editor.published_audio_covering(rev, &span) {
         Some((value, _)) => read(&value, channels, a, b)?,
         None => {
-            let plan = st.plan.clone();
             let spec = EstimateSpec::new(0)
                 .all_inputs(&plan, Source::Held)
                 .area(st.output, span.clone());

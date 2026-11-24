@@ -35,6 +35,9 @@ mod serve_tests;
 mod session_tests;
 pub(crate) mod slice;
 pub mod snap;
+pub(crate) mod solve;
+#[cfg(test)]
+mod solve_tests;
 pub(crate) mod source;
 pub mod timeline;
 #[cfg(test)]
@@ -122,6 +125,9 @@ pub struct AudioViewInfo {
     pub drawn_nodes: u64,
     /// 描くのにかかった時間（ミリ秒）。
     pub ms: f64,
+    /// 流し解きの進み（0〜1）。頭の文書の流し解きを裏で進めていて、この表示は最後に公開した rev（`rev`）の計画で描いた
+    /// もの（頭より古い）。解き終えると新しい rev の表示になる（M17 段 3。docs/editing.md §18.3）。
+    pub solving: Option<f64>,
 }
 
 /// 開いている音声のエディタの状態（`State::audio`）。
@@ -134,6 +140,12 @@ pub(crate) struct AudioState {
     pub(crate) measure: measure::MeasureJob,
     /// 最後の表示の範囲の描画の数（測るための数。[`Editor::audio_counts`]）。
     pub(crate) last_area: AreaStats,
+    /// 最後に公開した rev の計画と、その申告した解析の結果（古い計画の道。M17 段 3）。
+    pub(crate) held: Option<solve::Held>,
+    /// 裏で進める流し解き（M17 段 3）。
+    pub(crate) solve: Option<solve::SolveRun>,
+    /// 最後の表示は握る計画で描いた（頭より古い）。
+    pub(crate) stale: bool,
     /// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数で区切る（`slice::Limit::Chunks`）。
     #[cfg(test)]
     pub(crate) script: Option<u64>,
@@ -284,6 +296,39 @@ impl Editor {
             }));
         };
         let avp = audio_viewport(vp);
+        // 裏の仕事の区切り（`work` の頼みだけ）：流し解き（操作中でも）→ 波形の段 → 長い音声の計り（操作中は進めない）の順に
+        // 1 つの締め切りを分け合う
+        let mut limit = avp
+            .work
+            .then(|| slice::Limit::Deadline(Instant::now() + peaks::WORK_SLICE));
+        #[cfg(test)]
+        if let (Some(l), Some(n)) = (
+            limit.as_mut(),
+            st.audio.as_mut().and_then(|a| a.script.take()),
+        ) {
+            *l = slice::Limit::Chunks(n);
+        }
+        let mut progress = slice::WorkProgress::default();
+        // M17 段 3：流し解きが重い手は裏の仕事にし、解き終えるまで握る計画で描く
+        if let solve::Gate::Background = self.solve_gate(st, &full) {
+            let done = match limit.as_mut() {
+                Some(l) => match self.advance_solve(st, l, &mut progress, ticket) {
+                    Ok(solve::Advanced::Done) => true,
+                    Ok(solve::Advanced::Pending) => false,
+                    Err(_) => {
+                        return if self.cancel.canceled() {
+                            Err(EditorError::Canceled)
+                        } else {
+                            Ok(ViewOutcome::Superseded)
+                        };
+                    }
+                },
+                None => false,
+            };
+            if !done {
+                return self.render_held(st, &avp, ticket, started, limit.is_some(), &progress);
+            }
+        }
         let area = view_area(&full, &avp);
         let plan = st.plan.clone();
         let spec = EstimateSpec::new(0)
@@ -350,6 +395,9 @@ impl Editor {
         let changed = ChangedSpans::of(&vr.changed);
         self.publish_audio(rev, vr.view.clone(), id.clone());
         st.view = Some(vr.view.clone());
+        // 公開した計画の申告した解析の結果を握る（次に重い手が来たら、この計画で描き続ける。M17 段 3）
+        self.drop_solve(st);
+        self.hold_published(st, rev, &id);
         let settled = !avp.interacting && !st.session.is_provisional();
         if let Some(a) = st.audio.as_mut() {
             a.peaks.note(rev, (rate, channels, frames), &changed);
@@ -359,18 +407,11 @@ impl Editor {
                 a.measure.retarget(&id);
             }
         }
-        // 裏の仕事の区切り（`work` の要求だけ。操作中は進めない）：波形の段を先に、残った時間で長い音声の計りを進める。窓の
-        // 途中でもチャンクごとに締め切りを見る（`slice`）
-        let mut limit = (avp.work && !avp.interacting)
-            .then(|| slice::Limit::Deadline(Instant::now() + peaks::WORK_SLICE));
-        #[cfg(test)]
-        if let (Some(l), Some(n)) = (
-            limit.as_mut(),
-            st.audio.as_mut().and_then(|a| a.script.take()),
-        ) {
-            *l = slice::Limit::Chunks(n);
+        // 裏の仕事の区切りの残り（操作中は波形の段・計りを進めない）：波形の段を先に、残った時間で長い音声の計りを進める。
+        // 窓の途中でもチャンクごとに締め切りを見る（`slice`）
+        if avp.interacting {
+            limit = None;
         }
-        let mut progress = slice::WorkProgress::default();
         self.advance_peaks(
             st,
             rev,
@@ -427,6 +468,134 @@ impl Editor {
             warnings: vr.warnings.clone(),
             drawn_nodes: vr.drawn_nodes(),
             ms: started.elapsed().as_secs_f64() * 1000.0,
+            solving: None,
+        };
+        Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
+    }
+
+    /// 流し解きの間の表示（モジュール `solve` の説明）：握る計画（最後に公開した rev）で頼まれた区間を描き、同じ rev で公開
+    /// する。波形の段・計りは進めない（流し解きが先）。`work` はこの頼みが裏の仕事の頼みか（`work_stalled` を立てるため）。
+    fn render_held(
+        &self,
+        st: &mut State,
+        avp: &AudioViewport,
+        ticket: &Ticket,
+        started: Instant,
+        work: bool,
+        progress: &slice::WorkProgress,
+    ) -> Result<ViewOutcome, EditorError> {
+        let Some(held) = st.audio.as_ref().and_then(|a| a.held.as_ref()) else {
+            return failed(EditorError::Failed("握る計画がありません".into()));
+        };
+        let (rev, plan, doc, id) = (
+            held.rev,
+            held.plan.clone(),
+            held.doc.clone(),
+            held.samples_id.clone(),
+        );
+        let Some(full) = plan
+            .output_shapes()
+            .into_iter()
+            .find(|(o, _)| *o == st.output)
+            .map(|(_, s)| s)
+        else {
+            return failed(EditorError::Failed("握る計画に出力がありません".into()));
+        };
+        let Some((rate, channels, frames)) = audio_shape(&full) else {
+            return failed(EditorError::Failed(
+                "握る計画の出力が音声ではありません".into(),
+            ));
+        };
+        let area = view_area(&full, avp);
+        let spec = EstimateSpec::new(0)
+            .all_inputs(&plan, Source::Held)
+            .area(st.output, area.clone());
+        if let Err(e) = self.runtime.admit_preview(
+            &plan,
+            spec.clone(),
+            &st.inputs,
+            &mut st.cache,
+            &mut st.lease,
+        ) {
+            let problem = self.admit_problem(&plan, spec, st, e);
+            settle(st);
+            return Ok(ViewOutcome::Failed(problem));
+        }
+        let req = ViewRequest {
+            output: st.output,
+            area: area.clone(),
+            focus: avp.focus,
+        };
+        let (inputs, cache, prev) = (&st.inputs, &mut st.cache, st.view.as_ref());
+        let r = self
+            .runtime
+            .preview(|e| e.render_view(&plan, inputs, cache, &req, prev, ticket));
+        settle(st);
+        let vr = match r {
+            Ok(vr) => vr,
+            Err(e) if matches!(e.root(), EngineError::Canceled) => {
+                return if self.cancel.canceled() {
+                    Err(EditorError::Canceled)
+                } else {
+                    Ok(ViewOutcome::Superseded)
+                };
+            }
+            Err(e) => return failed(EditorError::from_engine("表示を描けません", e)),
+        };
+        let value = vr.view.value().clone();
+        let meta = value.audio_meta().cloned().unwrap_or_default();
+        let changed = ChangedSpans::of(&vr.changed);
+        self.publish_audio(rev, vr.view.clone(), id.clone());
+        st.view = Some(vr.view.clone());
+        let solving = st
+            .audio
+            .as_ref()
+            .and_then(|a| a.solve.as_ref())
+            .map_or(0.0, solve::SolveRun::progress);
+        let (peaks, loudness) = match st.audio.as_mut() {
+            Some(a) => {
+                a.last_area = vr.area;
+                a.stale = true;
+                (a.peaks.report(), a.measure.state(&id))
+            }
+            None => return failed(EditorError::Failed("音声の状態がありません".into())),
+        };
+        self.count_resident(st);
+        let chain = plan.time_chain(st.output);
+        let input_shape = st.shapes.get(&kura_engine::doc::InputId(0)).copied();
+        let source_map = chain
+            .as_ref()
+            .zip(input_shape)
+            .and_then(|(c, s)| timeline::source_map(c, &s));
+        let nodes = chain
+            .as_ref()
+            .map(|c| handles::node_views(c, &doc))
+            .unwrap_or_default();
+        let info = AudioViewInfo {
+            rev,
+            rate,
+            channels,
+            frames,
+            loop_range: meta.loop_range.map(|l| (l.start, l.end)),
+            markers: meta
+                .markers
+                .iter()
+                .map(|m| (m.pos, m.name.clone()))
+                .collect(),
+            samples_id: id,
+            changed,
+            meta_changed: vr.meta_changed,
+            valid: valid_runs(&value, frames),
+            peaks,
+            source_map,
+            nodes,
+            loudness,
+            work: true,
+            work_stalled: work && progress.stalled(),
+            warnings: vr.warnings.clone(),
+            drawn_nodes: vr.drawn_nodes(),
+            ms: started.elapsed().as_secs_f64() * 1000.0,
+            solving: Some(solving),
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
@@ -479,7 +648,23 @@ impl Editor {
             views.saturating_add(peaks)
         };
         let run = st.audio.as_ref().map_or(0, |a| a.peaks.run_bytes());
-        st.lease.set_extra(bytes.saturating_add(run));
+        // 流し解きの作りかけ（進めている仕事の結果の見積もり。解けた結果はキャッシュが数える）
+        let solving = st
+            .audio
+            .as_ref()
+            .and_then(|a| a.solve.as_ref())
+            .map_or(0, |s| {
+                let solved = s
+                    .job
+                    .finished()
+                    .iter()
+                    .fold(0u64, |a, x| a.saturating_add(x.bytes));
+                self.runtime
+                    .preview(|e| s.job.held_bytes(e))
+                    .saturating_sub(solved)
+            });
+        st.lease
+            .set_extra(bytes.saturating_add(run).saturating_add(solving));
         settle(st);
     }
 }

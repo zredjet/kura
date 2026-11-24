@@ -436,7 +436,10 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
             return Ok(known);
         }
     }
-    if !whole_is_short(&editor, st, &full)? {
+    // 流し解きの間（M17 段 3）は短い音声でもその場で計らない（今の計画で全体を描くと錠の中で入力の全体を流し直す）。予約して、
+    // 解き終えたあと裏の仕事で計る
+    let solving = st.audio.as_ref().is_some_and(|a| a.solve.is_some());
+    if solving || !whole_is_short(&editor, st, &full)? {
         // 長い音声：計りを予約する（裏の仕事で窓ごとに流して解く）
         let frames = audio_shape(&full)
             .map(|(_, _, n)| n)
