@@ -655,6 +655,28 @@ pub enum Reach {
     Segments(Vec<Seg>),
     /// 音声：多相 FIR の窓（`audio::resample`。`(l, m)` は比、`h` はタップの数の半分）。
     Rate { l: u64, m: u64, h: u64 },
+    /// 音声：状態を運ぶ操作（M17 段 1。docs/editing.md §18.2）。出力 [a, b) は入力 [0, b + after) に依り、入力 [a, b) が
+    /// 変わると出力 [a − after, n) が変わりうる（`after` は先読み）。`frames` は入力と出力の長さ（同じ。時間の写しは恒等）で、
+    /// どちらの向きも [0, frames) で切る。
+    Prefix { after: u64, frames: u64 },
+    /// 音声：状態の表を使う核の読み（`Op::audio_reach`）。出力 [a, b) を描くのに入力 [⌊(a − before)/grid⌋·grid, b + after)
+    /// を読む（表の格子 `grid` の境から流す）。前へ写すのは [a − after, n)（保守的）。`grid` は表の格子で、`AUDIO_CHUNK` の
+    /// 倍数であることに頼らない（0 は 1 とみなす）。
+    Aligned {
+        grid: u64,
+        before: u64,
+        after: u64,
+        frames: u64,
+    },
+    /// 音声：出力のブロック（長さ `align`）を絶対位置 0 に揃える重なり保存（直線位相の FIR）。出力 [a, b) は入力
+    /// [⌊a/align⌋·align − before, ⌈b/align⌉·align + after) に依り、入力 [a, b) が変わると出力
+    /// [⌊(a − after)/align⌋·align, ⌈(b + before)/align⌉·align) が変わりうる（0 は 1 とみなす）。
+    Window {
+        before: u64,
+        after: u64,
+        align: u64,
+        frames: u64,
+    },
 }
 
 impl Reach {
@@ -703,12 +725,51 @@ impl Reach {
                 let (lo, hi) = source_window(*l, *m, *h, a, b);
                 s.push(lo, hi);
             }),
+            Self::Prefix { after, frames } => map_spans(out, |_, b, s| {
+                push_clipped(s, 0, b.saturating_add(*after), *frames);
+            }),
+            Self::Aligned {
+                grid,
+                before,
+                after,
+                frames,
+            } => map_spans(out, |a, b, s| {
+                push_clipped(
+                    s,
+                    floor_to(a.saturating_sub(*before), *grid),
+                    b.saturating_add(*after),
+                    *frames,
+                );
+            }),
+            Self::Window {
+                before,
+                after,
+                align,
+                frames,
+            } => map_spans(out, |a, b, s| {
+                push_clipped(
+                    s,
+                    floor_to(a, *align).saturating_sub(*before),
+                    ceil_to(b, *align).saturating_add(*after),
+                    *frames,
+                );
+            }),
         }
     }
 
-    /// 位置を写す申告（Affine・Resample・Segments・Rate）なら true（`All` を開いてから写すと狭く求まるもの）。
+    /// 位置を写す申告（Affine・Resample・Segments・Rate・Prefix・Aligned・Window）なら true（`All` を開いてから写すと狭く
+    /// 求まるもの）。型を足したら、どちらかに入れる（網羅の match）。
     fn maps_positions(&self) -> bool {
-        !matches!(self, Self::Global | Self::Same | Self::SameTime)
+        match self {
+            Self::Global | Self::Same | Self::SameTime => false,
+            Self::Affine { .. }
+            | Self::Resample { .. }
+            | Self::Segments(_)
+            | Self::Rate { .. }
+            | Self::Prefix { .. }
+            | Self::Aligned { .. }
+            | Self::Window { .. } => true,
+        }
     }
 
     /// [`Reach::backward`] の、出力の形 `out_shape` で `All` を開いてから写す版（位置を写さない申告は `All` のまま）。
@@ -769,8 +830,43 @@ impl Reach {
                 let (lo, hi) = dest_window(*l, *m, *h, a, b);
                 s.push(lo, hi);
             }),
+            Self::Prefix { after, frames } | Self::Aligned { after, frames, .. } => {
+                map_spans(d, |a, _, s| {
+                    push_clipped(s, a.saturating_sub(*after), *frames, *frames);
+                })
+            }
+            Self::Window {
+                before,
+                after,
+                align,
+                frames,
+            } => map_spans(d, |a, b, s| {
+                push_clipped(
+                    s,
+                    floor_to(a.saturating_sub(*after), *align),
+                    ceil_to(b.saturating_add(*before), *align),
+                    *frames,
+                );
+            }),
         }
     }
+}
+
+/// `a` を `step` の倍数に切り下げる（`step` の 0 は 1 とみなす）。
+fn floor_to(a: u64, step: u64) -> u64 {
+    let step = step.max(1);
+    a / step * step
+}
+
+/// `b` を `step` の倍数に切り上げる（`step` の 0 は 1 とみなす。あふれは飽和）。
+fn ceil_to(b: u64, step: u64) -> u64 {
+    let step = step.max(1);
+    b.div_ceil(step).saturating_mul(step)
+}
+
+/// 区間 [a, b) を [0, n) で切って足す。
+fn push_clipped(s: &mut Spans, a: u64, b: u64, n: u64) {
+    s.push(a.min(n), b.min(n));
 }
 
 /// 矩形の軸の区間（0 以上に切った u32。空なら None）。
@@ -1429,6 +1525,201 @@ mod tests {
         assert_eq!(trim.backward(&Area::span(10, 20)), Area::span(110, 120));
         assert_eq!(trim.forward(&Area::span(150, 400)), Area::span(50, 100));
         assert!(trim.forward(&Area::span(0, 100)).is_empty());
+    }
+
+    /// M17 段 1 の 3 つの型の式（docs/editing.md §18.2 の表）を、決まった値で確かめる。
+    #[test]
+    fn stateful_reaches_follow_the_table() {
+        let n = 100_000;
+        let prefix = Reach::Prefix {
+            after: 5,
+            frames: n,
+        };
+        assert_eq!(
+            prefix.backward(&Area::span(20_000, 20_010)),
+            Area::span(0, 20_015)
+        );
+        assert_eq!(
+            prefix.forward(&Area::span(20_000, 20_010)),
+            Area::span(19_995, n)
+        );
+        // 長さで切る
+        assert_eq!(prefix.backward(&Area::span(99_998, n)), Area::span(0, n));
+        assert!(prefix.forward(&Area::span(n + 5, n + 9)).is_empty());
+        let aligned = Reach::Aligned {
+            grid: 3 * 4_096,
+            before: 100,
+            after: 5,
+            frames: n,
+        };
+        // ⌊(20,000 − 100)/12,288⌋·12,288 = 12,288
+        assert_eq!(
+            aligned.backward(&Area::span(20_000, 20_010)),
+            Area::span(12_288, 20_015)
+        );
+        assert_eq!(
+            aligned.backward(&Area::span(12_400, 12_401)),
+            Area::span(12_288, 12_406)
+        );
+        // before で前の格子へ
+        assert_eq!(
+            aligned.backward(&Area::span(12_300, 12_301)),
+            Area::span(0, 12_306)
+        );
+        assert_eq!(
+            aligned.forward(&Area::span(20_000, 20_010)),
+            Area::span(19_995, n)
+        );
+        let window = Reach::Window {
+            before: 7,
+            after: 9,
+            align: 1_000,
+            frames: n,
+        };
+        assert_eq!(
+            window.backward(&Area::span(2_500, 3_001)),
+            Area::span(1_993, 4_009)
+        );
+        // ブロック 1 は入力 [993, 2,009) までしか読まない
+        assert_eq!(
+            window.forward(&Area::span(2_010, 2_990)),
+            Area::span(2_000, 3_000)
+        );
+        // 入力 2,005 はブロック 1 にも、入力 2,994 はブロック 3（入力 [2,993, 4,009) を読む）にも効く
+        assert_eq!(
+            window.forward(&Area::span(2_005, 2_995)),
+            Area::span(1_000, 4_000)
+        );
+        // 0 は 1 とみなす（割り算で落ちない）
+        let zero = Reach::Aligned {
+            grid: 0,
+            before: 0,
+            after: 0,
+            frames: 10,
+        };
+        assert_eq!(zero.backward(&Area::span(3, 4)), Area::span(3, 4));
+        let zero = Reach::Window {
+            before: 0,
+            after: 0,
+            align: 0,
+            frames: 10,
+        };
+        assert_eq!(zero.backward(&Area::span(3, 4)), Area::span(3, 4));
+        assert_eq!(zero.forward(&Area::span(3, 4)), Area::span(3, 4));
+        // 端に近い値でもあふれない
+        let far = Reach::Window {
+            before: u64::MAX,
+            after: u64::MAX,
+            align: u64::MAX,
+            frames: u64::MAX,
+        };
+        assert!(!far.backward(&Area::span(5, 6)).is_empty());
+        assert!(!far.forward(&Area::span(5, 6)).is_empty());
+        // 位置を写す申告なので、`All` は長さで開いてから写す
+        let shape = Shape::Audio {
+            rate: 48_000,
+            channels: 2,
+            frames: Dim::Exact(n),
+        };
+        assert_eq!(prefix.backward_in(&Area::All, &shape), Area::span(0, n));
+        assert_eq!(window.forward_in(&Area::All, &shape), Area::span(0, n));
+    }
+
+    /// M17 段 1：`Prefix`・`Aligned`・`Window` の逆写しと前の写しが、出力の位置ごとの素朴な依存の区間を覆い、[0, n) の中に
+    /// ある。格子・揃えに 1・C を割り切らない値（3·4,096）・C・C より大きい値（2C）を含める（実行器は頼みをチャンクに揃えて
+    /// から写すので、C を割り切る値だけでは式の穴が見えない。docs/editing.md §18.2）。
+    #[test]
+    fn stateful_reaches_cover_the_dependencies() {
+        use rand_chacha::rand_core::Rng;
+        let c = crate::value::AUDIO_CHUNK as u64;
+        let mut r = crate::determinism::rng_at(17, 0, 0);
+        let mut below = |n: u64| r.next_u64() % n.max(1);
+        let covered = |s: &Area, lo: u64, hi: u64| match s {
+            Area::Samples(sp) => sp.spans().iter().any(|(a, b)| *a <= lo && hi <= *b),
+            Area::All => true,
+            _ => lo >= hi,
+        };
+        let inside = |s: &Area, n: u64| match s {
+            Area::Samples(sp) => sp.spans().iter().all(|(_, b)| *b <= n),
+            Area::Empty => true,
+            _ => false,
+        };
+        let mut checked = 0;
+        for step in [1, 3 * 4_096, c, 2 * c] {
+            for (before, after) in [(0, 0), (0, 37), (5_000, 1), (1, 70_000)] {
+                for _ in 0..6 {
+                    let n = 1 + below(3 * step + 2 * c);
+                    let reaches = [
+                        Reach::Prefix { after, frames: n },
+                        Reach::Aligned {
+                            grid: step,
+                            before,
+                            after,
+                            frames: n,
+                        },
+                        Reach::Window {
+                            before,
+                            after,
+                            align: step,
+                            frames: n,
+                        },
+                    ];
+                    // 出力の位置 i の依存（入力の区間。[0, n) で切る）
+                    let dep = |k: usize, i: u64| -> (u64, u64) {
+                        let (lo, hi) = match k {
+                            0 => (0, i + 1 + after),
+                            1 => ((i.saturating_sub(before)) / step * step, i + 1 + after),
+                            _ => {
+                                let j = i / step;
+                                ((j * step).saturating_sub(before), (j + 1) * step + after)
+                            }
+                        };
+                        (lo.min(n), hi.min(n))
+                    };
+                    // 区間 2 つ（離れているか重なる）
+                    let mut spans = Vec::new();
+                    for _ in 0..2 {
+                        let a = below(n);
+                        let len = 1 + below((n - a).min(2 * step + 9));
+                        spans.push((a, a + len));
+                    }
+                    let mut area = Spans::new();
+                    for (a, b) in &spans {
+                        area.push(*a, *b);
+                    }
+                    let area = Area::samples(area);
+                    for (k, reach) in reaches.iter().enumerate() {
+                        // 逆写し：頼んだ区間の出力の位置ごとの依存を覆う
+                        let back = reach.backward(&area);
+                        assert!(inside(&back, n), "{reach:?} {spans:?} → {back:?}");
+                        for (a, b) in &spans {
+                            for i in *a..*b {
+                                let (lo, hi) = dep(k, i);
+                                assert!(
+                                    covered(&back, lo, hi),
+                                    "{reach:?} の逆写しが出力 {i} の依存 [{lo}, {hi}) を覆わない（{spans:?} → {back:?}）"
+                                );
+                            }
+                        }
+                        // 前の写し：変わった入力の区間に依存が掛かる出力の位置をすべて含む
+                        let fwd = reach.forward(&area);
+                        assert!(inside(&fwd, n), "{reach:?} {spans:?} → {fwd:?}");
+                        for i in 0..n {
+                            let (lo, hi) = dep(k, i);
+                            let hit = spans.iter().any(|(a, b)| lo < *b && *a < hi);
+                            if hit {
+                                assert!(
+                                    covered(&fwd, i, i + 1),
+                                    "{reach:?} の前の写しが出力 {i}（依存 [{lo}, {hi})）を含まない（{spans:?} → {fwd:?}）"
+                                );
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 4 * 6 * 3);
     }
 
     #[test]
