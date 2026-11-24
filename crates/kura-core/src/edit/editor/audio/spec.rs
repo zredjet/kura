@@ -810,9 +810,8 @@ impl Editor {
         };
         let len = usize::try_from(b.saturating_sub(a))
             .map_err(|_| EngineError::Limit("スペクトルの区間が長すぎます".into()))?;
-        let planes = vec![vec![0f32; len]; usize::from(port.channels)];
         if len == 0 {
-            return Ok(planes);
+            return Ok(vec![Vec::new(); usize::from(port.channels)]);
         }
         let spec = EstimateSpec::new(0)
             .all_inputs(plan, Source::Held)
@@ -824,6 +823,8 @@ impl Editor {
             settle(st);
             return Err(EngineError::Limit(format!("スペクトルの区間の確保：{e}")));
         }
+        // 受け手の区間は確保のあとに作る（一時の作業領域 `WORK_BYTES` の内）
+        let planes = vec![vec![0f32; len]; usize::from(port.channels)];
         let mut sink = Collect { start: a, planes };
         let spans = Spans::one(a, b);
         let side = PortSide::from(port.side);
@@ -896,11 +897,11 @@ impl Editor {
         };
         let len = usize::try_from(b.saturating_sub(a))
             .map_err(|_| EngineError::Limit("スペクトルの区間が長すぎます".into()))?;
-        let mut planes = vec![vec![0f32; len]; usize::from(channels)];
         if len == 0 {
-            return Ok(planes);
+            return Ok(vec![Vec::new(); usize::from(channels)]);
         }
         if let Some(shown) = shown.filter(|v| v.shape() == full && v.covers(&Area::span(a, b))) {
+            let mut planes = vec![vec![0f32; len]; usize::from(channels)];
             for (ch, plane) in planes.iter_mut().enumerate() {
                 shown.audio_read(ch, a, plane)?;
             }
@@ -926,6 +927,8 @@ impl Editor {
             settle(st);
             return Err(EngineError::Limit(format!("スペクトルの区間の確保：{e}")));
         }
+        // 受け手の区間は確保のあとに作る（一時の作業領域 `WORK_BYTES` の内）
+        let planes = vec![vec![0f32; len]; usize::from(channels)];
         let mut sink = Collect { start: a, planes };
         let mut spans = Spans::new();
         spans.push(a, b);

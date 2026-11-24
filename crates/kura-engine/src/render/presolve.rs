@@ -421,7 +421,7 @@ impl Engine {
     }
 
     /// 解く仕事を数える口の前の確かめ（このエンジンの計画・入力の数）。
-    fn check_solve_plan(
+    pub(super) fn check_solve_plan(
         &self,
         plan: &Plan,
         inputs: &BTreeMap<InputId, FingerprintedInput>,

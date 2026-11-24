@@ -6,8 +6,11 @@
 //!   `render` した値とビット一致する（窓は `stream_windows` のもの・メタデータも同じ・窓の中で解き直さない）。
 //! - downstream_of_the_table_waits_for_the_solve：`audio.eq`（状態の表）より下流のポートは、表がキャッシュにないと流さずに
 //!   `Unsupported`（`missing_port_solves` に仕事が 1 つ）、上流のポートは流せる。`PresolveJob` で解いたあとは下流も流せる。
-//! - port_fingerprints_match：`port_fingerprint` が `fingerprints` の `nodes`・入力の指紋と合う。外したノードの出力は入力と同じ
-//!   指紋・同じ値。
+//! - port_fingerprints_match：`port_fingerprint` が `fingerprints` の `nodes`・入力の指紋と合い、そのノードで切った文書の出力の
+//!   指紋とも同じ。外したノードの出力は入力と同じ指紋・同じ値。別のエンジンの計画は断る。
+//! - regions_stream_with_fresh_caches：窓が 2 つになる長さで、区間ごとに新しいキャッシュ（解いた表は外の解析で入れる）で流し、
+//!   範囲の描画を本当に通る（`region_nodes > 0`）こと、窓の中で解析を解かない（`analysis_solved` が増えない）こと、値が全体の
+//!   描画と同じことを確かめる。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -427,6 +430,10 @@ fn port_fingerprints_match() {
             .unwrap();
         assert_eq!(fp_in, prev, "ノード {i} の入力");
         assert_eq!(fp_out, fps.nodes[&node.id], "ノード {i} の出力");
+        // そのノードで切った文書の出力の指紋と同じ（同じ指紋なら同じ値）
+        let cut = compile(&engine, &doc(i + 1), &input);
+        let cut_fps = engine.fingerprints(&cut, &inputs).unwrap();
+        assert_eq!(fp_out, cut_fps.outputs[0].1, "ノード {i}：切った文書の出力");
         if i == DISABLED {
             assert_eq!(fp_out, fp_in, "外したノードの出力は入力と同じ指紋");
         } else {
@@ -467,6 +474,14 @@ fn port_fingerprints_match() {
         };
         assert!(bits(p) == bits(q), "外したノードの出力が入力と違う");
     }
+    // 別のエンジンの計画は断る（ほかの口と揃える）
+    let other = Engine::new().unwrap();
+    let plain = doc(2);
+    let foreign = compile(&other, &plain, &input);
+    assert!(matches!(
+        engine.port_fingerprint(&foreign, &inputs, plain.nodes[0].id, PortSide::Output),
+        Err(EngineError::Internal(_))
+    ));
     // 計画にないノードは断る
     for side in sides() {
         assert!(matches!(
@@ -487,5 +502,82 @@ fn port_fingerprints_match() {
             ),
             Err(EngineError::Invalid(_))
         ));
+    }
+}
+
+/// 窓が 2 つになる長さ（17 チャンク余り）。
+const LONG_FRAMES: u64 = 17 * C + 123;
+
+/// 解いた表（`needed` の鍵）を外の解析として入れた新しいキャッシュ。
+fn fresh_with_tables(
+    base: &NodeCache,
+    needed: &[(kura_engine::render::cache::Fingerprint, u64)],
+) -> NodeCache {
+    let mut cache = NodeCache::new(512 << 20);
+    for (key, bytes) in needed {
+        let out = base.peek_analysis(key).expect("解いた表");
+        cache.register_external_analysis(*key, out, *bytes);
+    }
+    cache
+}
+
+/// 窓が 2 つになる長さで、区間ごとに新しいキャッシュで流す：範囲の描画を通り、窓の中で解析を解かず、値は全体の描画と同じ。
+#[test]
+fn regions_stream_with_fresh_caches() {
+    let engine = stateful_engine().unwrap();
+    let input = noise(2, LONG_FRAMES, 53);
+    let g = doc(ops().len());
+    let plan = compile(&engine, &g, &input);
+    let refs = references(&engine, &input);
+    let mut base = NodeCache::new(512 << 20);
+    let missing = engine
+        .missing_solves(&plan, &fin(&input), &base, OutputId(0))
+        .unwrap();
+    let needed = missing.needed.clone();
+    solve(&engine, &plan, &input, &mut base, missing);
+    let mut two = Spans::one(3 * C + 5, 3 * C + 9);
+    two.push(16 * C - 40, 16 * C + 40);
+    let spans = [
+        ("窓の境をまたぐ", Spans::one(16 * C - 5, 16 * C + 5)),
+        ("チャンクの途中から", Spans::one(C / 2, C + C / 3)),
+        ("離れた 2 つ", two),
+        ("最後の半端なチャンク", Spans::one(17 * C + 7, 17 * C + 9)),
+    ];
+    for (i, node) in g.nodes.iter().enumerate() {
+        for side in sides() {
+            let want = match side {
+                PortSide::Input => &refs[i].0,
+                PortSide::Output => &refs[i].1,
+            };
+            for (name, spans) in &spans {
+                let what = format!("ノード {i}（{}）の {side:?}・{name}", node.op);
+                let mut cache = fresh_with_tables(&base, &needed);
+                let before = cache.stats();
+                let mut sink = Collect::default();
+                let stats = engine
+                    .stream_node_port(
+                        &plan,
+                        &fin(&input),
+                        &mut cache,
+                        node.id,
+                        side,
+                        Some(spans),
+                        &mut sink,
+                        &NoMonitor,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}：{e}"));
+                // 計画の入力そのもの（最初のノードの入力）は描くノードがない
+                if !(i == 0 && side == PortSide::Input) {
+                    assert!(stats.area.region_nodes > 0, "{what}：範囲の描画を通らない");
+                }
+                assert_eq!(stats.area.presolved, 0, "{what}：流し解いた");
+                assert_eq!(
+                    cache.stats().since(&before).analysis_solved,
+                    0,
+                    "{what}：窓の中で解析を解いた"
+                );
+                check(&sink, want, Some(spans), &what);
+            }
+        }
     }
 }

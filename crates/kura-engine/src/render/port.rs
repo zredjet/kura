@@ -72,6 +72,9 @@ impl Engine {
         node: NodeId,
         side: PortSide,
     ) -> Result<Fingerprint, EngineError> {
+        // ほかの口（`stream_node_port`・`missing_port_solves`）と同じく、別のエンジンの計画・入力の数の違いを断る（指紋は
+        // 登録表に縛られないので、別の登録表の指紋を鍵に使わない）
+        self.check_solve_plan(plan, inputs)?;
         let port = node_port(plan, node, side)?;
         let fps = self.fingerprints(plan, inputs)?;
         let input_fps: BTreeMap<InputId, Fingerprint> =

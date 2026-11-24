@@ -487,7 +487,9 @@ impl Engine {
         // （入力をそのまま出す出力・外したノードだけの鎖・全体で描いた出力のノードも同じ。render/area.rs の `AudioFinish`）。
         // ダイジェストは出力ごとに帯を持つ（範囲の描画は頼んだ出力の描いた分だけ）
         if let Some((port, area)) = &spec.port_area {
-            // 流す窓の写し（`read_planes`）
+            // 流す窓の写し（`read_planes`）と、写す間も持っている窓の値。帳簿は最後の使い手の表どおりにポートのノードの値を
+            // 落としているが、流れはその値を持ったまま写す（出力のポートは表から外れているので、出力の流れでは起きない）。
+            // 新しく作る値ならその大きさ、キャッシュに当たる・外したノード・計画の入力（遅延の源から読む窓）は写しと同じ大きさ
             let shape = super::area::Shapes::of(plan).port(port);
             if let Some(
                 s @ Shape::Audio {
@@ -496,11 +498,16 @@ impl Engine {
             ) = shape
             {
                 let target = super::area::clip_to_canvas(area, &s);
-                ledger.add(
-                    super::audio::covered_frames(&target, frames.max())
-                        .saturating_mul(u64::from(channels))
-                        .saturating_mul(4),
-                );
+                let copy = super::audio::covered_frames(&target, frames.max())
+                    .saturating_mul(u64::from(channels))
+                    .saturating_mul(4);
+                let held = match port {
+                    PortRef::Node { id } => {
+                        nodes.iter().find(|n| n.id == *id).map_or(0, |n| n.value)
+                    }
+                    PortRef::Input { .. } => 0,
+                };
+                ledger.add(copy.saturating_add(if held > 0 { held } else { copy }));
                 render = render.max(ledger.live);
             }
         }
