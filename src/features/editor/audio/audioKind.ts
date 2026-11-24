@@ -14,12 +14,12 @@ import {
 } from './AudioParts';
 import { AUDIO_KEYS } from './audioKeys';
 import { AUDIO_ADAPTER } from './audioStore';
-import { WaveStage } from './WaveStage';
+import { AudioStage } from './SpectrumStage';
 
 export const AUDIO_EDITOR: EditorKindModule = {
   adapter: AUDIO_ADAPTER,
   ui: {
-    Stage: WaveStage,
+    Stage: AudioStage,
     Tools: AudioTopTools,
     Meta: AudioMeta,
     Capsule: AudioCapsule,

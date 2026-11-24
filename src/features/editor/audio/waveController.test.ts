@@ -671,3 +671,82 @@ describe('ズームと再生位置', () => {
     expect(c.frameAt(-50)).toBe(0);
   });
 });
+
+describe('スペクトルの面の頼みと細い波形の帯（M17 段 5）', () => {
+  const spec = [
+    {
+      node: 3,
+      side: 'input' as const,
+      channel: { type: 'sum' as const },
+      spans: [{ start: 0, end: 65_536 }],
+    },
+    {
+      node: 3,
+      side: 'output' as const,
+      channel: { type: 'sum' as const },
+      spans: [{ start: 0, end: 65_536 }],
+    },
+  ];
+
+  it('spec がなければ今までと同じ頼み（spec の欄なし）。あれば手・再生・裏の仕事のどの頼みにも載る', () => {
+    const { c, clock, idle } = setup();
+    c.applyView(audioView({ work: true }));
+    expect('spec' in c.viewport()).toBe(false);
+    c.setSpec(spec);
+    expect(c.viewport().spec).toEqual(spec);
+    // spec だけが変わったら止まって 150 ms で頼む（裏の仕事が残っていれば work: true）
+    clock.advance(WAVE_IDLE_MS);
+    const last = idle[idle.length - 1]?.[0];
+    expect(last?.spec).toEqual(spec);
+    expect(last?.work).toBe(true);
+    // 再生の頼みにも載る
+    c.setPlaybackSpans([{ start: 0, end: 131_072 }]);
+    expect(idle[idle.length - 1]?.[0].spec).toEqual(spec);
+    c.setSpec(null);
+    expect('spec' in c.viewport()).toBe(false);
+  });
+
+  it('同じ spec では頼み直さない', () => {
+    const { c, clock, idle } = setup();
+    c.applyView(audioView());
+    c.setSpec(spec);
+    clock.advance(WAVE_IDLE_MS);
+    const n = idle.length;
+    c.setSpec(spec.map((r) => ({ ...r, spans: [...r.spans] })));
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle.length).toBe(n);
+  });
+
+  it('裏の仕事の理由は別々に数える（ラウドネスが終わっても平均を計っていれば続ける）', () => {
+    const { c, clock, idle } = setup();
+    c.applyView(audioView());
+    c.setExtraWork(true, 'loudness');
+    c.setExtraWork(true, 'specAverage');
+    c.setExtraWork(false, 'loudness');
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle[idle.length - 1]?.[0].work).toBe(true);
+  });
+
+  it('帯：曲の全体を 1 段にまとめ（列ごとの最小・最大）、ズーム・パンしない。見えている区間は全体で PCM の区間は頼まない。戻すと前の区間', async () => {
+    const { c, io } = setup();
+    c.applyView(audioView({ peaks: { rev: 3 } }));
+    c.zoomStep(1);
+    const zoomed = c.window;
+    io.resolve(peaksUrl(3, 65536, 0), tileBytes(65536, 0, TOTAL, 2, 100));
+    await settle();
+    c.setStrip(true);
+    expect(c.window).toEqual({ start: 0, span: TOTAL });
+    expect(c.layout().lanes).toHaveLength(1);
+    expect(c.layout().overview.h).toBe(0);
+    const scene = c.scene();
+    expect(scene.channels).toBe(1);
+    expect(scene.lanes[0]).toBeLessThan(0);
+    expect(scene.lanes[1]).toBeGreaterThan(0);
+    c.zoomStep(1);
+    c.panBy(100);
+    expect(c.window).toEqual({ start: 0, span: TOTAL });
+    expect(c.viewport().visible).toEqual({ start: 0, end: TOTAL });
+    c.setStrip(false);
+    expect(c.window).toEqual(zoomed);
+  });
+});

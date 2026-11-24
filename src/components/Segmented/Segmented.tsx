@@ -4,7 +4,8 @@ interface SegmentedProps<T extends string> {
   /** 読み上げる名前（グループの名前）。 */
   label: string;
   value: T;
-  options: readonly { value: T; label: string }[];
+  /** 選択肢（`title` はポインタを載せたときの説明。キーを添えるときに使う）。 */
+  options: readonly { value: T; label: string; title?: string }[];
   onChange: (value: T) => void;
   disabled?: boolean;
 }
@@ -25,6 +26,7 @@ export function Segmented<T extends string>({
           type="button"
           className={styles.button}
           aria-pressed={option.value === value}
+          title={option.title}
           disabled={disabled}
           onClick={(e) => {
             e.currentTarget.focus();

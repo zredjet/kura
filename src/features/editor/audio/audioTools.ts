@@ -29,6 +29,7 @@ import {
   openedAudio,
   overlayOf,
   setAudioDragging,
+  setAudioFace,
   setAudioLocal,
   setCursor,
   setSelection,
@@ -75,8 +76,12 @@ function nowPos(): number {
 
 // ===== 道具 =====
 
-/** 道具を選ぶ（切り詰めは枠を出す。ほかの道具を選んだら切り詰めをやめる）。 */
+/**
+ * 道具を選ぶ（切り詰めは枠を出す。ほかの道具を選んだら切り詰めをやめる）。スペクトルの面で切り詰め・フェード・ループを
+ * 選んだら、波形に戻して替える（M17 段 5。キーとカプセルのボタンは同じ道を通る）。
+ */
 export function selectAudioTool(tool: AudioTool): void {
+  if (tool !== 'select' && state().face === 'spectrum') setAudioFace('wave');
   if (tool === 'trim') {
     startTrim();
     return;

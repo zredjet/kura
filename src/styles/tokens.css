@@ -87,6 +87,15 @@
   --h-wave-ruler: 20px;     /* 波形の目盛り */
   --h-wave-overview: 24px;  /* 波形の全体図 */
 
+  /* ---- スペクトルの面（M17 段 5。アクセントは合成の曲線と選んだバンドだけ） ---- */
+  --spec-post: color-mix(in srgb, var(--text-secondary) 16%, transparent);       /* 後のスペクトルの塗り */
+  --spec-post-line: color-mix(in srgb, var(--text-secondary) 50%, transparent);  /* 後のスペクトルの縁 */
+  --spec-pre: color-mix(in srgb, var(--text-tertiary) 55%, transparent);         /* 前のスペクトルの線 */
+  --spec-hold: color-mix(in srgb, var(--text-primary) 26%, transparent);         /* 最大の保持（点線） */
+  --eq-band: color-mix(in srgb, var(--text-tertiary) 70%, transparent);          /* 各バンドの曲線 */
+  --eq-band-fill: color-mix(in srgb, var(--accent) 16%, transparent);            /* 選んだバンドが効く帯 */
+  --h-spec-strip-lane: 52px;  /* スペクトルの面の上の細い波形の帯（目盛りの下の 1 段） */
+
   /* ---- 角丸 ---- */
   --radius-xs: 5px;    /* kbd */
   --radius-sm: 7px;    /* タグ、トークン、小さなサムネ */

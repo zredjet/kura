@@ -28,6 +28,8 @@ import {
   editorUndo,
   openEditorAs,
   pushEditorSteps,
+  selectAdjacent,
+  selectNode,
   useEditorStore,
 } from '../editorStore';
 import {
@@ -38,10 +40,15 @@ import {
   MEASURE_RETRY_MS,
   overlayOf,
   setAudioDragging,
+  setAudioFace,
   setAudioIoForTest,
   setAudioLocal,
   setCursor,
   setSelection,
+  setSpectrumSettings,
+  spectrumController,
+  loadSpectrumSettings,
+  usableChannel,
   toggleAB,
   toggleLoopAudition,
   togglePlay,
@@ -929,5 +936,63 @@ describe('編集中の試聴と排他', () => {
     togglePlay();
     expect(useAudioStore.getState().play.status).toBe('idle');
     expect(useAudioStore.getState().cursor).toBe(1000);
+  });
+});
+
+describe('スペクトルの面（M17 段 5）', () => {
+  const eqDoc = {
+    order: [5, 6],
+    nodes: {
+      5: { id: 5, op: 'audio.eq', v: 1, enabled: true, params: { bands: [] } },
+      6: { id: 6, op: 'audio.gain', v: 1, enabled: true, params: { db: 0 } },
+    },
+    outputs: [],
+  } as never;
+
+  it('スペクトルにすると細い波形の帯になり、頼みに spec（文書の出力の後）が載る。波形に戻すと載らない', async () => {
+    await open();
+    setAudioFace('spectrum');
+    await flush(WAVE_IDLE_MS + 200);
+    const last = vi.mocked(viewEdit).mock.calls.at(-1)?.[1];
+    expect(last && last.type === 'audio' && last.spec?.map((r) => [r.node, r.side])).toEqual([
+      [null, 'output'],
+    ]);
+    expect(audioController()?.stripMode).toBe(true);
+    setAudioFace('wave');
+    await flush(WAVE_IDLE_MS + 200);
+    expect(audioController()?.stripMode).toBe(false);
+    expect(audioController()?.viewport().spec).toBeUndefined();
+  });
+
+  it('イコライザをポインタで選んだら・足したらスペクトルへ替わり、↑↓ でたどって通っただけでは替わらない', async () => {
+    await open();
+    useEditorStore.setState({ doc: eqDoc });
+    selectAdjacent(1);
+    expect(useEditorStore.getState().selected).toBe(5);
+    expect(useAudioStore.getState().face).toBe('wave');
+    selectNode(6);
+    selectNode(5);
+    expect(useAudioStore.getState().face).toBe('spectrum');
+    // 見るノードは選んだイコライザ：頼みは [前, 後]
+    expect(spectrumController()?.targetNode).toBe(5);
+  });
+
+  it('スペクトルのとき切り詰め・フェード・ループの道具を選ぶと波形に戻る。スペクトルへ替えると道具は選択に戻る', async () => {
+    await open();
+    selectAudioTool('fade');
+    setAudioFace('spectrum');
+    expect(useAudioStore.getState().tool).toBe('select');
+    selectAudioTool('loop');
+    expect(useAudioStore.getState().face).toBe('wave');
+    expect(useAudioStore.getState().tool).toBe('loop');
+  });
+
+  it('表示の設定は覚え、選べないチャンネルは和にする', () => {
+    setSpectrumSettings({ fall: 40 });
+    expect(loadSpectrumSettings().fall).toBe(40);
+    setSpectrumSettings({ fall: 20 });
+    expect(usableChannel({ type: 'mid' }, 1)).toEqual({ type: 'sum' });
+    expect(usableChannel({ type: 'side' }, 2)).toEqual({ type: 'side' });
+    expect(usableChannel({ type: 'index', index: 2 }, 2)).toEqual({ type: 'sum' });
   });
 });

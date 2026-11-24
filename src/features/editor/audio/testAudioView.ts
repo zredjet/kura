@@ -50,6 +50,8 @@ export function audioView(over: AudioViewOver = {}): EditAudioView {
     drawnNodes: 0,
     ms: 1,
     solving: null,
+    spec: [],
+    specAverage: [],
     ...over,
     peaks,
   } as EditAudioView;
@@ -183,4 +185,35 @@ export function fakeFetch() {
 /** 約束の続きを流す。 */
 export async function settle(): Promise<void> {
   for (let i = 0; i < 6; i++) await Promise.resolve();
+}
+
+/** スペクトルのタイル（`kst1`）のバイト列（列 j・帯 k の u8 を `value(j, k)` に）。 */
+export function specTileBytes(t: {
+  rate: number;
+  n: number;
+  hop: number;
+  bands: number;
+  code: number;
+  firstFrame: number;
+  frames: number;
+  value: (frame: number, band: number) => number;
+}): ArrayBuffer {
+  const buf = new ArrayBuffer(40 + t.frames * t.bands);
+  const v = new DataView(buf);
+  [0x6b, 0x73, 0x74, 0x31].forEach((b, i) => v.setUint8(i, b));
+  v.setUint16(4, 1, true);
+  v.setUint16(6, t.code, true);
+  v.setUint32(8, t.rate, true);
+  v.setUint32(12, t.n, true);
+  v.setUint32(16, t.hop, true);
+  v.setUint16(20, t.bands, true);
+  v.setUint16(22, 1, true);
+  v.setBigUint64(24, BigInt(t.firstFrame), true);
+  v.setUint32(32, t.frames, true);
+  v.setUint32(36, 0, true);
+  const data = new Uint8Array(buf, 40);
+  for (let j = 0; j < t.frames; j++) {
+    for (let k = 0; k < t.bands; k++) data[j * t.bands + k] = t.value(t.firstFrame + j, k);
+  }
+  return buf;
 }

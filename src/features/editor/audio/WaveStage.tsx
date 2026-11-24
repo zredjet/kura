@@ -23,7 +23,8 @@ const DEFAULT_INSETS: WaveInsets = { top: 64, right: 16, bottom: 96, left: 16 };
 
 /** 上部（`data-editor-top`）と下のカプセル（`data-editor-capsule`）を避ける余白。左右は --space-4。 */
 export function measureWaveInsets(host: HTMLElement): WaveInsets {
-  const stage = host.parentElement;
+  // スペクトルの面の帯（M17 段 5）は舞台の中の箱に入るので、エディタの根から探す
+  const stage = host.closest('[data-editor]') ?? host.parentElement;
   const box = host.getBoundingClientRect();
   const top = stage?.querySelector('[data-editor-top]')?.getBoundingClientRect();
   const capsule = stage?.querySelector('[data-editor-capsule]')?.getBoundingClientRect();
@@ -128,7 +129,9 @@ export function WaveStage() {
     const observer = new ResizeObserver(measure);
     observer.observe(host);
     // 下のカプセルの高さは道具・一言・折り返しで替わる（2 段）ので、それも測り直す
-    const capsule = host.parentElement?.querySelector('[data-editor-capsule]');
+    const capsule = (host.closest('[data-editor]') ?? host.parentElement)?.querySelector(
+      '[data-editor-capsule]',
+    );
     if (capsule) observer.observe(capsule);
     window.addEventListener('resize', measure);
     return () => {

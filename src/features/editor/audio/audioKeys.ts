@@ -13,7 +13,8 @@
  * | ↵ | 切り詰めを確定 |
  * | esc | フェード・ループのドラッグ中ならやめる → 切り詰めをやめる → 選択を外す →（核が）閉じる |
  * | ⌘A | すべてを選択（編集メニューの項目も `selectAll` を通る） |
- * | ⌘0・⌘+・⌘− | 全体を表示・拡大・縮小（表示メニューの項目もこのキー） |
+ * | ⌘0・⌘+・⌘− | 全体を表示・拡大・縮小（表示メニューの項目もこのキー。スペクトルの面のときは何もしない） |
+ * | ⌘1・⌘2 | 表示を波形・スペクトルに（M17 段 5。表示メニューの項目もこのキー） |
  *
  * ↑↓・⌫・⌘Z・⌘S・⌘I は核のまま。メニューが押したことにした文字のキー・Space（ライブラリ向けの T・F・L・Space の
  * 項目）は受けない。
@@ -30,6 +31,7 @@ import {
   cursorToEdge,
   nudgeCursor,
   selectAllAudio,
+  setAudioFace,
   toggleAB,
   toggleLoopAudition,
   togglePlay,
@@ -41,16 +43,26 @@ const TOOL_KEYS: Record<string, AudioTool> = { s: 'select', t: 'trim', f: 'fade'
 
 /** ⌘ の組み合わせ（表示・すべてを選択）。 */
 function meta(e: KeyboardEvent, key: string): boolean {
+  if (key === '1' || e.code === 'Digit1') {
+    setAudioFace('wave');
+    return true;
+  }
+  if (key === '2' || e.code === 'Digit2') {
+    setAudioFace('spectrum');
+    return true;
+  }
+  // スペクトルの面では波形の拡大の窓を動かさない（押しても何もしない）
+  const spectrum = useAudioStore.getState().face === 'spectrum';
   if (key === '0') {
-    audioFit();
+    if (!spectrum) audioFit();
     return true;
   }
   if (key === '=' || key === '+' || key === ';') {
-    audioZoom(1);
+    if (!spectrum) audioZoom(1);
     return true;
   }
   if (key === '-') {
-    audioZoom(-1);
+    if (!spectrum) audioZoom(-1);
     return true;
   }
   if ((key === 'a' || e.code === 'KeyA') && !e.shiftKey) {

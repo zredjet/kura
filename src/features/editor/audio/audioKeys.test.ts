@@ -138,6 +138,19 @@ describe('音声エディタのキー', () => {
     expect(editorSelectAll()).toBe(false);
   });
 
+  it('⌘1・⌘2 で波形・スペクトル。スペクトルのときの ⌘0・⌘± は波形の窓を動かさない（M17 段 5）', () => {
+    store.useAudioStore.setState({ face: 'wave' });
+    expect(press('2', { metaKey: true, code: 'Digit2' })).toBe(true);
+    expect(store.useAudioStore.getState().face).toBe('spectrum');
+    expect(press('0', { metaKey: true })).toBe(true);
+    expect(press('=', { metaKey: true })).toBe(true);
+    expect(press('-', { metaKey: true })).toBe(true);
+    expect(store.audioFit).not.toHaveBeenCalled();
+    expect(store.audioZoom).not.toHaveBeenCalled();
+    expect(press('1', { metaKey: true, code: 'Digit1' })).toBe(true);
+    expect(store.useAudioStore.getState().face).toBe('wave');
+  });
+
   it('メニューが押したことにするキー（T・F・L・Space など）は、道具・再生に届かない', () => {
     for (const key of ['t', 'f', 'l', ' ', 's', 'r', 'b', 'i', 'o']) {
       const e = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });

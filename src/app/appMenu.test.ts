@@ -20,6 +20,8 @@ import {
   WINDOW_MENU_ID,
   acceleratorOf,
   appMenuItems,
+  audioFaceItemOptions,
+  audioFaceSyncer,
   editorViewItemOptions,
   historyCommand,
   historyMenuState,
@@ -171,6 +173,47 @@ describe('appMenuItems', () => {
       [ja.appMenu.editorInfo, 'CmdOrCtrl+I'],
     ]);
     expect(items.some((i) => 'item' in i && i.item === 'Fullscreen')).toBe(true);
+  });
+
+  it('音声エディタの表示の面の切り替え（波形 ⌘1・スペクトル ⌘2）はチェック項目で、押すとそのキー（M17 段 5）', () => {
+    const run = vi.fn();
+    const faces = audioFaceItemOptions(run, 'spectrum', 'test');
+    expect([faces.wave.text, faces.wave.accelerator, faces.wave.checked]).toEqual([
+      ja.appMenu.editorWave,
+      'CmdOrCtrl+1',
+      false,
+    ]);
+    expect([faces.spectrum.accelerator, faces.spectrum.checked]).toEqual(['CmdOrCtrl+2', true]);
+    faces.spectrum.action?.('');
+    expect(run).toHaveBeenCalledWith({
+      kind: 'key',
+      spec: { key: '2', code: 'Digit2', meta: true },
+    });
+  });
+
+  it('面の合わせ方：チェックを今の面に、全体・拡大・縮小は波形のときだけ押せる。変わらなければ何もしない', () => {
+    let face: 'wave' | 'spectrum' = 'wave';
+    const checked = { wave: vi.fn(), spectrum: vi.fn() };
+    const enabled = vi.fn();
+    const sync = audioFaceSyncer(
+      {
+        faces: { wave: { setChecked: checked.wave }, spectrum: { setChecked: checked.spectrum } },
+        waveOnly: [{ setEnabled: enabled }, { setEnabled: enabled }],
+      } as never,
+      'wave',
+      () => face,
+    );
+    sync(false);
+    expect(checked.wave).not.toHaveBeenCalled();
+    face = 'spectrum';
+    sync(false);
+    expect(checked.wave).toHaveBeenLastCalledWith(false);
+    expect(checked.spectrum).toHaveBeenLastCalledWith(true);
+    expect(enabled).toHaveBeenCalledTimes(2);
+    expect(enabled).toHaveBeenLastCalledWith(false);
+    // 押したあと（自分で反転する）は変わっていなくても合わせ直す
+    sync(true);
+    expect(checked.spectrum).toHaveBeenCalledTimes(2);
   });
 
   it('表示メニューは、Submenu を渡せばそれを置き、渡さなければライブラリの中身', () => {

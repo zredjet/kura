@@ -29,6 +29,7 @@ import {
   type EditStepDto,
   type EditViewportDto,
   measureEdit,
+  specAverageEdit,
 } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
 import { isIpcError } from '../../../ipc/result';
@@ -44,6 +45,7 @@ import {
   useEditorStore,
 } from '../editorStore';
 import { defaultParams } from '../opsCatalog';
+import { drawSpectrum } from './drawSpectrum';
 import { drawWave } from './drawWave';
 import { targetNode } from './handles';
 import {
@@ -55,6 +57,11 @@ import {
   type PlaySource,
   type SourceInfo,
 } from './playback';
+import {
+  DEFAULT_SPECTRUM_SETTINGS,
+  SpectrumController,
+  type SpectrumSettings,
+} from './spectrumController';
 import { fromSource, toSource } from './timeline';
 import { trimFrameOf } from './trim';
 import { EMPTY_OVERLAY, type FetchBytes, WaveController, type WaveOverlay } from './waveController';
@@ -104,6 +111,51 @@ export interface AudioLocal {
   loop?: FrameSpan | null;
 }
 
+/** 舞台の面（文書に入らない。開くと毎回波形から。M17 段 5）。 */
+export type AudioFace = 'wave' | 'spectrum';
+
+/** 表示の設定を覚える所（見た目の設定なので localStorage。ライブラリのデータではない）。 */
+const SPECTRUM_SETTINGS_KEY = 'kura.audioSpectrum.v1';
+
+/** 覚えた表示の設定（読めなければ既定）。 */
+export function loadSpectrumSettings(): SpectrumSettings {
+  try {
+    const raw = localStorage.getItem(SPECTRUM_SETTINGS_KEY);
+    if (!raw) return DEFAULT_SPECTRUM_SETTINGS;
+    const v = JSON.parse(raw) as Partial<SpectrumSettings>;
+    const num = (x: unknown, d: number) => (typeof x === 'number' && Number.isFinite(x) ? x : d);
+    const d = DEFAULT_SPECTRUM_SETTINGS;
+    const ch = v.channel;
+    const channel =
+      ch && typeof ch === 'object' && 'type' in ch
+        ? ch.type === 'index'
+          ? Number.isInteger((ch as { index?: unknown }).index)
+            ? ch
+            : d.channel
+          : ['sum', 'mid', 'side'].includes(ch.type)
+            ? ch
+            : d.channel
+        : d.channel;
+    return {
+      fall: num(v.fall, d.fall),
+      tilt: num(v.tilt, d.tilt),
+      channel,
+      range: num(v.range, d.range),
+      eqScale: num(v.eqScale, d.eqScale),
+    };
+  } catch {
+    return DEFAULT_SPECTRUM_SETTINGS;
+  }
+}
+
+function saveSpectrumSettings(settings: SpectrumSettings): void {
+  try {
+    localStorage.setItem(SPECTRUM_SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // 覚えられなくても表示は続ける
+  }
+}
+
 /** 再生の状態。 */
 export interface AudioPlayState {
   status: 'idle' | 'playing';
@@ -134,12 +186,16 @@ export interface AudioEditorState {
   loudnessTarget: number;
   /** ループの旗を離したらゼロ交差に寄せる。 */
   snapZero: boolean;
+  /** 舞台の面（波形・スペクトル）。 */
+  face: AudioFace;
+  /** スペクトルの面の表示の設定。 */
+  spectrum: SpectrumSettings;
 }
 
 const IDLE_PLAY: AudioPlayState = { status: 'idle', mode: 'cursor' };
 
 function initialState(
-  keep?: Pick<AudioEditorState, 'loudnessTarget' | 'snapZero'>,
+  keep?: Pick<AudioEditorState, 'loudnessTarget' | 'snapZero' | 'spectrum'>,
 ): AudioEditorState {
   return {
     view: null,
@@ -158,6 +214,8 @@ function initialState(
     loudnessFresh: false,
     loudnessTarget: keep?.loudnessTarget ?? -23,
     snapZero: keep?.snapZero ?? true,
+    face: 'wave',
+    spectrum: keep?.spectrum ?? loadSpectrumSettings(),
   };
 }
 
@@ -259,6 +317,8 @@ function curveOf(node: EditAudioNodeDto | null): string {
 interface AudioRuntime {
   ctx: EditorAdapterContext;
   controller: WaveController;
+  /** スペクトルの面（M17 段 5）。 */
+  spectrum: SpectrumController;
   feed: PcmFeed;
   player: EditorPlayer;
   patch: Partial<AudioEditorState>;
@@ -346,6 +406,48 @@ function fetchTimed(url: string): Promise<ArrayBuffer> {
 /** 今の波形の面の制御（開いていなければ null）。 */
 export function audioController(): WaveController | null {
   return live()?.controller ?? null;
+}
+
+/** 今のスペクトルの面（開いていなければ null）。 */
+export function spectrumController(): SpectrumController | null {
+  return live()?.spectrum ?? null;
+}
+
+/** 面の見るイコライザ：選んだイコライザ、なければ最後のイコライザ（なければ null）。 */
+export function spectrumTarget(): number | null {
+  const { doc, selected } = useEditorStore.getState();
+  return targetNode(doc, selected, 'audio.eq');
+}
+
+/** 面を替える（スペクトルへ替えるときは切り詰め・フェード・ループの道具を片付けて「選択」に戻す）。 */
+export function setAudioFace(face: AudioFace): void {
+  const s = useAudioStore.getState();
+  if (s.face === face) return;
+  if (face === 'spectrum') {
+    if (s.trim) cancelTrim();
+    useAudioStore.setState({ face, tool: 'select', local: null });
+  } else {
+    useAudioStore.setState({ face });
+  }
+}
+
+/** スペクトルの面の表示の設定を替える（覚える）。 */
+export function setSpectrumSettings(patch: Partial<SpectrumSettings>): void {
+  const next = { ...useAudioStore.getState().spectrum, ...patch };
+  saveSpectrumSettings(next);
+  useAudioStore.setState({ spectrum: next });
+}
+
+/** 選んでよいチャンネルにする（入力のチャンネル数で選べないものは和に）。 */
+export function usableChannel(
+  channel: SpectrumSettings['channel'],
+  channels: number,
+): SpectrumSettings['channel'] {
+  if (channel.type === 'index') return channel.index < channels ? channel : { type: 'sum' };
+  if (channel.type === 'mid' || channel.type === 'side') {
+    return channels === 2 ? channel : { type: 'sum' };
+  }
+  return channel;
 }
 
 /** 今の試聴（開いていなければ null。自己点検・テスト）。 */
@@ -439,7 +541,13 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     peek: (source, i) => feed.peek(source, i),
     want: (source, i) => feed.want(source, i),
     need: (source, spans) => {
-      if (source === 'edited') controller.setPlaybackSpans(spans);
+      if (source !== 'edited') return;
+      // スペクトルの面の頼みも再生の区間（チャンク揃え）にしてから、再生の頼みを出す
+      if (useAudioStore.getState().face === 'spectrum') {
+        spectrum.setPlaybackSpans(spans);
+        controller.setSpec(spectrum.specRequests());
+      }
+      controller.setPlaybackSpans(spans);
     },
     volume: () => usePlayerStore.getState().prefs.volume / 100,
     hold: holdAudio,
@@ -458,20 +566,93 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       if (ctx.current()) playFailed();
     },
   });
-  const offAudio = useAudioStore.subscribe((s) => controller.setOverlay(overlayOf(s)));
-  // 選んだ操作・文書が変わったら、フェードの印を出し直す
+  const spectrum = new SpectrumController({
+    fetch: fetchTimed,
+    playhead: () => (player.playing ? audioPlayhead() : null),
+    average: (session, request) => specAverageEdit(session, request),
+    draw: (canvas, scene) => {
+      const c2d = canvas.getContext('2d');
+      if (c2d) drawSpectrum(c2d, scene);
+    },
+    onStale: () => {
+      if (ctx.current()) ctx.requestView(controller.viewport(), true);
+    },
+    onWork: (on) => controller.setExtraWork(on, 'specAverage'),
+  });
+  // スペクトルの面の入力（面・設定・見るノード・止まっているときのカーソルと選択・再生）を制御に渡し、頼みの spec を替える
+  let stillTimer: ReturnType<typeof setTimeout> | null = null;
+  const syncSpectrum = (immediateStill: boolean) => {
+    const s = useAudioStore.getState();
+    const onFace = s.face === 'spectrum';
+    controller.setStrip(onFace);
+    if (!onFace) {
+      controller.setSpec(null);
+      spectrum.setPlaying(false);
+      return;
+    }
+    const target = spectrumTarget();
+    spectrum.setTarget(target);
+    const node = target === null ? null : rt.lastView?.nodes.find((n) => n.id === target);
+    const channels = node?.inChannels ?? s.view?.channels ?? 2;
+    spectrum.setSettings({ ...s.spectrum, channel: usableChannel(s.spectrum.channel, channels) });
+    spectrum.setPlaying(s.play.status === 'playing');
+    const applyStill = () => {
+      const now = useAudioStore.getState();
+      spectrum.setStill({ cursor: now.cursor, selection: now.selection });
+      controller.setSpec(spectrum.specRequests());
+    };
+    if (stillTimer !== null) clearTimeout(stillTimer);
+    stillTimer = null;
+    if (immediateStill || rt.dragging) {
+      if (!rt.dragging) applyStill();
+      else controller.setSpec(spectrum.specRequests());
+    } else {
+      // 選択・カーソルは手が止まってから（ドラッグのたびに平均を頼まない）
+      stillTimer = setTimeout(() => {
+        stillTimer = null;
+        if (live() === rt) applyStill();
+      }, 150);
+      controller.setSpec(spectrum.specRequests());
+    }
+  };
+  const offAudio = useAudioStore.subscribe((s, before) => {
+    controller.setOverlay(overlayOf(s));
+    if (
+      s.face !== before.face ||
+      s.spectrum !== before.spectrum ||
+      s.play.status !== before.play.status
+    ) {
+      syncSpectrum(true);
+    } else if (
+      s.face === 'spectrum' &&
+      (s.cursor !== before.cursor || s.selection !== before.selection)
+    ) {
+      syncSpectrum(false);
+    }
+  });
+  // 選んだ操作・文書が変わったら、フェードの印を出し直し、面の見るノードを決め直す。イコライザをポインタで選んだ・足した
+  // ときは、波形からスペクトルへ替える（↑↓ でたどって通っただけでは替えない）
   const offEditor = useEditorStore.subscribe((now, before) => {
     if (now.selected !== before.selected || now.doc !== before.doc) {
       controller.setOverlay(overlayOf(useAudioStore.getState()));
+      const chosenEq =
+        now.selected !== before.selected &&
+        now.selected !== null &&
+        now.selectedBy !== 'key' &&
+        now.doc.nodes[now.selected]?.op === 'audio.eq';
+      if (chosenEq && useAudioStore.getState().face === 'wave') setAudioFace('spectrum');
+      else syncSpectrum(true);
     }
   });
   const unsubscribe = () => {
     offAudio();
     offEditor();
+    if (stillTimer !== null) clearTimeout(stillTimer);
   };
   const rt: AudioRuntime = {
     ctx,
     controller,
+    spectrum,
     feed,
     player,
     patch: {},
@@ -500,6 +681,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     }),
     opened(o) {
       controller.setSession(o.session);
+      spectrum.setSession(o.session);
       feed.setSession(o.session);
       const audio = o.source.audio;
       if (audio) {
@@ -540,6 +722,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       // ラウドネス（計っている間の裏の仕事を、波形の面が頼み直しを決める前に決める）
       applyLoudness(rt, view, s.loudness, info);
       controller.applyView(view, isWorkRequest(info.viewport));
+      spectrum.applyView(view);
       feed.setView(view, view.changed);
       const summary = summarizeAudioView(view);
       rt.patch.view = summary;
@@ -603,6 +786,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       player.dispose();
       feed.dispose();
       controller.dispose();
+      spectrum.dispose();
       if (current === rt) current = null;
       if (closing) {
         const s = useAudioStore.getState();

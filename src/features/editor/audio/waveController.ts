@@ -29,6 +29,7 @@ import type {
   EditMarkerDto,
   EditPeaksInfoDto,
   EditSpanDto,
+  EditSpecRequestDto,
 } from '../../../ipc/edit';
 import { editPcmUrl, editPeaksUrl } from '../../../ipc/media';
 import { readPcmWav } from '../../../lib/asset/wav';
@@ -211,7 +212,8 @@ export class WaveHttpError extends Error {
   }
 }
 
-async function fetchBytes(url: string): Promise<ArrayBuffer> {
+/** kura:// のバイト列を取る（2xx でなければ `WaveHttpError`）。 */
+export async function fetchBytes(url: string): Promise<ArrayBuffer> {
   const res = await fetch(url);
   if (!res.ok) throw new WaveHttpError(res.status);
   return res.arrayBuffer();
@@ -225,7 +227,8 @@ export interface WaveScheduler {
   cancelLater(id: number): void;
 }
 
-const realScheduler: WaveScheduler = {
+/** 本物の時計（requestAnimationFrame と setTimeout）。 */
+export const realScheduler: WaveScheduler = {
   frame: (cb) =>
     typeof requestAnimationFrame === 'function'
       ? requestAnimationFrame(cb)
@@ -319,8 +322,15 @@ export class WaveController {
   private workWanted = false;
   /** 裏の仕事の頼みの応えが続けて進まなかった数（進めば 0）。 */
   private stalls = 0;
-  /** 表示の結果のほかに残っている裏の仕事（長い音声のラウドネスを計っている）。 */
-  private extraWork = false;
+  /** 表示の結果のほかに残っている裏の仕事の理由（長い音声のラウドネス・スペクトルの区間の平均を計っている）。 */
+  private readonly extraReasons = new Set<string>();
+  /** スペクトルの面の頼み（M17 段 5。null なら送らない：波形のときは今までと同じ頼み）。 */
+  private spec: EditSpecRequestDto[] | null = null;
+  /** 細い波形の帯（スペクトルの面の上。曲の全体・1 段にまとめる・ズームしない）と、入る前の区間。 */
+  private strip = false;
+  private beforeStrip: { w: WaveWindow; fit: boolean } | null = null;
+  private stripLanes = new Float32Array(0);
+  private stripHas = new Uint8Array(0);
   private tileLoads = 0;
   private pcmLoads = 0;
   private readonly loadingTiles = new Map<string, Loading>();
@@ -456,10 +466,12 @@ export class WaveController {
    * 表示の結果のほかに残っている裏の仕事（長い音声のラウドネスを計っている。計りは edit_view { work: true } の区切りで
    * だけ進む）。真の間は、表示の work が偽でも、手が止まって 150 ms で work: true を頼み、応えのたびに続ける。
    */
-  setExtraWork(on: boolean): void {
-    if (this.extraWork === on) return;
-    this.extraWork = on;
-    this.workWanted = (this.view?.work ?? false) || (this.peaks?.pending ?? false) || on;
+  setExtraWork(on: boolean, reason = 'loudness'): void {
+    if (this.extraReasons.has(reason) === on) return;
+    if (on) this.extraReasons.add(reason);
+    else this.extraReasons.delete(reason);
+    this.workWanted =
+      (this.view?.work ?? false) || (this.peaks?.pending ?? false) || this.extraWork;
     // 連鎖している間は、届く応えが続ける（同時に 2 本頼まない）
     if (this.workWanted && !this.chaining) this.scheduleIdle();
   }
@@ -478,9 +490,49 @@ export class WaveController {
     this.stopChain();
   }
 
+  /** 表示の結果のほかに残っている裏の仕事があるか。 */
+  private get extraWork(): boolean {
+    return this.extraReasons.size > 0;
+  }
+
   /** 編集中のノード（キャッシュに固定する）。 */
   setFocus(node: number | null): void {
     this.focusNode = node;
+  }
+
+  /**
+   * スペクトルの面の頼み（M17 段 5）：手・再生・裏の仕事のすべての頼みに載せる（Rust は頼みに入った spec でしかタイルを
+   * 作らない）。変わったら止まって 150 ms で頼む。null なら載せない。
+   */
+  setSpec(spec: EditSpecRequestDto[] | null): void {
+    if (JSON.stringify(spec) === JSON.stringify(this.spec)) return;
+    this.spec = spec === null ? null : spec.map((r) => ({ ...r, spans: [...r.spans] }));
+    if (!this.interacting || this.solving) this.scheduleIdle();
+  }
+
+  /**
+   * 細い波形の帯にする（スペクトルの面の上。M17 段 5）：曲の全体を 1 段にまとめて描き、ズーム・パンしない。見えている区間は
+   * 全体を頼み、PCM の区間は頼まない。戻すと前の区間に戻る。
+   */
+  setStrip(on: boolean): void {
+    if (this.strip === on) return;
+    this.strip = on;
+    if (on) {
+      this.beforeStrip = { w: this.w, fit: this.fitMode };
+      this.fitMode = true;
+      this.w = fitView(this.total);
+    } else {
+      const back = this.beforeStrip;
+      this.beforeStrip = null;
+      this.fitMode = back?.fit ?? true;
+      this.w = this.fitMode ? fitView(this.total) : clampWindow(back?.w ?? this.w, this.total);
+    }
+    this.changed(true);
+  }
+
+  /** 細い波形の帯か。 */
+  get stripMode(): boolean {
+    return this.strip;
   }
 
   /** 出力の長さ（フレーム）。 */
@@ -521,9 +573,9 @@ export class WaveController {
   layout(): LaneLayout {
     return laneLayout(
       this.inner().h,
-      Math.max(1, this.channels),
+      this.strip ? 1 : Math.max(1, this.channels),
       this.metrics.ruler,
-      this.metrics.overview,
+      this.strip ? 0 : this.metrics.overview,
     );
   }
 
@@ -555,6 +607,7 @@ export class WaveController {
 
   /** 全体を表示（⌘0）。 */
   fit(): void {
+    if (this.strip) return;
     this.fitMode = true;
     this.setWindow(fitView(this.total), true);
   }
@@ -566,6 +619,7 @@ export class WaveController {
 
   /** ⌘ホイール・ピンチ：x（面の中の CSS px）の下のフレームを動かさずに `factor` 倍に拡大する。 */
   zoomAt(factor: number, x: number): void {
+    if (this.strip) return;
     const inner = this.inner();
     const anchor = xToFrame(x - inner.x, this.w, inner.w);
     const next = zoomAround(this.w, factor, anchor, this.total, minSpan(inner.w, this.total));
@@ -576,12 +630,13 @@ export class WaveController {
   /** ホイール・横スワイプ：dx（CSS px。正で右の時刻へ）だけ動かす。 */
   panBy(dx: number): void {
     const inner = this.inner();
-    if (!(inner.w > 0)) return;
+    if (this.strip || !(inner.w > 0)) return;
     this.setWindow(panBy(this.w, (dx / inner.w) * this.w.span, this.total), true);
   }
 
   /** 全体図を押した・ドラッグした：その x を見ている区間の中央にする。 */
   panToOverview(x: number): void {
+    if (this.strip) return;
     const inner = this.inner();
     const start = overviewStart(x - inner.x, inner.w, this.w, this.total);
     this.setWindow({ start, span: this.w.span }, true);
@@ -589,6 +644,7 @@ export class WaveController {
 
   /** 再生位置が見ている区間の外へ出たら 1 画面ぶん飛ぶ（動いたら true）。 */
   follow(pos: number): boolean {
+    if (this.strip) return false;
     const next = followPlayhead(this.w, pos, this.total);
     if (next === this.w) return false;
     this.setWindow(next, true);
@@ -627,11 +683,12 @@ export class WaveController {
           }
         : null;
     const spans: EditSpanDto[] = [...this.extraSpans];
-    if (visible && this.pcmMode()) {
+    // 細い波形の帯（スペクトルの面）では、拡大の PCM の区間は頼まない
+    if (visible && this.pcmMode() && !this.strip) {
       const aligned = alignSpan(visible.start, visible.end, total);
       if (aligned) spans.push(aligned);
     }
-    return {
+    const vp: EditAudioViewport = {
       type: 'audio',
       visible: visible && visible.end > visible.start ? visible : null,
       spans: spans.slice(0, MAX_SPANS),
@@ -639,6 +696,8 @@ export class WaveController {
       focus: this.focusNode,
       work: false,
     };
+    // spec は波形のときは載せない（今までと同じ頼み：同じものを送らない比べが崩れない）
+    return this.spec ? { ...vp, spec: this.spec } : vp;
   }
 
   /**
@@ -1061,6 +1120,30 @@ export class WaveController {
       }
     }
     this.lastMode = mode;
+    // 細い波形の帯：チャンネルを 1 段にまとめる（列ごとに最小・最大）
+    let lanes = this.lanes;
+    let has = this.has;
+    let shownChannels = channels;
+    if (this.strip) {
+      if (this.stripLanes.length < columns * 2) this.stripLanes = new Float32Array(columns * 2);
+      if (this.stripHas.length < columns) this.stripHas = new Uint8Array(columns);
+      for (let col = 0; col < columns; col++) {
+        let lo = Number.POSITIVE_INFINITY;
+        let hi = Number.NEGATIVE_INFINITY;
+        for (let ch = 0; ch < channels; ch++) {
+          const i = (col * channels + ch) * 2;
+          lo = Math.min(lo, this.lanes[i] ?? 0);
+          hi = Math.max(hi, this.lanes[i + 1] ?? 0);
+        }
+        this.stripLanes[col * 2] = Number.isFinite(lo) ? lo : 0;
+        this.stripLanes[col * 2 + 1] = Number.isFinite(hi) ? hi : 0;
+        this.stripHas[col] = this.has[col] ?? 0;
+      }
+      lanes = this.stripLanes;
+      has = this.stripHas;
+      shownChannels = 1;
+      points = null;
+    }
     return {
       width: Math.round(this.size.w * this.dpr),
       height: Math.round(this.size.h * this.dpr),
@@ -1070,10 +1153,10 @@ export class WaveController {
       window: this.w,
       total,
       rate: this.rate,
-      channels,
+      channels: shownChannels,
       columns,
-      lanes: this.lanes,
-      has: this.has,
+      lanes,
+      has,
       mode,
       points,
       pointsStart,

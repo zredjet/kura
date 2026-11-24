@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 
 import { MinusIcon } from '../../../components/icons/MinusIcon';
 import { PlusIcon } from '../../../components/icons/PlusIcon';
+import { Segmented } from '../../../components/Segmented/Segmented';
 import { ja } from '../../../i18n/ja';
 import type { EditWritableFormatDto } from '../../../ipc/edit';
 import { formatCount } from '../../../lib/format';
@@ -12,7 +13,8 @@ import { FormatOutputRow, OpsPanel, type ParamTime } from '../OpsPanel';
 import { outputChoice } from '../formats';
 import styles from './Audio.module.css';
 import { AUDIO_FORMATS, type AudioCaps, capsOf, lossesFor, type AudioLoss } from './audioFormats';
-import { audioZoom, useAudioStore } from './audioStore';
+import { type AudioFace, audioZoom, setAudioFace, useAudioStore } from './audioStore';
+import { freqParts } from './spectrumMath';
 import { LoudnessSection } from './LoudnessSection';
 import { timeText } from './timeText';
 
@@ -26,11 +28,38 @@ export { AudioCapsule } from './AudioCapsule';
 
 const t = ja.editor.audio;
 
+/** 表示の切り替えの並び（M17 段 5。スペクトログラムは段 8 で足す）。 */
+const FACES: readonly AudioFace[] = ['wave', 'spectrum'];
+
 /**
- * 上部の道具の置き場（音声では空。道具の切り替えは、欄と並べて下のカプセルの上の段に置く：`AudioToolSwitch`）。
+ * 上部の中央：表示の切り替え「波形｜スペクトル」（⌘1・⌘2。ADR-232 の ADR-177 の改訂）。道具の切り替えは、欄と並べて
+ * 下のカプセルの上の段に置く（`AudioToolSwitch`）。
  */
 export function AudioTopTools() {
-  return null;
+  const face = useAudioStore((s) => s.face);
+  const open = useEditorStore((s) => s.phase === 'open');
+  if (!open) return null;
+  return (
+    <div className={styles.faceSwitch}>
+      <Segmented
+        label={t.faces}
+        value={face}
+        options={FACES.map((f) => ({
+          value: f,
+          label: t.faceNames[f],
+          title: ja.editor.withKey(t.faceNames[f], t.faceKeys[f]),
+        }))}
+        onChange={setAudioFace}
+      />
+    </div>
+  );
+}
+
+/** 周波数の短い書き方（「20 Hz」「24 kHz」）。 */
+function freqText(f: number): string {
+  const p = freqParts(f);
+  const value = p.unit === 'kHz' ? String(Number(p.value)) : p.value.replace(/\.0$/, '');
+  return `${value} ${p.unit}`;
 }
 
 /** 元の形式が非可逆か（元のビット数を出さない）。 */
@@ -76,7 +105,10 @@ export function AudioStatus() {
   const pending = useAudioStore((s) => s.peaksPending);
   const building = useAudioStore((s) => s.peaksBuilding);
   const solving = useAudioStore((s) => s.view?.solving ?? null);
+  const face = useAudioStore((s) => s.face);
+  const playing = useAudioStore((s) => s.play.status === 'playing');
   if (!open) return null;
+  const spectrum = face === 'spectrum';
   const where =
     selection && selection.end > selection.start
       ? t.selectionAt(
@@ -100,31 +132,53 @@ export function AudioStatus() {
             </span>
           )
         )}
+        {spectrum && (
+          <span className={`${styles.cornerPill} ${styles.cornerStatus}`} aria-live="off">
+            {playing
+              ? t.spectrum.analyzerPlaying
+              : selection && selection.end > selection.start
+                ? t.spectrum.analyzerAverage
+                : t.spectrum.analyzerCursor}
+          </span>
+        )}
         <span className={styles.cornerPill} aria-live="off">
           {where}
         </span>
       </div>
-      <div className={`${editorStyles.zoom} ${styles.zoom}`} role="group" aria-label={t.viewWidth}>
-        <button
-          type="button"
-          className={editorStyles.iconButton}
-          aria-label={t.zoomOut}
-          title={t.zoomOut}
-          onClick={() => audioZoom(-1)}
+      {spectrum ? (
+        // スペクトルのときは周波数の範囲（− ＋ はない：⌘0・⌘± も押せない）
+        <div className={`${editorStyles.zoom} ${styles.zoom}`}>
+          <span className={styles.widthValue}>
+            {t.spectrum.freqRange(freqText(20), freqText(rate > 0 ? rate / 2 : 24_000))}
+          </span>
+        </div>
+      ) : (
+        <div
+          className={`${editorStyles.zoom} ${styles.zoom}`}
+          role="group"
+          aria-label={t.viewWidth}
         >
-          <MinusIcon size={14} strokeWidth={2} />
-        </button>
-        <span className={styles.widthValue}>{t.width(timeText(span, rate))}</span>
-        <button
-          type="button"
-          className={editorStyles.iconButton}
-          aria-label={t.zoomIn}
-          title={t.zoomIn}
-          onClick={() => audioZoom(1)}
-        >
-          <PlusIcon size={14} strokeWidth={2} />
-        </button>
-      </div>
+          <button
+            type="button"
+            className={editorStyles.iconButton}
+            aria-label={t.zoomOut}
+            title={t.zoomOut}
+            onClick={() => audioZoom(-1)}
+          >
+            <MinusIcon size={14} strokeWidth={2} />
+          </button>
+          <span className={styles.widthValue}>{t.width(timeText(span, rate))}</span>
+          <button
+            type="button"
+            className={editorStyles.iconButton}
+            aria-label={t.zoomIn}
+            title={t.zoomIn}
+            onClick={() => audioZoom(1)}
+          >
+            <PlusIcon size={14} strokeWidth={2} />
+          </button>
+        </div>
+      )}
     </>
   );
 }

@@ -106,7 +106,7 @@ function openState(nodes: EditNodeDto[] = [], outputs: unknown[] = []) {
 }
 
 beforeEach(() => {
-  useAudioStore.setState({ tool: 'select', trim: null, local: null });
+  useAudioStore.setState({ tool: 'select', trim: null, local: null, face: 'wave' });
 });
 
 afterEach(() => {
@@ -336,5 +336,28 @@ describe('引数の時刻の欄', () => {
     rerender(<OpsPanel time={time} />);
     expect(screen.getByLabelText(a.start)).toHaveValue('0:00.000');
     expect(screen.getByLabelText(a.end)).toHaveValue('0:00.100');
+  });
+});
+
+describe('スペクトルの面（M17 段 5）', () => {
+  it('上部の中央に「波形｜スペクトル」（キーを添えた説明）。押すとスペクトルの面で、右下は周波数の範囲（− ＋ なし）、左下にアナライザが出しているもの', () => {
+    openState();
+    render(<Editor />);
+    const faces = screen.getByRole('group', { name: a.faces });
+    const wave = within(faces).getByRole('button', { name: a.faceNames.wave });
+    const spectrum = within(faces).getByRole('button', { name: a.faceNames.spectrum });
+    expect(wave).toHaveAttribute('aria-pressed', 'true');
+    expect(spectrum).toHaveAttribute('title', t.withKey(a.faceNames.spectrum, '⌘2'));
+    fireEvent.click(spectrum);
+    expect(useAudioStore.getState().face).toBe('spectrum');
+    expect(screen.getByRole('group', { name: a.spectrum.face })).toBeInTheDocument();
+    expect(screen.getByText(a.spectrum.freqRange('20 Hz', '24 kHz'))).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: a.zoomIn })).toBeNull();
+    expect(screen.getByText(a.spectrum.analyzerCursor)).toBeInTheDocument();
+    // 凡例と表示の設定（押すと欄が出る）
+    expect(screen.getByText(a.spectrum.legend.output)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: a.spectrum.settings }));
+    expect(screen.getByLabelText(a.spectrum.fall)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: a.spectrum.resetHold })).toBeInTheDocument();
   });
 });

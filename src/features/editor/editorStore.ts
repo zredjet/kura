@@ -199,6 +199,11 @@ export interface EditorState {
   panel: EditorPanel;
   /** 右パネルで選んだ操作（ノード ID）。 */
   selected: number | null;
+  /**
+   * 何で選んだか（ポインタ・キーでたどった・足した）。音声エディタは、イコライザをポインタで選んだ・足したときだけ
+   * スペクトルの面へ替える（↑↓ でたどって通っただけでは替えない。M17 段 5）。
+   */
+  selectedBy: 'pointer' | 'key' | 'created';
   sheet: EditorSheet | null;
   save: EditorSave | null;
   /** 断られた手の指摘（引数の欄の下に出す）。 */
@@ -234,6 +239,7 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     warnings: [],
     panel,
     selected: null,
+    selectedBy: 'pointer',
     sheet: null,
     save: null,
     issues: [],
@@ -751,7 +757,10 @@ function applyResult(
     rt.selectCreated = false;
   }
   if (selected !== null && !doc.order.includes(selected)) selected = null;
-  if (selected !== s.selected) patch.selected = selected;
+  if (selected !== s.selected) {
+    patch.selected = selected;
+    patch.selectedBy = 'created';
+  }
   const outcome = result.view;
   if (outcome.type !== 'superseded') rt.superseded = 0;
   if (outcome.type === 'shown') {
@@ -865,11 +874,11 @@ export function editorRedo(): void {
 
 // ===== 右パネル：操作の並び =====
 
-/** 操作を選ぶ（null で外す）。 */
-export function selectNode(id: number | null): void {
+/** 操作を選ぶ（null で外す。`by` は何で選んだか）。 */
+export function selectNode(id: number | null, by: 'pointer' | 'key' = 'pointer'): void {
   const s = useEditorStore.getState();
   const next = id !== null && s.doc.order.includes(id) ? id : null;
-  if (next !== s.selected) useEditorStore.setState({ selected: next });
+  if (next !== s.selected) useEditorStore.setState({ selected: next, selectedBy: by });
 }
 
 /** 上・下の操作を選ぶ（↑↓。選んでいなければ ↓ は先頭、↑ は末尾）。 */
@@ -883,7 +892,7 @@ export function selectAdjacent(delta: number): void {
         ? 0
         : doc.order.length - 1
       : Math.min(doc.order.length - 1, Math.max(0, i + delta));
-  selectNode(doc.order[next] ?? null);
+  selectNode(doc.order[next] ?? null, 'key');
 }
 
 /** 有効・無効を替える。 */
@@ -898,7 +907,7 @@ export function removeNode(id: number): void {
   if (i < 0) return;
   if (selected === id) {
     const next = doc.order[i + 1] ?? doc.order[i - 1] ?? null;
-    useEditorStore.setState({ selected: next });
+    useEditorStore.setState({ selected: next, selectedBy: 'key' });
   }
   pushSteps(removeSteps(id).map((step) => ({ step })));
 }

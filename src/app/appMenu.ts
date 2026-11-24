@@ -12,6 +12,7 @@ import {
   type SubmenuOptions,
 } from '@tauri-apps/api/menu';
 
+import { type AudioFace, useAudioStore } from '../features/editor/audio/audioStore';
 import { editorSelectAll } from '../features/editor/editorKeys';
 import { canSaveEditor, useEditorStore } from '../features/editor/editorStore';
 import { EDITOR_KINDS, type EditorKind } from '../features/editor/kindTraits';
@@ -232,7 +233,8 @@ type EditorViewItems = (MenuItemOptions | PredefinedMenuItemOptions)[];
  * 処理が受ける）。ライブラリの表示形式（⌘1〜⌘3）・サムネイルの大きさ（⌘+・⌘−）と重なるので、開いている間は差し替える。
  *
  * - 画像：⌘0 全体を表示・⌘1 実際のサイズ（100%）・⌘+ 拡大・⌘− 縮小・⌘I 情報。
- * - 音声：⌘0 全体を表示・⌘+ 拡大・⌘− 縮小・⌘I 情報（M13。⌘1 の 100% はない）。
+ * - 音声：⌘0 全体を表示・⌘+ 拡大・⌘− 縮小・⌘I 情報（M13。⌘1 の 100% はない）。先頭に面の切り替え（波形 ⌘1・スペクトル
+ *   ⌘2）のチェック項目を足す（M17 段 5。チェック項目は実体で作るので `audioFaceItemOptions`）。
  */
 const EDITOR_VIEW_ITEMS: Readonly<Record<EditorKind, (run: RunMenuAction) => EditorViewItems>> = {
   image: (run) => {
@@ -265,6 +267,51 @@ const EDITOR_VIEW_ITEMS: Readonly<Record<EditorKind, (run: RunMenuAction) => Edi
 /** 表示メニューの中身（その種類のエディタを開いている間）。 */
 export function editorViewItemOptions(run: RunMenuAction, kind: EditorKind): EditorViewItems {
   return EDITOR_VIEW_ITEMS[kind](run);
+}
+
+/** 音声エディタの表示の面の切り替え（波形 ⌘1・スペクトル ⌘2。チェック項目。M17 段 5）。 */
+export function audioFaceItemOptions(
+  run: RunMenuAction,
+  face: AudioFace,
+  idPrefix: string,
+): Record<AudioFace, CheckMenuItemOptions> {
+  const item = (f: AudioFace, digit: string, text: string): CheckMenuItemOptions => {
+    const spec = { key: digit, code: `Digit${digit}`, ...META };
+    return {
+      id: `${idPrefix}-audio-face-${f}`,
+      text,
+      checked: face === f,
+      accelerator: acceleratorOf(spec),
+      action: () => run({ kind: 'key', spec }),
+    };
+  };
+  return {
+    wave: item('wave', '1', ja.appMenu.editorWave),
+    spectrum: item('spectrum', '2', ja.appMenu.editorSpectrum),
+  };
+}
+
+/** 音声エディタの表示メニューの、面で替わる部品（切り替えのチェックと、波形のときだけ押せる全体・拡大・縮小）。 */
+export interface AudioFaceMenuItems {
+  faces: Record<AudioFace, Pick<CheckMenuItem, 'setChecked'>>;
+  waveOnly: readonly Pick<MenuItem, 'setEnabled'>[];
+}
+
+/** 面の切り替えのチェックと、波形のときだけ押せる項目を今の面に合わせる関数（`force` は押したあと：自分で反転するので）。 */
+export function audioFaceSyncer(
+  items: AudioFaceMenuItems,
+  shown: AudioFace,
+  read: () => AudioFace = () => useAudioStore.getState().face,
+): (force: boolean) => void {
+  let last = shown;
+  return (force) => {
+    const face = read();
+    if (!force && face === last) return;
+    last = face;
+    void items.faces.wave.setChecked(face === 'wave');
+    void items.faces.spectrum.setChecked(face === 'spectrum');
+    for (const item of items.waveOnly) void item.setEnabled(face === 'wave');
+  };
 }
 
 /**
@@ -660,9 +707,35 @@ export async function installAppMenu(): Promise<void> {
     };
     const libraryView = await toMenuObjects(libraryViewItems(run, view));
     const editorViews = new Map<EditorKind, MenuObject[]>();
+    let syncAudioFace: ((force: boolean) => void) | null = null;
     for (const kind of EDITOR_KINDS) {
-      editorViews.set(kind, await toMenuObjects(editorViewItemOptions(run, kind)));
+      const objects = await toMenuObjects(editorViewItemOptions(run, kind));
+      if (kind === 'audio') {
+        // 面の切り替え（チェック項目の実体）を先頭に足し、全体・拡大・縮小（先頭の 3 つ）を面に合わせて押せなくする
+        const face = useAudioStore.getState().face;
+        const faceOptions = audioFaceItemOptions(
+          (action) => {
+            run(action);
+            syncAudioFace?.(true);
+          },
+          face,
+          idPrefix,
+        );
+        const faces = {
+          wave: await CheckMenuItem.new(faceOptions.wave),
+          spectrum: await CheckMenuItem.new(faceOptions.spectrum),
+        };
+        const waveOnly = objects.slice(0, 3).filter((o): o is MenuItem => o instanceof MenuItem);
+        syncAudioFace = audioFaceSyncer({ faces, waveOnly }, face);
+        const separator = await PredefinedMenuItem.new({ item: 'Separator' });
+        editorViews.set(kind, [faces.wave, faces.spectrum, separator, ...objects]);
+      } else {
+        editorViews.set(kind, objects);
+      }
     }
+    useAudioStore.subscribe((now, before) => {
+      if (now.face !== before.face) syncAudioFace?.(false);
+    });
     const viewMenu = await Submenu.new({ text: ja.appMenu.view, items: libraryView });
     const menu = await Menu.new({
       items: appMenuItems(run, view, pixelArt, history, viewMenu, save),
