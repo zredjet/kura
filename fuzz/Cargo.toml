@@ -142,6 +142,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "state_table"
+path = "fuzz_targets/state_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "audio_source"
 path = "fuzz_targets/audio_source.rs"
 test = false

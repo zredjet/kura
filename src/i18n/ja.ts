@@ -1108,6 +1108,7 @@ export const ja = {
       colorSpaceAssumed: 'sRGB とみなして色を混ぜました',
       loudnessUnmeasurable: 'ラウドネスを計れないので、そろえませんでした',
       gainLimited: 'ピークの上限に当たるので、利得を抑えました',
+      nonFiniteSamples: 'NaN・∞ の標本を 0 として処理し、その位置は元の値のまま出しました',
     } as Record<string, string>,
     output: '出力の形式',
     outputKeep: (format: string) => `元と同じ（${format}）`,

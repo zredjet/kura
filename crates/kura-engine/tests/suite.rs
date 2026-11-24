@@ -61,6 +61,7 @@ pub mod relative_ops;
 pub mod rules;
 pub mod session;
 pub mod sprite_vectors;
+pub mod stateful;
 pub mod time_chain;
 pub mod versions;
 pub mod vertical;

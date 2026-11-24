@@ -751,6 +751,7 @@ impl Engine {
                                 fp,
                                 cache,
                                 &RenderOptions::default(),
+                                Some(&mut *presolved),
                                 mon,
                             )?;
                             cache.record_last(

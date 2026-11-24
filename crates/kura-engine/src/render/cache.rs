@@ -894,8 +894,9 @@ impl Engine {
                         (hit.value, hit.apply_warnings, hit.map_warnings)
                     }
                     None => {
-                        let run = self
-                            .draw_miss(plan, node, &ins, &in_fps, &source, fp, cache, opts, mon)?;
+                        let run = self.draw_miss(
+                            plan, node, &ins, &in_fps, &source, fp, cache, opts, None, mon,
+                        )?;
                         (run.value, run.apply_warnings, run.map_warnings)
                     }
                 };
@@ -971,6 +972,7 @@ impl Engine {
         fp: Fingerprint,
         cache: &mut NodeCache,
         opts: &RenderOptions,
+        mut presolved: Option<&mut super::area::Presolved>,
         mon: &dyn Monitor,
     ) -> Result<super::NodeRun, EngineError> {
         cache.stats.misses += 1;
@@ -985,8 +987,25 @@ impl Engine {
         };
         let run = match appended {
             Some(run) => run,
+            // 範囲の描画の中（`presolved` がある）では、解いた解析をこの描画の表にも入れて引く（キャッシュの上限が 0 でも、
+            // 流し解きの窓・下流の範囲の描画で同じ表を解き直さない。M17 段 1）
             None => self.run_node(plan, node, ins, source, mon, &mut |need, v, a, acx| {
-                solve_cached(cache, in_fps, need, v, a, acx, opts.verify_hits)
+                let key = match (presolved.is_some(), in_fps.get(need.input)) {
+                    (true, Some(fp)) => {
+                        Some(analysis_fingerprint(*fp, need.id, need.v, &need.params)?)
+                    }
+                    _ => None,
+                };
+                if let (Some(p), Some(k)) = (presolved.as_deref(), key.as_ref())
+                    && let Some(out) = p.get(k)
+                {
+                    return Ok(out.clone());
+                }
+                let out = solve_cached(cache, in_fps, need, v, a, acx, opts.verify_hits)?;
+                if let (Some(p), Some(k)) = (presolved.as_deref_mut(), key) {
+                    p.insert(k, out.clone());
+                }
+                Ok(out)
             })?,
         };
         cache.insert(

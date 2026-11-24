@@ -433,6 +433,7 @@ describe('文言', () => {
       colorSpaceAssumed: true,
       loudnessUnmeasurable: true,
       gainLimited: true,
+      nonFiniteSamples: true,
     };
     for (const code of Object.keys(codes)) {
       expect(t.issues[code], code).toBeTruthy();

@@ -1,7 +1,7 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`・`fuzz_recipe`・`fuzz_inflate`・`fuzz_deflate`・`fuzz_png_write`・`fuzz_lzw`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_state_table`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`・`fuzz_recipe`・`fuzz_inflate`・`fuzz_deflate`・`fuzz_png_write`・`fuzz_lzw`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
-//! 文書は `document`、文書の部品（M12）は `doc_parts`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
+//! 文書は `document`、文書の部品（M12）は `doc_parts`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、状態の表の読み口（M17 段 1）は `state_table`、3D モデル（glb）は `model_glb`、
 //! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）、音声の源（M13）は `audio_source`、
 //! レシピのファイル（M14）は `recipe`、zlib・deflate の展開（M16 段 6）は `inflate`、圧縮（M16 段 7）は `deflate`、PNG の書き出し（M16 段 7）は `png_write`、GIF の LZW（M16 段 8）は `lzw`。
 //!
@@ -28,7 +28,7 @@ use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
     FuzzEncodeMeta, fuzz_audio_source, fuzz_decode, fuzz_deflate, fuzz_doc_parts, fuzz_document,
     fuzz_encode, fuzz_encode_input, fuzz_encode_input_meta, fuzz_inflate, fuzz_lzw, fuzz_model,
-    fuzz_peaks, fuzz_png_write, fuzz_recipe, fuzz_svg_text,
+    fuzz_peaks, fuzz_png_write, fuzz_recipe, fuzz_state_table, fuzz_svg_text,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -619,6 +619,9 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         ("doc_parts", doc_parts_seeds(&[&doc, &paint_doc, &chain_doc])),
         // 波形の段のバイナリ（kura-peaks。解析 audio.peaks の正規の形。cargo-fuzz の対象は decode_peaks）
         ("peaks", peak_seeds()),
+        // M17 段 1：状態の表のバイナリ（kura-state。状態を運ぶ操作が申告する内部用の解析の正規の形。cargo-fuzz の対象も
+        // state_table）
+        ("state_table", state_table_seeds()),
         // 段 9：アンカー（PNG・APNG・f32 の WAV ＋私用のチャンク。cargo-fuzz の対象は decode_anchor）
         ("anchor", anchor_seeds(&with_exif, &frames, &wav_meta)),
         // M13 段 1：音声の源（WAV・AIFF・アンカーをチャンクごとにシークして読む。cargo-fuzz の対象も audio_source）
@@ -977,6 +980,32 @@ fn anchor_seeds(image: &Value, frames: &Value, audio: &Value) -> Vec<Vec<u8>> {
 }
 
 /// 波形の段のバイナリの種：5 段・一部の段・1 段・長さ 0。
+/// 状態の表の種：試験の操作（`test.iir1`）の表の解析の例（先読み・リンク・格子の違い・NaN の旗）の正規の形。
+fn state_table_seeds() -> Vec<Vec<u8>> {
+    use kura_engine::analysis::{Analysis, AnalysisOutput, AnalyzeCx};
+    use kura_engine::testing::stateful::Iir1State;
+    let limits = kura_engine::Limits::default();
+    let cx = AnalyzeCx {
+        mon: &NoMonitor,
+        limits: &limits,
+    };
+    Iir1State::examples()
+        .into_iter()
+        .filter(|e| {
+            e.input
+                .generate()
+                .is_ok_and(|v| v.shape().value_bytes() < 1 << 20)
+        })
+        .map(|e| {
+            let v = e.input.generate().unwrap();
+            Iir1State::run(&e.params, &v, &cx)
+                .unwrap()
+                .to_canonical()
+                .unwrap()
+        })
+        .collect()
+}
+
 fn peak_seeds() -> Vec<Vec<u8>> {
     let engine = kura_engine::Engine::new().unwrap();
     let audio = |frames, channels| {
@@ -1089,6 +1118,8 @@ fn run(target: &str, input: &[u8]) -> Result<(), String> {
         fuzz_doc_parts(input)
     } else if target == "peaks" {
         fuzz_peaks(input)
+    } else if target == "state_table" {
+        fuzz_state_table(input)
     } else if target == "audio_source" {
         fuzz_audio_source(input)
     } else if target == "model_glb" {

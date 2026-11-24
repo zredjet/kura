@@ -2303,7 +2303,12 @@ export type IssueCode =
 /**  ラウドネスを計れない（無音・400 ms より短い）ので、正規化しなかった（警告）。 */
 "loudnessUnmeasurable" | 
 /**  ピークの上限に当たるので、利得を抑えた（警告。目標より小さく仕上がる）。 */
-"gainLimited";
+"gainLimited" | 
+/**
+ *  有限でない標本（NaN・±∞）を 0 として状態を運ぶ処理に通し、その位置は元の値のまま出した（警告。M17 段 1。
+ *  docs/editing.md §18.1）。
+ */
+"nonFiniteSamples";
 
 /**  1 件のクレジット（null は未設定）。 */
 export type ItemCreditDto = {

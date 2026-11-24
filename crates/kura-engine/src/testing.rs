@@ -6,6 +6,7 @@ pub mod preview;
 pub mod region;
 mod snapshot;
 pub mod source;
+pub mod stateful;
 
 pub use platform::{FakePlatformDecoder, FakePlatformEncoder};
 pub use source::SyntheticSource;
@@ -378,6 +379,32 @@ pub fn fuzz_peaks(data: &[u8]) -> Result<(), String> {
     });
     match r {
         Err(at) => Err(format!("kura-peaks: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(())) => Ok(()),
+    }
+}
+
+/// ファズの対象（`fuzz/` の `state_table` と `tests/fuzz_smoke.rs` の `state_table`。M17 段 1）：状態の表のバイナリ
+/// （`kura-state`。状態を運ぶ操作が申告する内部用の解析の正規の形）を読む。読めたなら正規の形（書き直すと同じバイト列）で
+/// あること。見つけたい不具合（自前のコードの panic・往復しない・`Internal`）は `Err`、壊れたバイト列としてのエラーは `Ok`。
+pub fn fuzz_state_table(data: &[u8]) -> Result<(), String> {
+    use crate::analysis::AnalysisOutput;
+    use crate::audio::state::StateTable;
+    let r = catch_own_panic(|| match StateTable::from_canonical(data) {
+        Ok(t) => {
+            if t.to_canonical()? == data {
+                Ok(())
+            } else {
+                Err(EngineError::Internal(
+                    "kura-state: 読めたのに正規の形に戻らない".into(),
+                ))
+            }
+        }
+        Err(e @ EngineError::Internal(_)) => Err(e),
+        Err(_) => Ok(()),
+    });
+    match r {
+        Err(at) => Err(format!("kura-state: 自前のコードの panic（{at}）")),
         Ok(Err(e)) => Err(e.to_string()),
         Ok(Ok(())) => Ok(()),
     }

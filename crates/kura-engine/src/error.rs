@@ -47,6 +47,9 @@ pub enum IssueCode {
     LoudnessUnmeasurable,
     /// ピークの上限に当たるので、利得を抑えた（警告。目標より小さく仕上がる）。
     GainLimited,
+    /// 有限でない標本（NaN・±∞）を 0 として状態を運ぶ処理に通し、その位置は元の値のまま出した（警告。M17 段 1。
+    /// docs/editing.md §18.1）。
+    NonFiniteSamples,
 }
 
 /// 検証の指摘 1 つ。
