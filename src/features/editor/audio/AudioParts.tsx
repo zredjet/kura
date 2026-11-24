@@ -13,7 +13,7 @@ import { FormatOutputRow, OpsPanel, type ParamFieldOverrides, type ParamTime } f
 import { outputChoice } from '../formats';
 import styles from './Audio.module.css';
 import { AUDIO_FORMATS, type AudioCaps, capsOf, lossesFor, type AudioLoss } from './audioFormats';
-import { type AudioFace, audioZoom, setAudioFace, useAudioStore } from './audioStore';
+import { type AudioFace, audioZoom, setAudioFace, useAudioStore, useEqPort } from './audioStore';
 import { freqParts } from './spectrumMath';
 import { EqBandsField } from './EqBandsField';
 import { LoudnessSection } from './LoudnessSection';
@@ -105,6 +105,16 @@ export function AudioMeta() {
   return <span className={editorStyles.meta}>{meta}</span>;
 }
 
+/** スペクトルの面の周波数の範囲（面が出すノードの入力のレートの半分まで）。 */
+function SpectrumRange() {
+  const { rate } = useEqPort();
+  return (
+    <span className={styles.widthValue}>
+      {t.spectrum.freqRange(freqText(20), freqText(rate > 0 ? rate / 2 : 24_000))}
+    </span>
+  );
+}
+
 /** 左下のカーソル・選択の時刻と標本の位置、右下の表示の幅と − ＋。 */
 export function AudioStatus() {
   const open = useEditorStore((s) => s.phase === 'open');
@@ -158,9 +168,7 @@ export function AudioStatus() {
       {spectrum ? (
         // スペクトルのときは周波数の範囲（− ＋ はない：⌘0・⌘± も押せない）
         <div className={`${editorStyles.zoom} ${styles.zoom}`}>
-          <span className={styles.widthValue}>
-            {t.spectrum.freqRange(freqText(20), freqText(rate > 0 ? rate / 2 : 24_000))}
-          </span>
+          <SpectrumRange />
         </div>
       ) : (
         <div

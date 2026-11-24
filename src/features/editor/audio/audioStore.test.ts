@@ -44,6 +44,7 @@ import {
   setAudioIoForTest,
   setAudioLocal,
   setCursor,
+  setEqBand,
   setSelection,
   setSpectrumSettings,
   spectrumController,
@@ -975,8 +976,15 @@ describe('スペクトルの面（M17 段 5）', () => {
     selectNode(6);
     selectNode(5);
     expect(useAudioStore.getState().face).toBe('spectrum');
-    // 見るノードは選んだイコライザ：頼みは [前, 後]
+    // 見るノードは選んだイコライザ
     expect(spectrumController()?.targetNode).toBe(5);
+  });
+
+  it('イコライザを足して選ばれたら（created）スペクトルへ替わる', async () => {
+    await open();
+    expect(useAudioStore.getState().face).toBe('wave');
+    useEditorStore.setState({ doc: eqDoc, selected: 5, selectedBy: 'created' });
+    expect(useAudioStore.getState().face).toBe('spectrum');
   });
 
   it('スペクトルのとき切り詰め・フェード・ループの道具を選ぶと波形に戻る。スペクトルへ替えると道具は選択に戻る', async () => {
@@ -1060,6 +1068,49 @@ describe('スペクトルの面の点の手（M17 段 5）', () => {
     expect(local?.bands[0]?.gainDb).toBeGreaterThan(0);
     expect(SPECTRUM_POINTER.cancel()).toBe(true);
     expect(useAudioStore.getState().eqLocal).toBeNull();
+  });
+
+  it('ドラッグの間は面も道具も替えない。離したら手の番号つきで手元の値を残し、ドラッグの印を下ろす', async () => {
+    const c = await openSpectrum(eqDoc([band]));
+    const x = c.xOfFreq(1_000);
+    const y = c.yOfEqDb(0);
+    SPECTRUM_POINTER.down({ altKey: false }, x, y);
+    SPECTRUM_POINTER.move({ altKey: false }, x + 100, y - 40);
+    await flush();
+    setAudioFace('wave');
+    expect(useAudioStore.getState().face).toBe('spectrum');
+    selectAudioTool('fade');
+    expect(useAudioStore.getState()).toMatchObject({ face: 'spectrum', tool: 'select' });
+    SPECTRUM_POINTER.up(null, x + 100, y - 40, false);
+    expect(SPECTRUM_POINTER.dragging).toBe(false);
+    const local = useAudioStore.getState().eqLocal;
+    expect(local?.ticket).not.toBeNull();
+    expect(local?.bands[0]?.freq).toBeGreaterThan(1_000);
+    // 離したあとは替えられる
+    setAudioFace('wave');
+    expect(useAudioStore.getState().face).toBe('wave');
+  });
+
+  it('見るイコライザが替わったら、選んだバンドを外す', async () => {
+    await openSpectrum(
+      eqDoc(
+        [band, band],
+        {
+          6: {
+            id: 6,
+            op: 'audio.eq',
+            v: 1,
+            enabled: true,
+            params: { bands: [band, band], phase: 'minimum', gainDb: 0 },
+          },
+        },
+        [5, 6],
+      ),
+    );
+    setEqBand(1);
+    expect(useAudioStore.getState().eqBand).toBe(1);
+    selectNode(6);
+    expect(useAudioStore.getState().eqBand).toBeNull();
   });
 
   it('選んだ点の上のホイールで Q（応えの前に続けても前の手を土台にする）。点の外では手にしない', async () => {

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../../i18n/ja';
@@ -431,6 +431,34 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     );
     key(rows[0] as HTMLElement, 'ArrowDown');
     expect(useAudioStore.getState().eqBand).toBe(1);
+  });
+
+  it('⌫ はバンドだけを消し、イコライザの操作は消さない。行の ⌫ のあとフォーカスは残りの行（なければ［＋ バンドを足す］）へ', async () => {
+    openState([eqNode([bell(1_000, 0), bell(4_000, 0)])]);
+    useEditorStore.setState({ selected: 5 });
+    useAudioStore.setState({ face: 'spectrum' });
+    render(<Editor />);
+    const face = screen.getByRole('group', { name: a.spectrum.face });
+    const key = (target: Element, k: string) =>
+      fireEvent.keyDown(target, { key: k, bubbles: true });
+    // バンドを選んでいない面の ⌫：何もしない（操作も消さない）
+    key(face, 'Backspace');
+    expect(useEditorStore.getState().doc.order).toContain(5);
+    expect(useAudioStore.getState().eqLocal).toBeNull();
+    const list = screen.getByRole('list', { name: a.spectrum.bands });
+    const last = within(list).getAllByRole('button')[1] as HTMLElement;
+    last.focus();
+    key(last, 'Backspace');
+    expect(useAudioStore.getState().eqLocal?.bands).toHaveLength(1);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(list).getAllByRole('button')[0]),
+    );
+    key(document.activeElement as Element, 'Backspace');
+    expect(useAudioStore.getState().eqLocal?.bands).toHaveLength(0);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: a.spectrum.addBand })),
+    );
+    expect(useEditorStore.getState().doc.order).toContain(5);
   });
 
   it('スペクトルのときのカプセルの下の段：選んだバンドの読みと使い方の一言', () => {

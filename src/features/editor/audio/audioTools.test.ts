@@ -26,6 +26,7 @@ import {
   AUDIO_ADAPTER,
   audioController,
   audioPlayer,
+  setAudioFace,
   setAudioIoForTest,
   setCursor,
   setSelection,
@@ -400,6 +401,17 @@ describe('フェード・ループのドラッグ', () => {
       },
       { type: 'commitPreview', mode: 'step' },
     ]);
+  });
+
+  it('スペクトルの面の細い帯ではループの旗をつかめない（選択とカーソルだけ。M17 段 5）', async () => {
+    await open(view({ loop: { start: 1000, end: 4000 } }));
+    setAudioFace('spectrum');
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(1000), 5);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(1500), 5);
+    expect(useAudioStore.getState().local?.loop).toBeUndefined();
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(1500), 5, false);
+    await flush();
+    expect(sentSteps().some((s) => s.type === 'handle')).toBe(false);
   });
 
   it('ループを試聴しながら旗のドラッグを esc でやめたら、試聴も文書のループ点に戻す', async () => {

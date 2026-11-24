@@ -2,7 +2,7 @@
  * スペクトルの面の制御（M17 段 5。React の外。docs/design.md「音声エディタのスペクトルとダイナミクス」、docs/editing.md §18.4）。
  *
  * - 見るポート：イコライザのノード（選んだもの・なければ最後のもの）の入力（前）と出力（後）。ノードがなければ文書の出力（後）
- *   だけ。表示の頼みの `spec`（[前, 後] の順）を組み（`specRequests`）、WaveController がすべての頼みに載せる。
+ *   だけ。表示の頼みの `spec`（[後, 前] の順）を組み（`specRequests`）、WaveController がすべての頼みに載せる。
  * - 再生中：鳴っている位置（出力のフレーム）をポートの写し（`spec[].map`）でポートのフレームに写し、そのフレームのタイルの列を
  *   出す。描く時刻が 1 hop より遅れたら、前に出したフレームから今のフレームまでの最大を出す（過渡を落とさない）。表示は
  *   落ちる速さで下げ、最大の保持を溜める。
@@ -147,9 +147,12 @@ interface AverageSlot {
 
 /** 出力のフレームをポートのフレームへ（写しの区分の中。外なら null）。 */
 export function toPortFrame(port: EditSpecPortDto, out: number): number | null {
+  // 末尾（カーソルが長さちょうど）は最後のフレームに寄せる
+  const last = port.map[port.map.length - 1];
+  const at = last && out === last.outEnd && last.outEnd > last.outStart ? last.outEnd - 1 : out;
   for (const p of port.map) {
-    if (out >= p.outStart && out < p.outEnd) {
-      return p.inStart + Math.round(((out - p.outStart) * p.inRate) / Math.max(1, p.outRate));
+    if (at >= p.outStart && at < p.outEnd) {
+      return p.inStart + Math.round(((at - p.outStart) * p.inRate) / Math.max(1, p.outRate));
     }
   }
   return null;
@@ -195,9 +198,17 @@ export class SpectrumController {
     pre: null,
     post: null,
   };
-  private averageEpoch = 0;
+  /** 区間の平均を計っている間の裏の仕事を起こしているか。 */
+  private working = false;
+  /** ドラッグの間（後の鍵が手ごとに替わる。平均を頼み直さない）。 */
+  private interacting = false;
   private eqModel: EqModel | null = null;
-  private postMode: PostMode = 'shown';
+  /** 後の出し方の決め方（ドラッグ中・流し解きの間か、表示のチャンネルとバンドのチャンネルが合うか。P9）。 */
+  private postPolicy: { busy: boolean; compatible: boolean } = { busy: false, compatible: false };
+  /** 出している後の値を作ったポートの鍵（今の後の鍵と違えば古い後）。 */
+  private postKeyShown: string | null = null;
+  /** 404 のあと、次の表示の結果まで取らないタイル。 */
+  private readonly waitingView = new Set<string>();
   private peak: { x: number; y: number } | null = null;
   private frameId: number | null = null;
   private loopId: number | null = null;
@@ -224,6 +235,8 @@ export class SpectrumController {
 
   attach(canvas: HTMLCanvasElement): void {
     this.canvas = canvas;
+    // 付け直した（面を出し直した・大きさが変わった）：再生中なら描き続ける
+    if (this.playing) this.startLoop();
     this.invalidate();
   }
 
@@ -267,8 +280,10 @@ export class SpectrumController {
     if (this.target === node) return;
     this.target = node;
     this.averages = { pre: null, post: null };
+    this.postKeyShown = null;
     this.resetShown(true);
     this.refreshStill();
+    this.syncWork();
   }
 
   get targetNode(): number | null {
@@ -283,8 +298,8 @@ export class SpectrumController {
       this.resetShown(true);
       this.refreshStill();
     } else if (prev.tilt !== settings.tilt) {
-      // 傾きを替えたら出している値を作り直す
-      this.resetShown(false);
+      // 傾きを替えたら出している値と最大の保持を作り直す（古い傾きの保持を混ぜない）
+      this.resetShown(true);
       this.refreshStill();
     }
     this.invalidate();
@@ -302,6 +317,7 @@ export class SpectrumController {
     this.still = still;
     if (same) return;
     this.refreshStill();
+    this.syncWork();
   }
 
   /** 再生しているか（始めたら最大の保持を消す）。 */
@@ -317,6 +333,17 @@ export class SpectrumController {
       this.stopLoop();
       this.refreshStill();
     }
+    this.syncWork();
+  }
+
+  /** ドラッグの間（後の鍵が手ごとに替わるので平均を頼み直さない。離したら 1 回頼み直す）。 */
+  setInteracting(on: boolean): void {
+    if (this.interacting === on) return;
+    this.interacting = on;
+    if (!on) {
+      this.checkAverages();
+      this.refreshStill();
+    }
   }
 
   /** 再生の先読みの区間（出力のフレーム。spec の区間に使う）。 */
@@ -330,11 +357,25 @@ export class SpectrumController {
     this.invalidate();
   }
 
-  /** 後の出し方（ドラッグ中・流し解きの間は「前 ＋ 曲線」か、前の後を薄く。P9）。 */
-  setPostMode(mode: PostMode): void {
-    if (this.postMode === mode) return;
-    this.postMode = mode;
+  /**
+   * 後の出し方の決め方（P9）：ドラッグ中・流し解きの間（`busy`）か、出している後が今の後の鍵のものでない（離した直後など）
+   * なら、表示とバンドのチャンネルが合えば（`compatible`）「前 ＋ 曲線」、合わなければ前の後を薄く。
+   */
+  setPostPolicy(policy: { busy: boolean; compatible: boolean }): void {
+    if (this.postPolicy.busy === policy.busy && this.postPolicy.compatible === policy.compatible) {
+      return;
+    }
+    this.postPolicy = policy;
     this.invalidate();
+  }
+
+  /** 今の後の出し方。 */
+  postMode(): PostMode {
+    if (!this.eqModel?.curve) return 'shown';
+    const key = this.port('post')?.key ?? null;
+    const stale = this.postKeyShown !== null && key !== null && this.postKeyShown !== key;
+    if (!this.postPolicy.busy && !stale) return 'shown';
+    return this.postPolicy.compatible ? 'approx' : 'dim';
   }
 
   /** 山の印（面の中の CSS px。なければ null）。 */
@@ -459,7 +500,7 @@ export class SpectrumController {
   /** 出す後（「前 ＋ 曲線」なら作る）。 */
   private shownPost(): Float32Array | null {
     const curve = this.eqModel?.curve;
-    if (this.postMode === 'approx' && this.preShown && curve) {
+    if (this.postMode() === 'approx' && this.preShown && curve) {
       const out = new Float32Array(this.preShown.length);
       for (let k = 0; k < out.length; k++) {
         const b = this.bands[k];
@@ -509,6 +550,8 @@ export class SpectrumController {
   applyView(view: EditAudioView): void {
     if (this.disposed) return;
     this.view = view;
+    // 404 で待っていたタイルは、新しい置き場の様子（ready）で取り直す
+    this.waitingView.clear();
     if (this.bandsRate !== this.portRate()) {
       this.bandsRate = this.portRate();
       this.bands = specBands(this.bandsRate);
@@ -519,7 +562,10 @@ export class SpectrumController {
     this.invalidate();
   }
 
-  /** 表示の頼みの `spec`（[前, 後]。区間は再生の区間か、カーソル・選択の始めのチャンク）。 */
+  /**
+   * 表示の頼みの `spec`（[後, 前]：Rust は手・表示の頼みで作る 2 チャンクを頼みの順に分け合うので、主の後を先に。区間は
+   * 再生の区間か、カーソル・選択の始めのチャンク）。
+   */
   specRequests(): EditSpecRequestDto[] {
     const total = this.view?.frames ?? 0;
     const spans: EditSpanDto[] = [];
@@ -540,7 +586,7 @@ export class SpectrumController {
     });
     return this.target === null
       ? [port(null, 'output')]
-      : [port(this.target, 'input'), port(this.target, 'output')];
+      : [port(this.target, 'output'), port(this.target, 'input')];
   }
 
   // ===== ポート =====
@@ -597,7 +643,9 @@ export class SpectrumController {
         if (!isReady(port.ready, chunk)) continue;
         if (this.tiles.get(port.key, port.channel, chunk)) continue;
         const key = this.tileKey(port, chunk);
-        if (this.loading.has(key) || this.failed.blocked(key)) continue;
+        if (this.loading.has(key) || this.failed.blocked(key) || this.waitingView.has(key)) {
+          continue;
+        }
         this.loading.add(key);
         const url = editSpecUrl(session, port.key, port.channel, chunk);
         this.fetch(url)
@@ -607,8 +655,10 @@ export class SpectrumController {
             const tile = parseEditSpecTile(buf);
             if (!tile) {
               this.failed.fail(key);
+              this.retryLater(key);
               return;
             }
+            this.failed.ok(key);
             this.tiles.put(port.key, tile);
             this.refreshStill();
             this.invalidate();
@@ -616,14 +666,28 @@ export class SpectrumController {
           .catch((err: unknown) => {
             this.loading.delete(key);
             if (this.disposed) return;
-            this.failed.fail(key);
-            // 置き場から追い出された：表示を頼み直す（作り直したら ready に戻る）
             const status =
               err instanceof WaveHttpError ? err.status : (err as { status?: unknown }).status;
-            if (status === 404) this.options.onStale?.();
+            if (status === 404) {
+              // 置き場から追い出された：表示を頼み直し、その結果の ready で取り直す（印は付けない）
+              this.waitingView.add(key);
+              this.options.onStale?.();
+            } else {
+              this.failed.fail(key);
+              this.retryLater(key);
+            }
           });
       }
     }
+  }
+
+  /** 取れなかったタイルを、印の期限が来たら取り直す（止まっていても）。 */
+  private retryLater(key: string): void {
+    const wait = this.failed.waitOf(key);
+    if (wait === null || this.disposed) return;
+    this.scheduler.later(() => {
+      if (!this.disposed) this.pump();
+    }, wait + 1);
   }
 
   /** ポートのフレーム `j` の帯の dB（タイルがなければ null）。 */
@@ -659,7 +723,10 @@ export class SpectrumController {
       else holdMax(acc, col);
     }
     if (acc) this.lastFrame[side] = j;
-    if (side === 'post') this.frameProbe?.(acc ? Math.abs(pf / port.hop - j) : null);
+    if (side === 'post') {
+      this.frameProbe?.(acc ? Math.abs(pf / port.hop - j) : null);
+      if (acc) this.postKeyShown = port.key;
+    }
     return acc ? this.tilted(acc) : null;
   }
 
@@ -683,15 +750,19 @@ export class SpectrumController {
       this.requestAverages();
       const post = this.averages.post;
       const pre = this.averages.pre;
-      this.postShown = post?.mean ? this.tilted(Float32Array.from(post.mean)) : this.postShown;
+      if (post?.mean) {
+        this.postShown = this.tilted(Float32Array.from(post.mean));
+        if (post.key !== null) this.postKeyShown = post.key;
+      }
       this.preShown = pre?.mean ? this.tilted(Float32Array.from(pre.mean)) : this.preShown;
-      this.hold = post?.max ? this.tilted(Float32Array.from(post.max)) : null;
+      // 止まっているときの最大の保持は区間の最大（なければ残す）
+      if (post?.max) this.hold = this.tilted(Float32Array.from(post.max));
       this.dimPost = post?.state === 'measuring';
     } else {
+      // カーソルの位置のフレーム（最大の保持は残す：消すのはノード・チャンネルの替え・再生の始め・リセットだけ）
       this.lastFrame = { post: null, pre: null };
       this.postShown = this.valuesAt('post', this.still.cursor);
       this.preShown = this.valuesAt('pre', this.still.cursor);
-      this.hold = null;
       this.dimPost = false;
       this.pump();
     }
@@ -733,7 +804,6 @@ export class SpectrumController {
   private fetchAverage(session: string, side: 'pre' | 'post', slot: AverageSlot): void {
     const average = this.options.average;
     if (!average) return;
-    const epoch = ++this.averageEpoch;
     average(session, slot.request)
       .then((r) => {
         if (this.disposed || this.averages[side] !== slot) return;
@@ -748,16 +818,24 @@ export class SpectrumController {
           }
         } else if (r.type === 'measuring') {
           slot.state = 'measuring';
-          this.options.onWork?.(true);
         } else {
           slot.state = 'failed';
         }
-        if (epoch === this.averageEpoch && !this.anyMeasuring()) this.options.onWork?.(false);
+        this.syncWork();
         this.refreshStill();
       })
       .catch(() => {
         if (this.averages[side] === slot) slot.state = 'failed';
+        this.syncWork();
       });
+  }
+
+  /** 区間の平均を計っている間だけ裏の仕事を起こす（選択を外した・再生した・失敗したらやめる）。 */
+  private syncWork(): void {
+    const on = !this.playing && this.still.selection !== null && this.anyMeasuring();
+    if (on === this.working) return;
+    this.working = on;
+    this.options.onWork?.(on);
   }
 
   private anyMeasuring(): boolean {
@@ -773,11 +851,12 @@ export class SpectrumController {
       const slot = this.averages[side];
       if (!slot) continue;
       const key = this.port(side)?.key ?? null;
-      // 鍵が替わった（引数を変えた・ノードを替えた）：頼み直す
-      if (key !== null && slot.key !== null && slot.key !== key) {
-        slot.key = key;
-        slot.state = 'measuring';
-        this.fetchAverage(session, side, slot);
+      // 鍵が替わった（引数を変えた・ノードを替えた）：頼み直す（ドラッグの間は頼まず、離したら 1 回）
+      if (key !== null && slot.key !== null && slot.key !== key && !this.interacting) {
+        // 新しい組にする（前の鍵の頼みの応えが後から届いても、新しい組には入れない）
+        const next: AverageSlot = { ...slot, key, state: 'measuring' };
+        this.averages[side] = next;
+        this.fetchAverage(session, side, next);
         continue;
       }
       if (slot.state !== 'measuring') continue;
@@ -787,6 +866,7 @@ export class SpectrumController {
         this.fetchAverage(session, side, slot);
       else if (st.phase.type === 'failed') slot.state = 'failed';
     }
+    this.syncWork();
   }
 
   // ===== 再生中 =====
@@ -876,7 +956,7 @@ export class SpectrumController {
       post: this.shownPost(),
       pre: this.preShown,
       hold: this.hold,
-      dimPost: this.dimPost || this.postMode === 'dim',
+      dimPost: this.dimPost || this.postMode() === 'dim',
       eqLayer: this.eqLayer(),
       colors: this.colors,
       font: this.font,

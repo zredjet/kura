@@ -12,6 +12,7 @@ import {
   spectrumController,
   useAudioStore,
   usableChannel,
+  useEqPort,
 } from './audioStore';
 import { SPECTRUM_READING_ID } from './AudioCapsule';
 import { dbText, freqText } from './eqModel';
@@ -89,7 +90,8 @@ function channelOptions(channels: number): { value: string; label: string }[] {
 /** 面の右上の札：線の見本つきの凡例と、表示の設定（表示だけ。文書に入らない）。 */
 function SpectrumChip() {
   const settings = useAudioStore((s) => s.spectrum);
-  const channels = useAudioStore((s) => s.view?.channels ?? 2);
+  // 選べるチャンネルは、面が出すノードの入力の数（なければ出力の数）
+  const { channels } = useEqPort();
   const doc = useEditorStore((s) => s.doc);
   const selected = useEditorStore((s) => s.selected);
   const [open, setOpen] = useState(false);
@@ -97,7 +99,7 @@ function SpectrumChip() {
   const hasTarget = targetNode(doc, selected, 'audio.eq') !== null;
   const channel = usableChannel(settings.channel, channels);
   return (
-    <div className={styles.specChip}>
+    <div className={styles.specChip} data-spec-chip="">
       <ul className={styles.specLegend} aria-label={ts.settings}>
         <li>
           <span className={`${styles.swatch} ${styles.swatchPost}`} aria-hidden="true" />
@@ -272,6 +274,10 @@ export function SpectrumStage() {
     return () => host.removeEventListener('wheel', onWheel);
   }, []);
 
+  /** 札の上の手（面の手にしない：札のダブルクリックでベルを足さない・札の右クリックでメニューを開かない）。 */
+  const onChip = (e: { target: EventTarget }) =>
+    e.target instanceof Element && e.target.closest('[data-spec-chip]') !== null;
+
   const local = (e: { clientX: number; clientY: number }) => {
     const r = faceRef.current?.getBoundingClientRect();
     return { x: e.clientX - (r?.left ?? 0), y: e.clientY - (r?.top ?? 0) };
@@ -307,7 +313,7 @@ export function SpectrumStage() {
   };
 
   const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || onChip(e)) return;
     faceRef.current?.focus();
     const { x, y } = local(e);
     if (SPECTRUM_POINTER.down(e, x, y)) {
@@ -320,7 +326,11 @@ export function SpectrumStage() {
   const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
     const { x, y } = local(e);
     if (pointer.current === e.pointerId) SPECTRUM_POINTER.move(e, x, y);
-    else hoverAt(x, y);
+    else if (onChip(e)) {
+      setHover(null);
+      setEqHover(null);
+      spectrumController()?.setPeakMark(null);
+    } else hoverAt(x, y);
   };
 
   const finish = (e: PointerEvent<HTMLDivElement>, canceled: boolean) => {
@@ -357,10 +367,12 @@ export function SpectrumStage() {
           spectrumController()?.setPeakMark(null);
         }}
         onDoubleClick={(e) => {
+          if (onChip(e)) return;
           const { x, y } = local(e);
           SPECTRUM_POINTER.doubleClick(x, y);
         }}
         onContextMenu={(e) => {
+          if (onChip(e)) return;
           e.preventDefault();
           const { x, y } = local(e);
           SPECTRUM_POINTER.contextMenu(e.clientX, e.clientY, x, y);

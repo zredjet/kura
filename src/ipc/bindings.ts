@@ -1496,10 +1496,7 @@ export type EditEqCurveRequestDto = {
 	points: number,
 };
 
-/**
- *  操作のカタログ（bindings の定数 `EDIT_OPS`。今の版の操作の ID・版・入力・引数の記述（表示の条件つき））。
- *  イコライザ（`audio.eq` v1）の範囲と既定（M17 段 5。フロントのスペクトルの面・バンドの表は手で写さずにこれを読む）。
- */
+/**  イコライザ（`audio.eq` v1）の範囲と既定（M17 段 5。フロントのスペクトルの面・バンドの表は手で写さずにこれを読む）。 */
 export type EditEqLimitsDto = {
 	/**  バンドの数・2 次の段の数の上限。 */
 	maxBands: number,

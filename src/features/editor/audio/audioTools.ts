@@ -81,7 +81,11 @@ function nowPos(): number {
  * 選んだら、波形に戻して替える（M17 段 5。キーとカプセルのボタンは同じ道を通る）。
  */
 export function selectAudioTool(tool: AudioTool): void {
-  if (tool !== 'select' && state().face === 'spectrum') setAudioFace('wave');
+  if (tool !== 'select' && state().face === 'spectrum') {
+    setAudioFace('wave');
+    // ドラッグの途中で替えられなかった：道具も替えない
+    if (state().face === 'spectrum') return;
+  }
   if (tool === 'trim') {
     startTrim();
     return;
@@ -258,6 +262,10 @@ let drag: Drag | null = null;
  * つかめない（表示は切り詰めを仮に外した入力の座標だが、手は切り詰めを戻した出力の座標として読まれるため）。
  */
 function hitScene(s: AudioEditorState) {
+  // スペクトルの面の細い帯は選択とカーソルだけ（ループの旗・フェード・切り詰めの枠はつかめない）
+  if (s.face === 'spectrum') {
+    return { loop: null, fade: null, trim: null, selection: s.selection };
+  }
   const o = overlayOf(s);
   const trimming = s.trim !== null;
   return {

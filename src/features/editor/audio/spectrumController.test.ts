@@ -82,7 +82,7 @@ function setup(
 }
 
 describe('スペクトルの面の制御', () => {
-  it('頼みの spec は [前, 後]（ノードがなければ出力だけ）。区間は止まっていればカーソルと選択の始めのチャンク、再生中は再生の区間', () => {
+  it('頼みの spec は [後, 前]（ノードがなければ出力だけ）。区間は止まっていればカーソルと選択の始めのチャンク、再生中は再生の区間', () => {
     const { c } = setup();
     c.applyView(audioView({ rate: RATE, frames: FRAMES }));
     c.setStill({ cursor: 70_000, selection: { start: 140_000, end: 150_000 } });
@@ -100,8 +100,8 @@ describe('スペクトルの面の制御', () => {
     c.setTarget(3);
     const reqs = c.specRequests();
     expect(reqs.map((r) => [r.node, r.side])).toEqual([
-      [3, 'input'],
       [3, 'output'],
+      [3, 'input'],
     ]);
     c.setPlaybackSpans([{ start: 0, end: 131_072 }]);
     c.setPlaying(true);
@@ -236,14 +236,148 @@ describe('スペクトルの面の制御', () => {
     expect(calls[3]?.side).toBe('output');
   });
 
-  it('出力のフレームをポートのフレームへ写す（区分の比で。外は null）', () => {
+  it('出力のフレームをポートのフレームへ写す（区分の比で。末尾ちょうどは最後のフレーム、外は null）', () => {
     const p = port({
       map: [{ outStart: 100, outEnd: 1_100, inStart: 5_000, inRate: 8_000, outRate: 16_000 }],
     });
     expect(toPortFrame(p, 100)).toBe(5_000);
     expect(toPortFrame(p, 300)).toBe(5_100);
     expect(toPortFrame(p, 99)).toBeNull();
-    expect(toPortFrame(p, 1_100)).toBeNull();
+    expect(toPortFrame(p, 1_100)).toBe(5_500);
+    expect(toPortFrame(p, 1_101)).toBeNull();
+  });
+});
+
+describe('見直しで見つかった穴（M17 段 5）', () => {
+  it('404 のタイルは次の表示の結果で取り直す（止まっていても）。ほかの失敗は間を空けて取り直す', async () => {
+    const { c, io, clock, onStale } = setup();
+    c.setStill({ cursor: 10, selection: null });
+    const view = audioView({
+      rate: RATE,
+      frames: FRAMES,
+      spec: [port({ ready: [{ start: 0, end: 1 }] })],
+    });
+    c.applyView(view);
+    const url = editSpecUrl(SESSION, KEY_POST, { type: 'sum' }, 0);
+    expect(io.pending()).toEqual([url]);
+    io.reject(url, { status: 404 });
+    await settle();
+    expect(onStale).toHaveBeenCalledTimes(1);
+    expect(io.pending()).toEqual([]);
+    c.applyView(view);
+    expect(io.pending()).toEqual([url]);
+    io.reject(url, { status: 500 });
+    await settle();
+    expect(io.pending()).toEqual([]);
+    clock.advance(60_000);
+    expect(io.pending()).toEqual([url]);
+  });
+
+  it('平均を計っている間だけ仕事を起こし、選択を外した・頼みが失敗したらやめる', async () => {
+    const replies: { resolve: (r: EditSpecAverageDto) => void; reject: (e: unknown) => void }[] =
+      [];
+    const { c, onWork } = setup({
+      average: () =>
+        new Promise((resolve, reject) => {
+          replies.push({ resolve, reject });
+        }),
+    });
+    c.applyView(audioView({ rate: RATE, frames: FRAMES, spec: [port({})] }));
+    c.setStill({ cursor: 0, selection: { start: 1_000, end: 9_000 } });
+    replies[0]?.resolve({ type: 'measuring', progress: 0 });
+    await settle();
+    expect(onWork).toHaveBeenLastCalledWith(true);
+    c.setStill({ cursor: 0, selection: null });
+    expect(onWork).toHaveBeenLastCalledWith(false);
+    c.setStill({ cursor: 0, selection: { start: 2_000, end: 9_000 } });
+    expect(onWork).toHaveBeenLastCalledWith(true);
+    replies[1]?.reject(new Error('busy'));
+    await settle();
+    expect(onWork).toHaveBeenLastCalledWith(false);
+  });
+
+  it('再生中に面を出し直しても描き続ける', () => {
+    const { c, clock } = setup({ playhead: () => 0 });
+    c.applyView(audioView({ rate: RATE, frames: FRAMES, spec: [port({})] }));
+    c.setPlaying(true);
+    c.detach();
+    clock.flushFrames();
+    expect(clock.pendingFrames()).toBe(0);
+    c.attach(document.createElement('canvas'));
+    clock.flushFrames();
+    // 描き続けている（刻みが次の刻みを置く）
+    expect(clock.pendingFrames()).toBeGreaterThan(0);
+  });
+
+  it('止めても最大の保持は残る。傾きを替えたら保持を作り直す', async () => {
+    let pos = 0;
+    const { c, io, clock, scenes } = setup({ playhead: () => pos });
+    c.applyView(audioView({ rate: RATE, frames: FRAMES, spec: [port({})] }));
+    c.setPlaying(true);
+    c.tickPlaying();
+    io.resolve(
+      editSpecUrl(SESSION, KEY_POST, { type: 'sum' }, 0),
+      tile(0, (j) => (j === 3 ? 220 : 100)),
+    );
+    await settle();
+    pos = 3 * HOP;
+    c.tickPlaying();
+    expect(scenes[scenes.length - 1]?.hold?.[0]).toBe(-10);
+    c.setPlaying(false);
+    clock.flushFrames();
+    expect(scenes[scenes.length - 1]?.post?.[0]).toBe(-70);
+    expect(scenes[scenes.length - 1]?.hold?.[0]).toBe(-10);
+    c.setSettings({ ...c.currentSettings, tilt: 4.5 });
+    clock.flushFrames();
+    expect(scenes[scenes.length - 1]?.hold?.[0]).not.toBe(-10);
+  });
+
+  it('ドラッグの間は後の鍵が替わっても平均を頼み直さず、離したら 1 回頼む。前の鍵の応えは新しい組に入れない', async () => {
+    const calls: EditSpecAverageRequestDto[] = [];
+    const replies: ((r: EditSpecAverageDto) => void)[] = [];
+    const { c, clock, scenes } = setup({
+      average: (_s, r) =>
+        new Promise((resolve) => {
+          calls.push(r);
+          replies.push(resolve);
+        }),
+    });
+    c.setTarget(3);
+    const view = (key: string) =>
+      audioView({
+        rate: RATE,
+        frames: FRAMES,
+        spec: [
+          port({ node: 3, side: 'output', key }),
+          port({ node: 3, side: 'input', key: KEY_PRE }),
+        ],
+      });
+    c.applyView(view(KEY_POST));
+    c.setStill({ cursor: 0, selection: { start: 1_000, end: 9_000 } });
+    expect(calls).toHaveLength(2);
+    c.setInteracting(true);
+    c.applyView(view('33'.repeat(16)));
+    c.applyView(view('44'.repeat(16)));
+    expect(calls).toHaveLength(2);
+    c.setInteracting(false);
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.side).toBe('output');
+    // 前の鍵の後の応え（calls[1]）が遅れて届いても出さない
+    const ready = (v: number): EditSpecAverageDto => ({
+      type: 'ready',
+      frames: 60,
+      mean: new Array<number>(BANDS).fill(v),
+      max: new Array<number>(BANDS).fill(v),
+    });
+    const postReply = calls[0]?.side === 'output' ? replies[0] : replies[1];
+    postReply?.(ready(-11));
+    await settle();
+    clock.flushFrames();
+    expect(scenes[scenes.length - 1]?.post?.[0]).not.toBe(-11);
+    replies[2]?.(ready(-22));
+    await settle();
+    clock.flushFrames();
+    expect(scenes[scenes.length - 1]?.post?.[0]).toBe(-22);
   });
 });
 
@@ -295,10 +429,10 @@ describe('イコライザの重ね（M17 段 5）', () => {
     expect(c.hitBand(5, 5)).toBeNull();
     // ふつうは後のタイル、ドラッグ中は前（−40）＋ 曲線（+6）
     expect(scene?.post?.[0]).toBe(-70);
-    c.setPostMode('approx');
+    c.setPostPolicy({ busy: true, compatible: true });
     clock.flushFrames();
     expect(scenes[scenes.length - 1]?.post?.[0]).toBe(-34);
-    c.setPostMode('dim');
+    c.setPostPolicy({ busy: true, compatible: false });
     clock.flushFrames();
     expect(scenes[scenes.length - 1]?.dimPost).toBe(true);
     expect(c.curveDbAt(1_000)).toBe(6);

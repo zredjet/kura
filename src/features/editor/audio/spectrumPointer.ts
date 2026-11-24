@@ -14,6 +14,7 @@ import { openMenuAt, type MenuEntry } from '../../../components/Menu/menuStore';
 import { ja } from '../../../i18n/ja';
 import {
   addEqNode,
+  eqInputRate,
   eqTargetParams,
   sealEq,
   sendEqBands,
@@ -32,6 +33,7 @@ import {
   hasGain,
   newBell,
   qFromHandle,
+  qHandles,
 } from './eqModel';
 
 const ts = ja.editor.audio.spectrum;
@@ -60,9 +62,9 @@ interface Drag {
 
 let drag: Drag | null = null;
 
-/** 今のポートのレート（周波数を収める）。 */
+/** イコライザの入力のレート（周波数を収める）。 */
 function rate(): number {
-  return useAudioStore.getState().view?.rate ?? 48_000;
+  return eqInputRate();
 }
 
 /** ドラッグで動かしたバンド（錨からの移動量。⌥ は 1/10）。 */
@@ -73,7 +75,10 @@ function dragged(d: Drag, x: number, y: number): EqBand {
   const b = a.band;
   if (!c) return b;
   if (d.kind === 'qLo' || d.kind === 'qHi') {
-    const f = c.freqAt(a.x + (x - a.x) * k);
+    // 錨の時の印の周波数から、動いた量（オクターブ）だけ動かす（印をつかんだ所が印の上でなくても飛ばない）
+    const h = qHandles(b);
+    const from = h ? (d.kind === 'qLo' ? h.lo : h.hi) : b.freq;
+    const f = from * Math.pow(2, (x - a.x) * k * c.octPerPx());
     return { ...b, q: qFromHandle(b, f) };
   }
   const oct = (x - a.x) * k * c.octPerPx();
@@ -107,7 +112,7 @@ export const SPECTRUM_POINTER = {
       };
       return true;
     }
-    const peak = c.peakNear(x);
+    const peak = SPECTRUM_POINTER.inside(x, y) ? c.peakNear(x) : null;
     if (peak && Math.hypot(x - peak.x, y - peak.y) <= PEAK_PX) {
       const bands = target ? [...target.params.bands] : [];
       const band = newBell(clampFreq(peak.freq, rate()), 0, PEAK_Q);
@@ -116,7 +121,8 @@ export const SPECTRUM_POINTER = {
         kind: 'peak',
         band: bands.length - 1,
         node: target?.node ?? null,
-        anchor: { x: peak.x, y, band },
+        // 錨は押した所（山の印から少し離れて押しても、動かし始めで飛ばない）
+        anchor: { x, y, band },
         fine: e.altKey,
         moved: false,
         start: { x, y },
@@ -126,6 +132,14 @@ export const SPECTRUM_POINTER = {
     }
     if (!e.altKey) setEqBand(null);
     return false;
+  },
+
+  /** 面の内側（目盛りの外の帯でない所）か。空きの手（ダブルクリックでベル）はここだけ。 */
+  inside(x: number, y: number): boolean {
+    const c = spectrumController();
+    if (!c) return false;
+    const r = c.inner();
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
   },
 
   move(e: { altKey: boolean }, x: number, y: number): void {
@@ -190,6 +204,7 @@ export const SPECTRUM_POINTER = {
       sendEqBands(target.node, bands, 'set');
       return;
     }
+    if (!SPECTRUM_POINTER.inside(x, y)) return;
     const band = newBell(clampFreq(c.freqAt(x), rate()), clampGain(c.eqDbAt(y)));
     if (!target) {
       addEqNode([band]);

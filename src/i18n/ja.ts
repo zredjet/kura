@@ -1407,7 +1407,7 @@ export const ja = {
           tilt: 'チルト',
         },
         bandChannel: 'チャンネル',
-        bandChannels: { all: '両方', left: 'L', right: 'R', mid: 'M', side: 'S' },
+        bandChannels: { all: 'すべて', left: 'L', right: 'R', mid: 'M', side: 'S' },
         bandOn: 'オンにする',
         bandOff: 'オフにする',
         /** ホバーの吹き出し。 */

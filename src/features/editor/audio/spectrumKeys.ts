@@ -9,13 +9,15 @@
  */
 
 import { EQ_LIMITS } from '../../../ipc/edit';
-import { eqTargetParams, sendEqBands, setEqBand, useAudioStore } from './audioStore';
+import { eqInputRate, eqTargetParams, sendEqBands, setEqBand, useAudioStore } from './audioStore';
 import { bandSummary } from './EqBandsField';
 import { type EqBand, clampFreq, clampGain, clampQ, hasGain } from './eqModel';
 
 /** 面・行の印（キーの行き先の見分け）。 */
 export const FACE_ATTR = 'data-spectrum-face';
 export const ROW_ATTR = 'data-eq-band-row';
+/** ［＋ バンドを足す］の印（行を消したあとのフォーカスの行き先）。 */
+export const ADD_ATTR = 'data-eq-band-add';
 
 /** 1 回のキーの量（⇧ ×4・⌥ ÷5）。 */
 function scale(e: { shiftKey: boolean; altKey: boolean }): number {
@@ -66,7 +68,7 @@ export function spectrumKey(e: KeyboardEvent, key: string): boolean | null {
   const eq = eqTargetParams();
   const bands = eq?.params.bands ?? [];
   const sel = useAudioStore.getState().eqBand;
-  const rate = useAudioStore.getState().view?.rate ?? 48_000;
+  const rate = eqInputRate();
   if (row) {
     if (key !== 'ArrowUp' && key !== 'ArrowDown' && key !== 'Backspace' && key !== 'Delete') {
       return null;
@@ -78,6 +80,16 @@ export function spectrumKey(e: KeyboardEvent, key: string): boolean | null {
       setEqBand(null);
       sendEqBands(eq.node, next, 'set');
       announce(next, null);
+      // フォーカスを残った行（なければ［＋ バンドを足す］）へ移す（消えた行と一緒にフォーカスが本文へ落ちると、次の ⌫ が
+      // 核の「操作を消す」になる）
+      const list = row.closest('[role="list"]');
+      const to = Math.min(i, next.length - 1);
+      const field = list?.parentElement ?? null;
+      queueMicrotask(() => {
+        const rowEl =
+          to >= 0 ? list?.querySelector<HTMLElement>(`[${ROW_ATTR}="${to}"]`) : undefined;
+        (rowEl ?? field?.querySelector<HTMLElement>(`[${ADD_ATTR}]`))?.focus();
+      });
       return true;
     }
     const to = Math.min(bands.length - 1, Math.max(0, i + (key === 'ArrowDown' ? 1 : -1)));

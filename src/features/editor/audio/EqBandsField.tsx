@@ -8,7 +8,7 @@ import { EQ_LIMITS } from '../../../ipc/edit';
 import editorStyles from '../Editor.module.css';
 import { useEditorStore } from '../editorStore';
 import styles from './Audio.module.css';
-import { sendEqBands, setEqBand, useAudioStore } from './audioStore';
+import { sendEqBands, setEqBand, useAudioStore, useEqPort } from './audioStore';
 import {
   BAND_CHANNELS,
   BAND_TYPES,
@@ -99,7 +99,7 @@ function NumberField({
 export function EqBandsField({ node }: { node: number }) {
   const bands = useEqBands(node);
   const selected = useAudioStore((s) => s.eqBand);
-  const rate = useAudioStore((s) => s.view?.rate ?? 48_000);
+  const { rate } = useEqPort();
   const enabledCount = bands.filter((b) => b.enabled).length;
   const full = bands.length >= EQ_LIMITS.maxBands;
   const band = selected === null ? undefined : bands[selected];
@@ -137,6 +137,7 @@ export function EqBandsField({ node }: { node: number }) {
       <button
         type="button"
         className={styles.eqAdd}
+        data-eq-band-add=""
         disabled={full}
         onClick={() => {
           sendEqBands(node, [...bands, newBell(1_000, 0)], 'set');

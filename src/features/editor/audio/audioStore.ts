@@ -63,6 +63,7 @@ import {
 } from './playback';
 import {
   DEFAULT_SPECTRUM_SETTINGS,
+  SPECTRUM_CHOICES,
   SpectrumController,
   type SpectrumSettings,
 } from './spectrumController';
@@ -140,12 +141,18 @@ export function loadSpectrumSettings(): SpectrumSettings {
             ? ch
             : d.channel
         : d.channel;
+    // 選べる値だけを受ける（壊れた値で描けない・頼めないことがないように）
+    const pick = (x: unknown, choices: readonly number[], dv: number) => {
+      const n = num(x, dv);
+      return choices.includes(n) ? n : dv;
+    };
+    const index = channel.type === 'index' ? channel.index : 0;
     return {
-      fall: num(v.fall, d.fall),
-      tilt: num(v.tilt, d.tilt),
-      channel,
-      range: num(v.range, d.range),
-      eqScale: num(v.eqScale, d.eqScale),
+      fall: pick(v.fall, SPECTRUM_CHOICES.fall, d.fall),
+      tilt: pick(v.tilt, SPECTRUM_CHOICES.tilt, d.tilt),
+      channel: index >= 0 && index <= 0xfffc ? channel : d.channel,
+      range: pick(v.range, SPECTRUM_CHOICES.range, d.range),
+      eqScale: pick(v.eqScale, SPECTRUM_CHOICES.eqScale, d.eqScale),
     };
   } catch {
     return DEFAULT_SPECTRUM_SETTINGS;
@@ -443,12 +450,44 @@ export function spectrumTarget(): number | null {
 export function setAudioFace(face: AudioFace): void {
   const s = useAudioStore.getState();
   if (s.face === face) return;
+  // ドラッグの途中は替えない（面を替えると押した要素が消えて離す手が来ず、ドラッグの印・仮の値が残る）
+  if (live()?.dragging) return;
   if (face === 'spectrum') {
     if (s.trim) cancelTrim();
     useAudioStore.setState({ face, tool: 'select', local: null });
   } else {
     useAudioStore.setState({ face });
   }
+}
+
+/** 面が出すイコライザの入力のレート（周波数を収める・軸。なければ出力のレート）。 */
+export function eqInputRate(): number {
+  const s = useAudioStore.getState();
+  const node = spectrumTarget();
+  const viewNode = node === null ? undefined : s.view?.nodes.find((n) => n.id === node);
+  return viewNode?.inRate ?? s.view?.rate ?? s.source?.rate ?? 48_000;
+}
+
+/** 面が出すイコライザの入力のチャンネル数（チャンネルの選び方。なければ出力の数）。 */
+export function eqInputChannels(): number {
+  const s = useAudioStore.getState();
+  const node = spectrumTarget();
+  const viewNode = node === null ? undefined : s.view?.nodes.find((n) => n.id === node);
+  return viewNode?.inChannels ?? s.view?.channels ?? s.source?.channels ?? 2;
+}
+
+/** 面が出すイコライザの入力のレートとチャンネル数（React から。値が変われば描き直す）。 */
+export function useEqPort(): { rate: number; channels: number } {
+  const node = useEditorStore((e) => targetNode(e.doc, e.selected, 'audio.eq'));
+  const rate = useAudioStore((s) => {
+    const n = node === null ? undefined : s.view?.nodes.find((v) => v.id === node);
+    return n?.inRate ?? s.view?.rate ?? s.source?.rate ?? 48_000;
+  });
+  const channels = useAudioStore((s) => {
+    const n = node === null ? undefined : s.view?.nodes.find((v) => v.id === node);
+    return n?.inChannels ?? s.view?.channels ?? s.source?.channels ?? 2;
+  });
+  return { rate, channels };
 }
 
 /** 面が出すイコライザの今の引数（頭の文書 ＋ 手元の値。ノードがなければ null）。 */
@@ -645,9 +684,10 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     want: (source, i) => feed.want(source, i),
     need: (source, spans) => {
       if (source !== 'edited') return;
-      // スペクトルの面の頼みも再生の区間（チャンク揃え）にしてから、再生の頼みを出す
+      // スペクトルの面の頼みも再生の区間（チャンク揃え）にしてから、再生の頼みを出す（波形のときも区間は覚える：
+      // 再生中にスペクトルへ替えたら、すぐ今の区間で頼む）
+      spectrum.setPlaybackSpans(spans);
       if (useAudioStore.getState().face === 'spectrum') {
-        spectrum.setPlaybackSpans(spans);
         controller.setSpec(spectrum.specRequests());
       }
       controller.setPlaybackSpans(spans);
@@ -684,6 +724,15 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
   });
   // スペクトルの面の入力（面・設定・見るノード・止まっているときのカーソルと選択・再生）を制御に渡し、頼みの spec を替える
   let stillTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 見るノードとチャンネル（入力のチャンネル数で選べるもの）を渡す（表示の結果が届くたびにも：上流でチャンネルの数が変わる）。 */
+  const syncTarget = () => {
+    const s = useAudioStore.getState();
+    spectrum.setTarget(spectrumTarget());
+    spectrum.setSettings({
+      ...s.spectrum,
+      channel: usableChannel(s.spectrum.channel, eqInputChannels()),
+    });
+  };
   const syncSpectrum = (immediateStill: boolean) => {
     const s = useAudioStore.getState();
     const onFace = s.face === 'spectrum';
@@ -693,11 +742,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       spectrum.setPlaying(false);
       return;
     }
-    const target = spectrumTarget();
-    spectrum.setTarget(target);
-    const node = target === null ? null : rt.lastView?.nodes.find((n) => n.id === target);
-    const channels = node?.inChannels ?? s.view?.channels ?? 2;
-    spectrum.setSettings({ ...s.spectrum, channel: usableChannel(s.spectrum.channel, channels) });
+    syncTarget();
     spectrum.setPlaying(s.play.status === 'playing');
     const applyStill = () => {
       const now = useAudioStore.getState();
@@ -722,11 +767,20 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
   let curveSeq = 0;
   let curveKey = '';
   let curve: import('./spectrumController').EqCurve | null = null;
+  let lastTarget: number | null = null;
   const refreshEq = () => {
     const s = useAudioStore.getState();
+    // 見るイコライザが替わった：選んだバンドを外す（面によらない：右パネルの表は波形のときも出る）
+    const targetNow = spectrumTarget();
+    if (targetNow !== lastTarget) {
+      lastTarget = targetNow;
+      if (s.eqBand !== null) {
+        useAudioStore.setState({ eqBand: null });
+        return;
+      }
+    }
     if (s.face !== 'spectrum') {
       spectrum.setEqModel(null);
-      spectrum.setPostMode('shown');
       return;
     }
     const target = eqTargetParams();
@@ -738,7 +792,6 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
         : null;
     if (!params) {
       spectrum.setEqModel(null);
-      spectrum.setPostMode('shown');
       return;
     }
     // 選んだバンドが消えた（消した・取り消した）：外す
@@ -762,14 +815,20 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
           curve = { freqs: c.freqs, total: c.total, bands: c.bands };
           refreshEq();
         })
-        .catch(() => undefined);
+        .catch(() => {
+          // 求められない（引数が断られた）：古い曲線を残さない（点と食い違う）
+          if (seq !== curveSeq || live() !== rt) return;
+          curve = null;
+          refreshEq();
+        });
     }
     spectrum.setEqModel(model());
-    // 後の出し方：ドラッグ中・流し解きの間は「前 ＋ 曲線」（チャンネルが合えば）か、前の後を薄く（P9）
-    const busy = rt.dragging || (view?.solving ?? null) !== null;
-    spectrum.setPostMode(
-      !busy ? 'shown' : approxCompatible(params.bands, s.spectrum.channel) ? 'approx' : 'dim',
-    );
+    // 後の出し方：ドラッグ中・流し解きの間・離した直後（後が古い）は「前 ＋ 曲線」（チャンネルが合えば）か、前の後を
+    // 薄く（P9）
+    spectrum.setPostPolicy({
+      busy: rt.dragging || (view?.solving ?? null) !== null,
+      compatible: approxCompatible(params.bands, s.spectrum.channel),
+    });
   };
   const offAudio = useAudioStore.subscribe((s, before) => {
     controller.setOverlay(overlayOf(s));
@@ -798,14 +857,16 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
   // 選んだ操作・文書が変わったら、フェードの印を出し直し、面の見るノードを決め直す。イコライザをポインタで選んだ・足した
   // ときは、波形からスペクトルへ替える（↑↓ でたどって通っただけでは替えない）
   const offEditor = useEditorStore.subscribe((now, before) => {
-    // 手元のバンドの列：送った手の結果が確定した・文書が同じ値になったらやめる（ドラッグの間は残す）
+    // 手元のバンドの列：送った手の結果が確定したらやめる（ドラッグの間は残す。途中の結果がたまたま同じ値でもやめない：
+    // 続く手が古い文書を土台にしないため。手の番号がない（送れなかった）ときだけ文書と同じでやめる）
     const local = useAudioStore.getState().eqLocal;
     if (local && local.node !== null && !rt.dragging) {
-      const doc = readEq(now.doc.nodes[local.node]?.params).bands;
       const acked = local.ticket !== null && now.acked >= local.ticket;
-      if (acked || JSON.stringify(doc) === JSON.stringify(local.bands)) {
-        useAudioStore.setState({ eqLocal: null });
-      }
+      const same =
+        local.ticket === null &&
+        JSON.stringify(readEq(now.doc.nodes[local.node]?.params).bands) ===
+          JSON.stringify(local.bands);
+      if (acked || same) useAudioStore.setState({ eqLocal: null });
     }
     if (now.doc !== before.doc || now.selected !== before.selected) refreshEq();
     if (now.selected !== before.selected || now.doc !== before.doc) {
@@ -898,6 +959,10 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       applyLoudness(rt, view, s.loudness, info);
       controller.applyView(view, isWorkRequest(info.viewport));
       spectrum.applyView(view);
+      if (useAudioStore.getState().face === 'spectrum') {
+        syncTarget();
+        controller.setSpec(spectrum.specRequests());
+      }
       refreshEq();
       feed.setView(view, view.changed);
       const summary = summarizeAudioView(view);
@@ -1429,6 +1494,7 @@ export function setAudioDragging(on: boolean): void {
   if (!rt) return;
   rt.dragging = on;
   rt.controller.setInteracting(on);
+  rt.spectrum.setInteracting(on);
 }
 
 /** ドラッグの途中の手元の値。 */
