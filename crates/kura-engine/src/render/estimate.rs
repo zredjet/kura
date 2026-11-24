@@ -317,6 +317,9 @@ struct RegionCost {
     /// 申告の結果と、その流し解きの中で解いた上流の結果（入れ子）。`render_stage` は鍵ごとに 1 度だけ数え、このノードを
     /// 描いたあとの段に足し続ける（上流の結果は、このノードを描く間にも生きている）。
     held: BTreeMap<NodeId, Held>,
+    /// 流し解きの量（`presolve`）に結果を入れた申告の鍵（このノードのもの）。呼び手の帳簿が先に数えてあれば、その分だけを
+    /// 流し解きの量から引く。
+    presolve_keys: BTreeMap<NodeId, Vec<(NodeId, usize)>>,
 }
 
 /// 描画の終わりまで持つ解析の結果：（解析するノード, 申告の番号）→ 結果の見積もりのバイト数。同じ表は同じ鍵になるので、
@@ -672,15 +675,23 @@ impl Engine {
                 .iter()
                 .filter(|(k, _)| k.0 != node.id && !counted.contains(k))
                 .fold(0u64, |a, (_, b)| a.saturating_add(*b));
-            // このノードの結果が呼び手の帳簿で先に数えてある（流す出力・入れ子の窓）なら、作業領域と流し解きの項から引く
-            // （同じ表を 2 度数えない）
+            // このノードの結果が呼び手の帳簿で先に数えてある（流す出力・入れ子の窓）なら、作業領域（すべての申告の結果を含む）
+            // からはその分を、流し解きの項からは流して解く申告の分だけを引く（同じ表を 2 度数えない）
             let own_pre = held
                 .iter()
                 .filter(|(k, _)| k.0 == node.id && pre.contains(k))
                 .fold(0u64, |a, (_, b)| a.saturating_add(*b));
+            let streamed_pre =
+                region
+                    .and_then(|rc| rc.presolve_keys.get(&node.id))
+                    .map_or(0u64, |keys| {
+                        keys.iter().filter(|k| pre.contains(k)).fold(0u64, |a, k| {
+                            a.saturating_add(held.get(k).copied().unwrap_or(0))
+                        })
+                    });
             let (work, presolve) = (
                 work.saturating_sub(own_pre),
-                presolve.saturating_sub(own_pre),
+                presolve.saturating_sub(streamed_pre),
             );
             // 流し解きは核で描く前に終わる（入力の窓を流す間の最大と、描く間の最大の大きいほう）。描く間も、流し解きの中で
             // 解いた上流の結果は生きている
@@ -1003,6 +1014,7 @@ impl Engine {
                             _ => (0, Held::new()),
                         };
                         extra = extra.saturating_add(window).saturating_add(result);
+                        rc.presolve_keys.entry(*id).or_default().push((*id, k));
                         for (k, b) in inner_held {
                             let e = inner_all.entry(k).or_insert(0);
                             *e = (*e).max(b);
