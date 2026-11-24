@@ -30,7 +30,10 @@ export function PlayBar() {
   const shuffle = usePlayerStore((s) => s.queue?.playlist?.shuffle ?? s.shuffle);
   const controller = playerController();
   const item = snapshot.itemId !== null ? controller.item(snapshot.itemId) : undefined;
-  const duration = snapshot.durationMs ?? item?.durationMs ?? null;
+  const length = snapshot.durationMs ?? item?.durationMs ?? null;
+  // トリムの終わりがあれば、シークの範囲はそこまで（コントローラの seek と同じ終わり。ADR-230）
+  const trimEnd = usePlayerStore((s) => s.queue?.endMs[s.snapshot.index] ?? null);
+  const duration = slotEnd(length, trimEnd);
   const kindText = kindLabel(snapshot.kind);
 
   return (
@@ -137,6 +140,14 @@ export function PlayBar() {
       </div>
     </div>
   );
+}
+
+/** スロットの終わり（ms）：長さとトリムの終わりの早いほう。どちらも分からなければ null。 */
+export function slotEnd(length: number | null, trimEnd: number | null): number | null {
+  if (length === null) {
+    return trimEnd;
+  }
+  return trimEnd !== null ? Math.min(length, trimEnd) : length;
 }
 
 /** 「種類 · タグ · タグ」。 */

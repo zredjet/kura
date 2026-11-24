@@ -30,14 +30,15 @@ export function SeekRow({
   className?: string;
 }) {
   const [scrubbing, setScrubbing] = useState(false);
-  // ドラッグを始めたら時刻の欄を閉じる（開いたままだと、あとの Enter でドラッグの位置から打った時刻へ戻るため）
+  // ドラッグを始めたら・アイテムが替わったら時刻の欄を閉じる（開いたままだと、あとの Enter でドラッグの位置から
+  // 打った時刻へ戻る・前のアイテムのつもりの時刻で次のアイテムを飛ばすため）
   const [drags, setDrags] = useState(0);
   const length = durationMs !== null && durationMs > 0 ? durationMs : null;
   const off = disabled || length === null;
   return (
     <div className={[styles.row, className].filter(Boolean).join(' ')}>
       <TimeJump
-        key={drags}
+        key={`${String(resetKey)}:${drags}`}
         positionMs={positionMs}
         durationMs={length}
         onJump={onSeek}
