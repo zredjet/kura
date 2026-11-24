@@ -906,6 +906,13 @@ impl Editor {
         for input in st.inputs.values() {
             inputs_only.register_external(&input.value);
         }
+        // 握る計画の結果（古い計画の道。M17 段 3。空にしても入れ直す）も、空にしたあとに残る分に数える（駐車している間、
+        // 手ごとに空にし直さない）
+        if let Some(h) = st.audio.as_ref().and_then(|a| a.held.as_ref()) {
+            for (k, out, bytes) in &h.tables {
+                inputs_only.register_external_analysis(*k, out.clone(), *bytes);
+            }
+        }
         if st.cache.bytes() <= inputs_only.bytes() {
             return;
         }
@@ -2033,6 +2040,7 @@ fn finish_open(
             held: None,
             solve: None,
             stale: false,
+            solve_failed: None,
             #[cfg(test)]
             script: None,
         }

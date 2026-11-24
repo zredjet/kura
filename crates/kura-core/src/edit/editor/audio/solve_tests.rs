@@ -442,3 +442,125 @@ fn closing_drops_the_job_and_the_held_tables() {
     assert_eq!(u.standing, 0);
     assert_eq!(u.reserved, 0);
 }
+
+/// 見直しの直し：中止・予算の断りのほかの誤り（源が途中から読めない）が続いたら、仕事を捨てて錠の中で解く道で描き、誤りを
+/// 表示の失敗として知らせる（「変更を反映しています」のままにしない）。同じ鍵の列の間は戻らない。
+#[test]
+fn persistent_errors_fall_back_and_report() {
+    let env = Env::new();
+    let frames = 150 * C;
+    let bytes = noise_wav(8_000, 1, frames, 38);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let view = [(0, C)];
+    let s = env.open_with(id, vp(&view, false, false)).session.clone();
+    env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -1.0 }))],
+        &vp(&view, false, false),
+    );
+    // 開いたあとで元のファイルを半分に切る（遅延の源は 60 チャンクから先を読めない）
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let path = env.lib.layout().content_path(&hash, "wav");
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(44 + 60 * C * 2).unwrap();
+    drop(f);
+    let out = env.step(
+        &s,
+        vec![add(1, "audio.eq", eq(3.0))],
+        &vp(&view, false, false),
+    );
+    assert!(shown_audio(&out.view).solving.is_some());
+    let mut failed = false;
+    for _ in 0..50 {
+        script(&env, &s, 16);
+        let out = env.step(&s, Vec::new(), &vp(&view, true, false));
+        match &out.view {
+            crate::edit::editor::ViewOutcome::Shown(_) => {
+                assert!(shown_audio(&out.view).solving.is_some());
+            }
+            crate::edit::editor::ViewOutcome::Failed(_) => {
+                failed = true;
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(failed, "誤りを知らせない");
+    // 同じ鍵の列の間は裏の仕事に戻らない（錠の中で解いて、また失敗を知らせる）
+    let out = env.step(&s, Vec::new(), &vp(&view, false, false));
+    assert!(matches!(
+        out.view,
+        crate::edit::editor::ViewOutcome::Failed(_)
+    ));
+}
+
+/// 見直しの直し：仕事が解いた上流の結果がキャッシュから消えても（保存の駐車の `clear` など）、解き終えた区切りで今の計画を
+/// 描くときに錠の中で解き直さない（解けた結果を入れ直す）。
+#[test]
+fn solved_tables_survive_a_cleared_cache() {
+    let env = Env::new();
+    let frames = 150 * C;
+    let bytes = noise_wav(8_000, 1, frames, 39);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let view = [(2 * C, 3 * C)];
+    let s = env.open_with(id, vp(&view, false, false)).session.clone();
+    env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -1.0 }))],
+        &vp(&view, false, false),
+    );
+    // 正規化（上流の仕事）と EQ（下流の仕事）を足す
+    env.step(
+        &s,
+        vec![
+            add(
+                1,
+                "audio.normalize",
+                json!({ "target": -20.0, "peakLimit": null }),
+            ),
+            add(2, "audio.eq", eq(2.0)),
+        ],
+        &vp(&view, false, false),
+    );
+    // 上流の仕事を解き終えるまで進める（151 チャンク。下流の仕事に入る）
+    script(&env, &s, 160);
+    let out = env.step(&s, Vec::new(), &vp(&view, true, false));
+    assert!(shown_audio(&out.view).solving.unwrap() > 0.5);
+    // キャッシュを空にする（駐車と同じ：入力と握る結果は入れ直す）
+    {
+        let editor = env.editor(&s);
+        let mut guard = editor.lock_state();
+        let st = guard.as_mut().unwrap();
+        st.cache.clear();
+        for input in st.inputs.values() {
+            st.cache.register_external(&input.value);
+        }
+        editor.rehold(st);
+    }
+    let before = solves_in_cache(&env, &s);
+    let (_, done) = work_until_solved(&env, &s, &view, 400);
+    assert_eq!(
+        solves_in_cache(&env, &s) - before,
+        1,
+        "下流の表のほかに解き直した"
+    );
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 1)
+        .unwrap();
+    g.push_linear(
+        "audio.normalize",
+        1,
+        json!({ "target": -20.0, "peakLimit": null }),
+        2,
+    )
+    .unwrap();
+    g.push_linear("audio.eq", 1, eq(2.0), 3).unwrap();
+    same_as(
+        &env,
+        &s,
+        done.info.rev,
+        2 * C,
+        3 * C,
+        &rendered(&bytes, "wav", &g),
+    );
+}

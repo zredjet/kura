@@ -146,6 +146,8 @@ pub(crate) struct AudioState {
     pub(crate) solve: Option<solve::SolveRun>,
     /// 最後の表示は握る計画で描いた（頭より古い）。
     pub(crate) stale: bool,
+    /// 誤りが続いて捨てた流し解きの要る鍵の列（その間は錠の中で解く道で描いて誤りを知らせる）。
+    pub(crate) solve_failed: Option<Vec<kura_engine::render::cache::Fingerprint>>,
     /// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数で区切る（`slice::Limit::Chunks`）。
     #[cfg(test)]
     pub(crate) script: Option<u64>,
@@ -313,7 +315,15 @@ impl Editor {
         if let solve::Gate::Background = self.solve_gate(st, &full) {
             let done = match limit.as_mut() {
                 Some(l) => match self.advance_solve(st, l, &mut progress, ticket) {
-                    Ok(solve::Advanced::Done) => true,
+                    Ok(solve::Advanced::Done) => {
+                        // 解いた結果がキャッシュから消えていれば入れ直す（錠の中で解き直さない）
+                        self.restore_solved(st);
+                        true
+                    }
+                    Ok(solve::Advanced::Failed) => {
+                        self.fail_solve(st);
+                        true
+                    }
                     Ok(solve::Advanced::Pending) => false,
                     Err(_) => {
                         return if self.cancel.canceled() {
@@ -648,20 +658,23 @@ impl Editor {
             views.saturating_add(peaks)
         };
         let run = st.audio.as_ref().map_or(0, |a| a.peaks.run_bytes());
-        // 流し解きの作りかけ（進めている仕事の結果の見積もり。解けた結果はキャッシュが数える）
+        // 流し解きの作りかけ（進めている仕事の結果の見積もり）と、解けた結果のうちキャッシュにないもの（仕事だけが持つ。
+        // キャッシュにあるものはキャッシュが数える）
         let solving = st
             .audio
             .as_ref()
             .and_then(|a| a.solve.as_ref())
             .map_or(0, |s| {
-                let solved = s
-                    .job
-                    .finished()
+                let finished = s.job.finished();
+                let solved = finished.iter().fold(0u64, |a, x| a.saturating_add(x.bytes));
+                let uncached = finished
                     .iter()
+                    .filter(|x| !st.cache.contains_analysis(&x.key))
                     .fold(0u64, |a, x| a.saturating_add(x.bytes));
                 self.runtime
                     .preview(|e| s.job.held_bytes(e))
                     .saturating_sub(solved)
+                    .saturating_add(uncached)
             });
         st.lease
             .set_extra(bytes.saturating_add(run).saturating_add(solving));

@@ -32,8 +32,13 @@ use super::slice::{Limit, Pace, WorkProgress};
 /// docs/editing.md §18.5 の「手ごとに正で描く境」）。
 pub const SYNC_SOLVE_NS: f64 = 25_000_000.0;
 
-/// 1 回の step に渡すチャンクの数の上限（窓の 4 つ分。区切りの中で何度か step する）。
-const MAX_STEP_CHUNKS: u64 = 64;
+/// 1 回の step に渡すチャンクの数の上限（流れの窓 1 つ。区切りの中で何度か step する。区切りの前の確保の見積もりと同じ
+/// 大きさにする）。
+const MAX_STEP_CHUNKS: u64 = kura_engine::audio::stream::STREAM_CHUNKS as u64;
+
+/// 中止・予算の断りのほかの誤り（源の読み・上限など）が 1 つの仕事でこの回数になったら、仕事を捨てて錠の中で解く今までの道に
+/// 戻す（誤りを表示の失敗として知らせる。同じ鍵の列の間は戻さない）。
+const MAX_SOLVE_ERRORS: u32 = 3;
 
 /// 最後に公開した rev の計画と、その計画の申告した解析の結果（キャッシュに外の解析として入れて握る）。
 pub(crate) struct Held {
@@ -53,6 +58,8 @@ pub(crate) struct SolveRun {
     pub(crate) needed: Vec<Fingerprint>,
     pub(crate) job: PresolveJob,
     pub(crate) pace: Pace,
+    /// この仕事の誤りの数（誤りのあと、その仕事は最初から流し直すので、進んでも戻さない）。
+    pub(crate) errors: u32,
 }
 
 impl SolveRun {
@@ -81,6 +88,8 @@ pub(crate) enum Advanced {
     Done,
     /// 続きがある。
     Pending,
+    /// 誤りが続いた：仕事を捨てて、錠の中で解く今までの道で描く（誤りはそこで知らせる）。
+    Failed,
 }
 
 impl Editor {
@@ -112,18 +121,40 @@ impl Editor {
             .as_ref()
             .and_then(|a| a.held.as_ref())
             .is_some_and(|h| h.complete && h.rev != st.session.rev().0);
-        if !heavy || !usable {
+        let needed: Vec<Fingerprint> = missing.needed.iter().map(|(k, _)| *k).collect();
+        // 誤りが続いて捨てた鍵の列の間は、錠の中で解く道（誤りを知らせる）。列が変われば忘れる
+        let failed = st.audio.as_mut().is_some_and(|a| {
+            if a.solve_failed.as_ref().is_some_and(|f| *f != needed) {
+                a.solve_failed = None;
+            }
+            a.solve_failed.is_some()
+        });
+        if !heavy || !usable || failed {
             self.drop_solve(st);
             return Gate::Now;
         }
-        let needed: Vec<Fingerprint> = missing.needed.iter().map(|(k, _)| *k).collect();
-        if let Some(a) = st.audio.as_mut()
-            && a.solve.as_ref().is_none_or(|s| s.needed != needed)
-        {
+        let Some(a) = st.audio.as_mut() else {
+            return Gate::Now;
+        };
+        if a.solve.as_ref().is_none_or(|s| s.needed != needed) {
+            let mut job = PresolveJob::new(MissingSolves {
+                needed: missing.needed.clone(),
+                ..missing
+            });
+            // キャッシュにある上流の結果は仕事の中の表にも持つ（追い出されても入れ子に解き直さない）
+            job.seed(&missing.needed, &st.cache);
+            let mut pace = Pace::default();
+            if let Some(mut old) = a.solve.take() {
+                // 同じ鍵を流している途中なら引き継ぐ（下流の申告を足した手などで上流の作りかけを捨てない）
+                if job.adopt(&mut old.job) {
+                    pace = old.pace;
+                }
+            }
             a.solve = Some(SolveRun {
                 needed,
-                job: PresolveJob::new(MissingSolves { ..missing }),
-                pace: Pace::default(),
+                job,
+                pace,
+                errors: 0,
             });
         }
         Gate::Background
@@ -167,10 +198,13 @@ impl Editor {
             if run.job.is_done() {
                 return Ok(Advanced::Done);
             }
-            let n = limit.grant(&run.pace, MAX_STEP_CHUNKS);
+            // 今の仕事の残りで切る（区切りの前の確保の見積もりと、step が流す量を同じにする。仕事の境をまたがない）
+            let left = run.job.left_chunks();
+            let n = limit.grant(&run.pace, MAX_STEP_CHUNKS.min(left.max(1)));
             if n == 0 {
                 return Ok(Advanced::Pending);
             }
+            let n = if left == 0 { 0 } else { n };
             let Some((port, (a, b))) = run.job.next_span(n) else {
                 return Ok(Advanced::Done);
             };
@@ -204,6 +238,11 @@ impl Editor {
                 }
                 Err(e) if matches!(e.root(), EngineError::Canceled) => return Err(e),
                 Err(err) => {
+                    run.errors = run.errors.saturating_add(1);
+                    if run.errors >= MAX_SOLVE_ERRORS {
+                        tracing::warn!(%err, "流し解きの誤りが続いたので、錠の中で解きます");
+                        return Ok(Advanced::Failed);
+                    }
                     tracing::warn!(%err, "流し解きの区切りが失敗しました（次の区切りで続きから）");
                     progress.blocked = true;
                     return Ok(Advanced::Pending);
@@ -263,6 +302,31 @@ impl Editor {
             a.stale = false;
         }
         settle(st);
+    }
+
+    /// 仕事が解いた結果を、キャッシュから消えていれば外の解析として入れ直す（解き終えた区切りで今の計画を描く前。保存の駐車の
+    /// `clear`・追い出しのあとでも錠の中で解き直さない。続く公開で握る結果に替わる）。
+    pub(in crate::edit::editor) fn restore_solved(&self, st: &mut State) {
+        let solved: Vec<_> = st
+            .audio
+            .as_ref()
+            .and_then(|a| a.solve.as_ref())
+            .map(|s| s.job.finished().to_vec())
+            .unwrap_or_default();
+        for s in solved {
+            if !st.cache.contains_analysis(&s.key) {
+                st.cache.register_external_analysis(s.key, s.out, s.bytes);
+            }
+        }
+    }
+
+    /// 誤りが続いた仕事を捨て、その鍵の列を覚える（列が変わるまで錠の中で解く道で描く）。
+    pub(in crate::edit::editor) fn fail_solve(&self, st: &mut State) {
+        if let Some(a) = st.audio.as_mut()
+            && let Some(run) = a.solve.take()
+        {
+            a.solve_failed = Some(run.needed);
+        }
     }
 
     /// キャッシュを空にしたあと（保存の駐車）、握っている結果を入れ直す。

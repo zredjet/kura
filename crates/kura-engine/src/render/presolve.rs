@@ -121,6 +121,53 @@ impl PresolveJob {
         }
     }
 
+    /// キャッシュにある要る結果（`missing.needed` のうち仕事にならなかったもの）を仕事の中の表に入れる（キャッシュから追い
+    /// 出されても、後ろの仕事の窓の描画が上流を入れ子に解き直さない）。`needed` は [`MissingSolves::needed`]。
+    pub fn seed(&mut self, needed: &[(Fingerprint, u64)], cache: &NodeCache) {
+        for (key, _) in needed {
+            if let Some(out) = cache.peek_analysis(key) {
+                self.presolved.insert(*key, out);
+            }
+        }
+    }
+
+    /// 前の仕事 `old` が進めていた流しを、同じ鍵の仕事を最初に解くなら引き継ぐ（下流の申告を足した手などで、上流の作りかけを
+    /// 捨てない）。引き継いだら true。
+    pub fn adopt(&mut self, old: &mut PresolveJob) -> bool {
+        let (Some(first), Some(prev)) = (self.tasks.get(self.at), old.tasks.get(old.at)) else {
+            return false;
+        };
+        if first.key != prev.key {
+            return false;
+        }
+        let taken = old
+            .running
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(solving) = taken else {
+            return false;
+        };
+        *self
+            .running
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = Some(solving);
+        for (k, v) in &old.presolved {
+            self.presolved.entry(*k).or_insert_with(|| v.clone());
+        }
+        true
+    }
+
+    /// 今の仕事の残りのチャンクの数（なければ 0）。
+    pub fn left_chunks(&self) -> u64 {
+        let Some(t) = self.tasks.get(self.at) else {
+            return 0;
+        };
+        t.frames
+            .saturating_sub(self.pos())
+            .div_ceil(AUDIO_CHUNK as u64)
+    }
+
     /// 仕事（上流から順）。
     pub fn tasks(&self) -> &[SolveTask] {
         &self.tasks
@@ -272,7 +319,14 @@ impl PresolveJob {
                 );
                 left = left.saturating_sub(n);
                 used = used.saturating_add(n);
-                r?;
+                if let Err(e) = r {
+                    // 中止のほかの誤り（源の読み・上限など）は、受け手が窓の途中まで進んでいることがある（`TableBuilder::feed`
+                    // は組ごとに食べる）ので、この仕事を最初からやり直す
+                    if !matches!(e.root(), EngineError::Canceled) {
+                        *running = None;
+                    }
+                    return Err(e);
+                }
             }
             if solving.pos < task.frames {
                 break;
