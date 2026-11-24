@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EQ・スペクトルの画面案</title>
+<style>
+/* docs/design/tokens.css の写し（2026-11-24。この案のファイルだけで開けるように。正本は tokens.css） */
+/*
+ * Kura デザイントークン
+ * 実装時は src/styles/tokens.css にコピーして使う。値の正本はこのファイル。
+ * 色はダーク基調のみ（v1）。ライトモードは v2 で検討。
+ */
+
+:root {
+  /* ---- 書体 ---- */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", "Hiragino Kaku Gothic ProN", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+
+  --text-2xs: 10px;   /* kbd の小さい表示 */
+  --text-xs: 11px;    /* 見出しラベル、補足、バッジ */
+  --text-sm: 12px;    /* チップ、メタ情報 */
+  --text-md: 13px;    /* 本文の基準（UI の既定） */
+  --text-lg: 14px;    /* 強調した本文、候補行 */
+  --text-xl: 15px;    /* パネルの見出し、入力欄（パレット） */
+  --text-2xl: 17px;   /* ダイアログの見出し */
+  --text-3xl: 20px;   /* 画面の見出し */
+  --text-4xl: 30px;   /* プレイリストのタイトル */
+  --text-specimen: 40px;  /* フォントの見本（インスペクタ・クイックルックのプレビュー。M11） */
+
+  --weight-regular: 400;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --leading-tight: 1.35;
+  --leading-body: 1.55;
+
+  /* ---- 地の色 ---- */
+  --bg-window: #121214;          /* ウィンドウ全体の地 */
+  --bg-theater: #08080A;         /* シアター表示の地 */
+  --bg-media: #0B0B0D;           /* プレビュー枠の地 */
+  --bg-input: rgba(0, 0, 0, 0.22);
+
+  /* ---- ガラス面（浮いている部品だけに使う）---- */
+  --glass-panel: rgba(38, 38, 43, 0.86);      /* サイドバー、インスペクタ、右パネル */
+  --glass-capsule: rgba(44, 44, 50, 0.84);    /* ミニプレーヤー、再生バー */
+  --glass-dialog: rgba(40, 40, 46, 0.94);     /* ⌘K パレット、シート */
+  --glass-blur: blur(28px) saturate(150%);
+  --glass-blur-strong: blur(32px) saturate(160%);
+  --scrim: rgba(6, 6, 8, 0.56);               /* ダイアログの背面 */
+
+  /* ---- 塗り（白の重ね）---- */
+  --fill-1: rgba(255, 255, 255, 0.05);  /* 控えめなチップ、統計の箱 */
+  --fill-2: rgba(255, 255, 255, 0.07);  /* ボタン、入力の地 */
+  --fill-3: rgba(255, 255, 255, 0.10);  /* トークン、ホバー */
+  --fill-selected: rgba(255, 255, 255, 0.11);  /* 選択中の行 */
+  --fill-pressed: rgba(255, 255, 255, 0.16);   /* 押下中・オンのセグメント */
+  --fill-track: rgba(255, 255, 255, 0.14);     /* プログレスの溝 */
+
+  /* ---- 線 ---- */
+  --stroke-1: rgba(255, 255, 255, 0.07);  /* 区切り線 */
+  --stroke-2: rgba(255, 255, 255, 0.08);  /* パネル・チップの縁 */
+  --stroke-3: rgba(255, 255, 255, 0.12);  /* ダイアログの縁、入力の縁 */
+  --stroke-kbd: rgba(255, 255, 255, 0.16);
+  --stroke-dashed: rgba(255, 255, 255, 0.30);  /* 除外条件、追加ボタン */
+
+  /* ---- 文字色 ---- */
+  --text-primary: #F4F4F6;
+  --text-secondary: #C2C2CA;
+  --text-tertiary: #A3A3AC;    /* 暗い地の上でも 4.5:1 以上 */
+  --text-on-media: #FFFFFF;    /* サムネイル上のバッジ */
+
+  /* ---- アクセント（1 色のみ）---- */
+  --accent: #FF7A45;           /* 柿色。選択リング、主ボタン、再生位置、オンのスイッチ */
+  --on-accent: #1C0E07;        /* アクセントの上の文字 */
+
+  /* ---- 状態色 ---- */
+  --warning: #F2C14E;
+  --danger-text: #FF9A8A;
+
+  /* ---- フォルダの色（ラベル用、文字色には使わない）---- */
+  --folder-blue: #6FB1FF;
+  --folder-violet: #C49BFF;
+  --folder-amber: #FFB35C;
+  --folder-teal: #5FD4C4;
+
+  /* ---- 素材の表示（M11）---- */
+  --checker-a: #2A2A2F;        /* 透過の下地の市松模様：地（--bg-media より少し明るい無彩色） */
+  --checker-b: #1E1E22;        /* 市松模様：マス */
+  --checker-size: 16px;        /* 市松模様の 2×2 の一辺（1 マス 8px。画面に固定で、拡大率で変えない） */
+  --loop-region: color-mix(in srgb, var(--accent) 22%, transparent);  /* 波形のループの区間 */
+
+  /* ---- 音声エディタ（M13）---- */
+  --wave-selection: color-mix(in srgb, var(--text-primary) 14%, transparent);  /* 波形の選択の地 */
+  --wave-outside: rgba(6, 6, 8, 0.62);                                         /* 切り詰めの外の暗さ */
+  --h-wave-ruler: 20px;     /* 波形の目盛り */
+  --h-wave-overview: 24px;  /* 波形の全体図 */
+
+  /* ---- 角丸 ---- */
+  --radius-xs: 5px;    /* kbd */
+  --radius-sm: 7px;    /* タグ、トークン、小さなサムネ */
+  --radius-md: 8px;    /* タイル、入力、選択肢ボタン、サイドバー行 */
+  --radius-lg: 12px;   /* 行（候補・キュー）、統計の箱、カード */
+  --radius-xl: 16px;   /* パネル */
+  --radius-2xl: 22px;  /* ダイアログ、再生バー */
+  --radius-pill: 999px;
+
+  /* ---- 余白（4 の倍数を基本に 2/6/10/14 を補助で使う）---- */
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-3-5: 14px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ---- 部品の高さ ---- */
+  --h-toolbar: 36px;
+  --h-chip: 28px;
+  --h-sidebar-row: 32px;
+  --h-list-row: 52px;
+  --h-button: 34px;
+  --h-button-lg: 38px;
+  --h-switch: 20px;
+  --w-sidebar: 248px;
+  --w-inspector: 300px;
+  --w-queue: 340px;
+  --h-waveform: 48px;    /* インスペクタの波形（M11） */
+
+  /* ---- 影 ---- */
+  --shadow-panel: 0 10px 30px rgba(0, 0, 0, 0.32);
+  --shadow-capsule: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.55);
+  --shadow-media: 0 30px 80px rgba(0, 0, 0, 0.50);
+
+  /* ---- 選択リング（タイル）---- */
+  --ring-selected: inset 0 0 0 2.5px var(--accent), inset 0 0 0 5px rgba(18, 18, 20, 0.85);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent);
+
+  /* ---- 動き ---- */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-fade: 300ms;   /* BGM のフェードと同じ長さ */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* 「透明度を下げる」：ガラスを不透明な面に置き換える */
+:root[data-reduce-transparency="true"] {
+  --glass-panel: #26262B;
+  --glass-capsule: #2C2C32;
+  --glass-dialog: #28282E;
+  --glass-blur: none;
+  --glass-blur-strong: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-base: 0ms;
+  }
+}
+</style>
+<style>
+/*
+ * docs/proposals/audio-eq-dynamics.md の画面のイメージ（案）。値は見た目のための作り物。
+ * 色・余白・角丸・文字は tokens.css の変数だけを使う。下の「トークンの案」だけが新しい変数で、承認されたら tokens.css へ移す。
+ */
+:root {
+  /* ===== トークンの案（スペクトル・EQ・ダイナミクス） ===== */
+  --spec-post: color-mix(in srgb, var(--text-secondary) 16%, transparent);       /* 後のスペクトルの塗り */
+  --spec-post-line: color-mix(in srgb, var(--text-secondary) 50%, transparent);  /* 後のスペクトルの縁 */
+  --spec-pre: color-mix(in srgb, var(--text-tertiary) 55%, transparent);         /* 前のスペクトルの線 */
+  --spec-hold: color-mix(in srgb, var(--text-primary) 26%, transparent);         /* 最大の保持 */
+  --eq-band: color-mix(in srgb, var(--text-tertiary) 70%, transparent);          /* 各バンドの曲線 */
+  --eq-band-fill: color-mix(in srgb, var(--accent) 16%, transparent);            /* 選んだバンドが効く帯 */
+  --gr-fill: color-mix(in srgb, var(--accent) 18%, transparent);                 /* ゲインリダクションの重ね */
+  --spectro-0: #0B0B0D;  /* スペクトログラムの色の表（弱い → 強い）。--bg-media から柿色を経て淡い色へ */
+  --spectro-1: #2A1B3D;
+  --spectro-2: #7A2E4F;
+  --spectro-3: #FF7A45;
+  --spectro-4: #FFE6C2;
+  --note: var(--warning);  /* この案の注釈の番号（画面の部品ではない） */
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: var(--space-6);
+  background: var(--bg-window);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  line-height: var(--leading-tight);
+}
+h1 { margin: 0 0 var(--space-2); font-size: var(--text-3xl); }
+.lead { margin: 0 0 var(--space-6); color: var(--text-secondary); line-height: var(--leading-body); max-width: 960px; }
+.screen { margin-bottom: 48px; }
+.screen > h2 { margin: 0 0 var(--space-3); font-size: var(--text-2xl); }
+.fit { position: relative; width: 100%; max-width: 1440px; overflow: hidden; border-radius: var(--radius-lg); }
+.win { position: absolute; top: 0; left: 0; width: 1440px; height: 900px; transform-origin: top left; }
+.notes { margin: var(--space-3) 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: var(--space-2) var(--space-6); max-width: 1440px; }
+.notes li { display: flex; gap: var(--space-2); color: var(--text-secondary); line-height: var(--leading-body); }
+.notes b { color: var(--text-primary); font-weight: var(--weight-semibold); }
+.num { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: var(--radius-pill); background: var(--note); color: var(--bg-window); font-size: var(--text-xs); font-weight: var(--weight-bold); }
+.badge { position: absolute; z-index: 5; display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: var(--radius-pill); background: var(--note); color: var(--bg-window); font-size: var(--text-xs); font-weight: var(--weight-bold); box-shadow: 0 0 0 3px var(--bg-theater); pointer-events: none; }
+
+/* ===== エディタの殻（src/features/editor/Editor.module.css と同じ形） ===== */
+.editor { position: absolute; inset: 0; display: flex; gap: var(--space-2-5); padding: var(--space-2-5); background: var(--bg-theater); }
+.stage { position: relative; flex: 1; min-width: 0; border-radius: var(--radius-xl); overflow: hidden; background: var(--bg-media); }
+.lights { position: absolute; top: 18px; left: 18px; display: flex; gap: 8px; }
+.lights i { width: 12px; height: 12px; border-radius: var(--radius-pill); background: var(--fill-3); }
+.top { position: absolute; top: var(--space-3); left: calc(var(--space-6) * 3 + var(--space-1)); right: var(--space-3); display: flex; align-items: center; gap: var(--space-3); }
+.round { display: flex; flex: none; align-items: center; justify-content: center; width: 36px; height: 36px; border: 1px solid var(--stroke-3); border-radius: var(--radius-pill); background: var(--fill-3); color: var(--text-primary); }
+.heading { flex: 0 1 268px; min-width: 0; margin-right: auto; display: flex; flex-direction: column; gap: 1px; }
+.title { font-size: var(--text-xl); font-weight: var(--weight-semibold); }
+.meta { font-size: var(--text-sm); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: default; }
+.pill { display: inline-flex; align-items: center; gap: var(--space-1); height: 30px; padding: 0 var(--space-3); border-radius: var(--radius-pill); background: var(--fill-3); border: 1px solid var(--stroke-3); font-size: var(--text-sm); white-space: nowrap; }
+.pill.on { background: var(--fill-pressed); }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--radius-pill); background: var(--fill-2); border: 1px solid var(--stroke-2); }
+.seg button { height: 24px; padding: 0 var(--space-2-5); border-radius: var(--radius-pill); font-size: var(--text-sm); color: var(--text-secondary); white-space: nowrap; }
+.seg button[aria-pressed='true'] { background: var(--fill-pressed); color: var(--text-primary); }
+.seg kbd { margin-left: var(--space-1); font-family: var(--font-ui); font-size: var(--text-2xs); color: var(--text-tertiary); }
+.viewSeg { position: absolute; top: 15px; left: 50%; transform: translateX(-50%); }
+.viewSeg .seg button { height: 26px; padding: 0 var(--space-3); }
+
+/* 舞台の中 */
+.layer { position: absolute; display: block; }
+.ruler-text { font-size: var(--text-xs); fill: var(--text-tertiary); }
+.chips { position: absolute; display: flex; gap: var(--space-1-5); }
+.chip { display: inline-flex; align-items: center; gap: var(--space-1); height: 24px; padding: 0 var(--space-2-5); border-radius: var(--radius-pill); background: var(--scrim); border: 1px solid var(--stroke-2); font-size: var(--text-xs); color: var(--text-secondary); white-space: nowrap; }
+.swatch { display: inline-block; width: 14px; height: 8px; border-radius: 2px; }
+.corner { position: absolute; bottom: var(--space-5); display: flex; flex-direction: column; gap: var(--space-1); max-width: 204px; }
+.corner.left { left: var(--space-4); align-items: flex-start; }
+.corner.right { right: var(--space-4); align-items: flex-end; max-width: 160px; }
+.tag { padding: 3px var(--space-2); border-radius: var(--radius-pill); background: var(--scrim); font-size: var(--text-xs); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.tag.dim { color: var(--text-tertiary); }
+.zoom { display: flex; align-items: center; gap: var(--space-1); padding: 3px; border-radius: var(--radius-pill); background: var(--scrim); }
+.zoom button { width: 22px; height: 22px; border-radius: var(--radius-pill); color: var(--text-secondary); font-size: var(--text-md); }
+.zoom span { font-size: var(--text-xs); color: var(--text-tertiary); padding: 0 var(--space-1); }
+.legend { display: flex; align-items: center; gap: var(--space-1-5); }
+.legend .bar { width: 96px; height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--spectro-0), var(--spectro-1), var(--spectro-2), var(--spectro-3), var(--spectro-4)); border: 1px solid var(--stroke-2); }
+
+/* 下のカプセル（音声エディタ：左下 204px・右下 160px を避けた帯の真ん中。2 段） */
+.capsule { position: absolute; bottom: var(--space-5); left: calc(var(--space-4) + 204px + var(--space-2)); right: calc(var(--space-4) + 160px + var(--space-2)); width: fit-content; margin-inline: auto; display: flex; flex-direction: column; gap: var(--space-1-5); padding: var(--space-2) var(--space-3); border: 1px solid var(--stroke-3); border-radius: var(--radius-2xl); background: var(--glass-capsule); box-shadow: var(--shadow-capsule); -webkit-backdrop-filter: var(--glass-blur-strong); backdrop-filter: var(--glass-blur-strong); font-size: var(--text-sm); white-space: nowrap; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2-5); }
+.grp { display: flex; align-items: center; gap: var(--space-1-5); }
+.icon { display: flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: var(--radius-pill); color: var(--text-primary); }
+.icon.on { background: var(--fill-pressed); }
+.time { font-variant-numeric: tabular-nums; color: var(--text-secondary); padding: 0 var(--space-1); }
+.hint { font-size: var(--text-xs); color: var(--text-secondary); }
+.readout { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.readout em { font-style: normal; color: var(--text-tertiary); }
+
+/* 右パネル（340px のガラス） */
+.panel { flex: none; width: var(--w-queue); display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-4) var(--space-2-5) var(--space-3); border-radius: var(--radius-xl); background: var(--glass-panel); border: 1px solid var(--stroke-2); box-shadow: var(--shadow-panel); overflow: hidden; }
+.panelTitle { margin: 0; padding: 0 var(--space-1-5); font-size: var(--text-xl); font-weight: var(--weight-semibold); }
+.ops { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: var(--space-0-5); }
+.op { display: flex; align-items: center; gap: var(--space-2); height: 36px; padding: 0 var(--space-2) 0 var(--space-2-5); border-radius: var(--radius-md); background: var(--fill-1); font-size: var(--text-md); }
+.op[data-selected] { background: var(--fill-selected); box-shadow: inset 2px 0 0 var(--accent); }
+.op .name { flex: none; }
+.op .sum { flex: 1; min-width: 0; color: var(--text-tertiary); font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.switch { flex: none; position: relative; width: 32px; height: var(--h-switch); border-radius: var(--radius-pill); background: var(--fill-track); }
+.switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: var(--radius-pill); background: var(--text-secondary); }
+.switch.on { background: var(--accent); }
+.switch.on::after { left: 14px; background: var(--text-on-media); }
+.switch.sm { width: 26px; height: 16px; }
+.switch.sm::after { width: 12px; height: 12px; }
+.switch.sm.on::after { left: 12px; }
+.add { display: flex; align-items: center; justify-content: center; height: 32px; border-radius: var(--radius-md); border: 1px dashed var(--stroke-dashed); color: var(--text-secondary); font-size: var(--text-sm); }
+.sep { height: 1px; background: var(--stroke-1); margin: 0 var(--space-1-5); }
+.params { display: flex; flex-direction: column; gap: var(--space-3); padding: 0 var(--space-1-5); min-height: 0; }
+.phead { display: flex; align-items: baseline; justify-content: space-between; }
+.phead h3 { margin: 0; font-size: var(--text-lg); font-weight: var(--weight-semibold); }
+.phead span { font-size: var(--text-xs); color: var(--text-tertiary); }
+.frow { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); font-size: var(--text-sm); color: var(--text-secondary); }
+.field { display: inline-flex; align-items: center; justify-content: flex-end; height: 28px; min-width: 84px; padding: 0 var(--space-2); border-radius: var(--radius-md); background: var(--bg-input); border: 1px solid var(--stroke-3); color: var(--text-primary); font-variant-numeric: tabular-nums; font-size: var(--text-sm); }
+.field.sel { justify-content: space-between; gap: var(--space-2); }
+.field.sel::after { content: '▾'; color: var(--text-tertiary); font-size: var(--text-2xs); }
+.fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2) var(--space-3); }
+.fgrid label { display: flex; flex-direction: column; gap: 3px; font-size: var(--text-xs); color: var(--text-tertiary); }
+.fgrid .field { width: 100%; }
+.bands { width: 100%; border-collapse: separate; border-spacing: 0 2px; font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.bands th { text-align: right; font-weight: var(--weight-regular); font-size: var(--text-2xs); color: var(--text-tertiary); padding: 0 var(--space-1); }
+.bands th:first-child, .bands th:nth-child(2) { text-align: left; }
+.bands td { text-align: right; padding: 0 var(--space-1); height: 28px; background: var(--fill-1); color: var(--text-secondary); }
+.bands td:first-child { border-radius: var(--radius-md) 0 0 var(--radius-md); text-align: left; }
+.bands td:last-child { border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+.bands td:nth-child(2) { text-align: left; color: var(--text-primary); }
+.bands tr[data-selected] td { background: var(--fill-selected); color: var(--text-primary); }
+.bands tr[data-off] td { color: var(--text-tertiary); }
+.bn { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: var(--radius-pill); border: 1.5px solid var(--text-secondary); font-size: var(--text-2xs); color: var(--text-primary); }
+tr[data-selected] .bn { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+tr[data-off] .bn { border-style: dashed; color: var(--text-tertiary); }
+.box { display: flex; flex-direction: column; gap: var(--space-2-5); padding: var(--space-3); border-radius: var(--radius-lg); background: var(--fill-1); border: 1px solid var(--stroke-2); }
+.box h4 { margin: 0; font-size: var(--text-md); font-weight: var(--weight-semibold); display: flex; align-items: center; gap: var(--space-2); }
+.btns { display: flex; gap: var(--space-2); }
+.btns .pill { flex: 1; justify-content: center; }
+.meters { display: flex; gap: var(--space-2-5); align-items: flex-end; }
+.meter { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: var(--text-2xs); color: var(--text-tertiary); }
+.meter .tube { position: relative; width: 10px; height: 176px; border-radius: 5px; background: var(--fill-track); overflow: hidden; }
+.meter .lvl { position: absolute; left: 0; right: 0; bottom: 0; background: var(--text-secondary); }
+.meter .gr { position: absolute; left: 0; right: 0; top: 0; background: var(--accent); }
+.meter b { font-weight: var(--weight-regular); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.tooltip { position: absolute; padding: var(--space-1-5) var(--space-2-5); border-radius: var(--radius-md); background: var(--glass-dialog); border: 1px solid var(--stroke-3); box-shadow: var(--shadow-panel); font-size: var(--text-xs); color: var(--text-secondary); line-height: 1.5; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tooltip strong { color: var(--text-primary); font-weight: var(--weight-semibold); }
+</style>
+</head>
+<body>
+<h1>音声エディタの EQ・スペクトル・ダイナミクスの画面案</h1>
+<p class="lead">docs/proposals/audio-eq-dynamics.md の D4（スペクトルの面の置き場）・D9（試聴だけの重ね）と §4 の画面のイメージです。窓は 1440 × 900pt、殻（舞台・右パネル 340px・下のカプセル・上部）は今の音声エディタと同じ形です。音・曲線・数値は見た目のための作り物です。色は tokens.css の変数だけで、新しい色（スペクトル・GR・スペクトログラムの色の表）はこのファイルの冒頭に「トークンの案」として分けてあります。黄色の番号はこの案の注釈で、画面の部品ではありません。</p>
+
+<section class="screen" id="screen1">
+  <h2>1. スペクトルで EQ を直す（M17）</h2>
+  <div class="fit"><div class="win"></div></div>
+  <ol class="notes">
+    <li><span class="num">1</span><span><b>表示の切り替え</b>（D4）。上部の中央に「波形｜スペクトル｜スペクトログラム」。EQ のノードを選ぶ・足すとスペクトルに替わる。ADR-177 の改訂（道具ではなく表示の切り替えで、同じボタンはほかにない）。左の名前と情報の行は、切り替えの左端までで省略する。</span></li>
+    <li><span class="num">2</span><span><b>細い波形の帯</b>。曲の全体・選択・再生位置を残し、時間の操作はここで行う。止まっているときのアナライザは、この選択の平均。</span></li>
+    <li><span class="num">3</span><span><b>アナライザ</b>（D3）。後（塗り）・前（線）・最大の保持（細い線）。再生中は鳴っている位置、止まっていれば選択の平均。左の目盛りが EQ の dB、右がスペクトルの dBFS。</span></li>
+    <li><span class="num">4</span><span><b>曲線</b>。合成の曲線は柿色、各バンドは細い線。選んだバンドは効く帯を塗り、左右の小さな印で Q の幅をつかめる。オフのバンドは点線の点で、合成に入らない。</span></li>
+    <li><span class="num">5</span><span><b>山をつかむ</b>。ポインタの近くのスペクトルの山に印を出し、そこからドラッグするとその周波数にバンドができる。ホバーで周波数・音名・スペクトルと曲線の dB。</span></li>
+    <li><span class="num">6</span><span><b>右パネルの引数</b>。位相（最小｜直線）・出力の利得・バンドの表・選んだバンドの欄・［ソロで聴く］。値の欄は右パネルだけに置く（同じ欄を 2 か所に置かない）。</span></li>
+    <li><span class="num">7</span><span><b>試聴だけの重ね</b>（D9）。聞き比べの隣に「音量をそろえる」、カプセルの下の段に「EQ を外して聞く」。どちらも文書に入らず、取り消しの外。</span></li>
+    <li><span class="num">8</span><span><b>色</b>。アクセントは合成の曲線と選んだバンドだけ（「色はメディアとアクセント 1 色だけ」の方針どおり、バンドごとに色を変えない）。</span></li>
+  </ol>
+</section>
+
+<section class="screen" id="screen2">
+  <h2>2. スペクトログラム（M17）</h2>
+  <div class="fit"><div class="win"></div></div>
+  <ol class="notes">
+    <li><span class="num">1</span><span><b>時間×周波数の面</b>。チャンネルごとの段・目盛り・全体図は波形と同じで、ズーム・パン・選択・ループ・再生位置もそのまま使える。縦は対数の周波数。</span></li>
+    <li><span class="num">2</span><span><b>色の表</b>はトークンの案 <code>--spectro-0〜4</code>（地 → 柿色 → 淡い色）。凡例は表示の設定の並びに。Rust が強さを配り、色はトークンから（塗る側は段 6 で決める）。</span></li>
+    <li><span class="num">3</span><span><b>表示の設定</b>（どのノードの前・後を見るか、チャンネルを分ける｜和・L・R・M・S、下限の dB）。表示だけの設定で文書に入らない。</span></li>
+    <li><span class="num">4</span><span><b>2.8 kHz の細い線</b>は EQ のバンド 3 で減らした共振（「EQ の前」に替えると強く見える）。後の候補「時間×周波数の範囲を選んで減らす」はこの面の上に作る（M17 は表示だけ）。</span></li>
+  </ol>
+</section>
+
+<section class="screen" id="screen3">
+  <h2>3. ダイナミクス：コンプとゲインリダクションの重ね（M18）</h2>
+  <div class="fit"><div class="win"></div></div>
+  <ol class="notes">
+    <li><span class="num">1</span><span><b>ゲインリダクションを曲の全体に重ねる</b>。各段の上から下へ、どこでどれだけ効いたかが一目で分かる。最も深い所に印。あとから描くので、再生しなくても全体が見える。</span></li>
+    <li><span class="num">2</span><span><b>伝達の曲線</b>。しきい値・比・ニーをドラッグで直す。点は再生位置（止まっていればカーソル）の入力のレベル。</span></li>
+    <li><span class="num">3</span><span><b>メーター</b>（入力・出力・GR）。ADR-177 で退けたメーターを入れる改訂。</span></li>
+    <li><span class="num">4</span><span><b>スタイル</b>（D8：クリーン｜パンチ｜オプト）と引数。サイドチェーンのフィルタは［スペクトルで直す］でスペクトルの面に移って直す。</span></li>
+  </ol>
+</section>
+
+<script>
+'use strict';
+const tok = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const hexRgb = (h) => { h = h.replace('#', ''); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
+function rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) >>> 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const fmt = (s) => { const m = Math.floor(s / 60); return `${m}:${(s - m * 60).toFixed(3).padStart(6, '0')}`; };
+const fmtShort = (s) => { const m = Math.floor(s / 60); return `${m}:${String(Math.round(s - m * 60)).padStart(2, '0')}`; };
+const DUR = 192.5;
+
+// ===== 曲の作り物：音量の包絡 =====
+function env(t) {
+  const sec = [[0, 0.16], [8, 0.42], [40, 0.78], [72, 0.24], [80, 0.48], [112, 0.84], [150, 0.4], [170, 0.7], [DUR, 0.0]];
+  let a = 0;
+  for (let i = 0; i < sec.length - 1; i++) {
+    if (t >= sec[i][0] && t < sec[i + 1][0]) { a = i === sec.length - 2 ? sec[i][1] * (1 - (t - sec[i][0]) / (sec[i + 1][0] - sec[i][0])) : sec[i][1]; break; }
+  }
+  const beat = 0.72 + 0.28 * Math.exp(-(t % 0.5) / 0.09);
+  return a * beat;
+}
+
+// ===== アイコン（stroke 1.8〜2.0、currentColor） =====
+const ic = {
+  back: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
+  info: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></svg>',
+  toStart: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5v14M18 6l-9 6 9 6z"/></svg>',
+  stop: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>',
+  play: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><path d="M8 5.5v13l10-6.5z"/></svg>',
+  loop: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>',
+  match: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10v4h3l4 3V7l-4 3z"/><path d="M14.5 10h6M14.5 14h6"/></svg>',
+  hp: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 19c4 0 5-11 9-11h9"/></svg>',
+  bellDown: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 9h4c2 0 3 7 5 7s3-7 5-7h4"/></svg>',
+  bellUp: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 15h4c2 0 3-7 5-7s3 7 5 7h4"/></svg>',
+  shelfHi: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 15h7c3 0 3-6 6-6h5"/></svg>',
+  pointer: '<svg width="18" height="22" viewBox="0 0 18 22"><path d="M2 2l13 9.5-6 .8 3.6 7-2.4 1.2-3.6-7L2 17z" style="fill:var(--text-on-media);stroke:var(--bg-theater);stroke-width:1.2;stroke-linejoin:round"/></svg>',
+};
+
+// ===== 殻 =====
+function shell({ view, meta, stage, panel, row2, hint, left, right, badges }) {
+  const views = ['波形', 'スペクトル', 'スペクトログラム'];
+  return `
+  <div class="editor">
+    <div class="stage">
+      <div class="lights"><i></i><i></i><i></i></div>
+      <div class="top">
+        <button class="round" aria-label="閉じる">${ic.back}</button>
+        <div class="heading"><span class="title">夜の街.wav</span><span class="meta">${meta}</span></div>
+        <button class="round" aria-label="情報">${ic.info}</button>
+        <button class="pill">保存 <span style="color:var(--text-tertiary);font-size:var(--text-2xs)">▾</span></button>
+      </div>
+      <div class="viewSeg"><div class="seg" role="group" aria-label="表示">${views.map((v, i) => `<button aria-pressed="${i === view}">${v}</button>`).join('')}</div></div>
+      ${stage}
+      <div class="corner left">${left}</div>
+      <div class="corner right">${right}</div>
+      <div class="capsule">
+        <div class="row">
+          <div class="grp">
+            <button class="icon" aria-label="先頭へ">${ic.toStart}</button>
+            <button class="icon" aria-label="止める">${ic.stop}</button>
+            <button class="icon" aria-label="ループを試聴">${ic.loop}</button>
+            <div class="seg" role="group" aria-label="聞き比べ"><button aria-pressed="false">元<kbd>B</kbd></button><button aria-pressed="true">編集後</button></div>
+            <button class="icon on" aria-label="音量をそろえる" title="音量をそろえる">${ic.match}</button>
+            <span class="time">0:42.318 / 3:12.500</span>
+          </div>
+          <div class="seg" role="group" aria-label="道具"><button aria-pressed="true">選択<kbd>S</kbd></button><button aria-pressed="false">切り詰め<kbd>T</kbd></button><button aria-pressed="false">フェード<kbd>F</kbd></button><button aria-pressed="false">ループ<kbd>R</kbd></button></div>
+        </div>
+        <div class="row">${row2}</div>
+        ${hint ? `<div class="hint">${hint}</div>` : ''}
+      </div>
+    </div>
+    <aside class="panel">${panel}</aside>
+  </div>
+  ${badges.map(([n, x, y]) => `<span class="badge" style="left:${x}px;top:${y}px">${n}</span>`).join('')}`;
+}
+
+function opsList(rows, selected) {
+  return `<h2 class="panelTitle">操作</h2>
+  <ul class="ops">${rows.map(([name, sum, on], i) => `<li class="op"${i === selected ? ' data-selected' : ''}><span class="name">${name}</span><span class="sum">${sum}</span><span class="switch sm${on ? ' on' : ''}"></span></li>`).join('')}</ul>
+  <button class="add">＋ 操作を追加</button>`;
+}
+
+// 時刻の目盛り（刻みの間は 72px 以上）
+function rulerSvg(w, t0, t1, y = 14) {
+  const steps = [1, 2, 5, 10, 15, 30, 60];
+  const pxPerSec = w / (t1 - t0);
+  const step = steps.find((s) => s * pxPerSec >= 72) || 60;
+  let out = '';
+  for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
+    const x = (t - t0) * pxPerSec;
+    out += `<line x1="${x}" y1="${y + 2}" x2="${x}" y2="20" style="stroke:var(--stroke-3)"/><text class="ruler-text" x="${x + 4}" y="${y}">${fmtShort(t)}</text>`;
+  }
+  return out;
+}
+
+function canvasOf(el, w, h) {
+  const c = document.createElement('canvas');
+  const dpr = 2;
+  c.width = w * dpr; c.height = h * dpr; c.style.width = `${w}px`; c.style.height = `${h}px`;
+  const ctx = c.getContext('2d'); ctx.scale(dpr, dpr); el.appendChild(c); return ctx;
+}
+
+function drawWave(ctx, x, y, w, h, t0, t1, seed, color) {
+  const r = rng(seed); ctx.fillStyle = color;
+  const mid = y + h / 2;
+  for (let i = 0; i < w; i++) {
+    const t = t0 + (t1 - t0) * (i + 0.5) / w;
+    const a = Math.min(1, env(t) * (0.55 + 0.45 * r()));
+    const up = a * h / 2 * (0.86 + 0.14 * r()), dn = a * h / 2 * (0.86 + 0.14 * r());
+    ctx.fillRect(x + i, mid - up, 1, Math.max(1, up + dn));
+  }
+}
+
+// ===== EQ の作り物（見た目のための RBJ。本物の式は D6 で決める） =====
+const FS = 48000;
+function biquad(type, f0, g, q) {
+  const A = Math.pow(10, g / 40), w0 = 2 * Math.PI * f0 / FS, c = Math.cos(w0), s = Math.sin(w0), al = s / (2 * q);
+  if (type === 'bell') return [1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A];
+  if (type === 'hp') return [(1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al];
+  if (type === 'shelfHi') { const sa = 2 * Math.sqrt(A) * al; return [A * ((A + 1) + (A - 1) * c + sa), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - sa), (A + 1) - (A - 1) * c + sa, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - sa]; }
+}
+function magDb(bq, f) {
+  const w = 2 * Math.PI * f / FS, c1 = Math.cos(w), s1 = Math.sin(w), c2 = Math.cos(2 * w), s2 = Math.sin(2 * w);
+  const [b0, b1, b2, a0, a1, a2] = bq;
+  const nr = b0 + b1 * c1 + b2 * c2, ni = -(b1 * s1 + b2 * s2), dr = a0 + a1 * c1 + a2 * c2, di = -(a1 * s1 + a2 * s2);
+  return 10 * Math.log10((nr * nr + ni * ni) / (dr * dr + di * di));
+}
+const BANDS = [
+  { n: 1, type: 'hp', icon: 'hp', label: 'ローカット', f: 30, g: 0, q: 0, slope: '24 dB/oct', ch: 'ステレオ', on: true, parts: [biquad('hp', 30, 0, 0.5412), biquad('hp', 30, 0, 1.3066)] },
+  { n: 2, type: 'bell', icon: 'bellDown', label: 'ベル', f: 180, g: -3.0, q: 1.0, ch: 'M', on: true },
+  { n: 3, type: 'bell', icon: 'bellDown', label: 'ベル', f: 2800, g: -5.0, q: 6.0, ch: 'ステレオ', on: true },
+  { n: 4, type: 'shelfHi', icon: 'shelfHi', label: 'ハイシェルフ', f: 9000, g: 2.5, q: 0.707, ch: 'ステレオ', on: true },
+  { n: 5, type: 'bell', icon: 'bellUp', label: 'ベル', f: 450, g: 1.5, q: 0.8, ch: 'S', on: false },
+];
+for (const b of BANDS) if (!b.parts) b.parts = [biquad(b.type, b.f, b.g, b.q)];
+const bandDb = (b, f) => b.parts.reduce((s, p) => s + magDb(p, f), 0);
+const eqDb = (f) => BANDS.filter((b) => b.on).reduce((s, b) => s + bandDb(b, f), 0);
+
+// ===== スペクトルの作り物（dBFS） =====
+const gauss = (f, fc, sig) => Math.exp(-0.5 * Math.pow(Math.log2(f / fc) / sig, 2));
+const addDb = (a, b) => 10 * Math.log10(Math.pow(10, a / 10) + Math.pow(10, b / 10));
+function preSpec(f, r) {
+  const lf = Math.log2(f / 150);
+  let s = -31 - (lf > 0 ? 4.1 * lf : -lf * 1.5);
+  if (f < 45) s -= 16 * Math.log2(45 / f);
+  if (f > 16000) s -= 24 * Math.log2(f / 16000);
+  s += 3 * gauss(f, 11000, 0.5);
+  for (const root of [110, 146.8, 220]) for (let k = 1; k <= 12; k++) {
+    const fk = root * k; if (fk > 8000) break;
+    s = addDb(s, -27 - 1.6 * k - 1.2 * Math.log2(root / 110) * 4 + 10 * Math.log10(gauss(f, fk, 0.018) + 1e-9));
+  }
+  s = addDb(s, -22 + 10 * Math.log10(gauss(f, 2800, 0.06) + 1e-9));   // 耳障りな共振
+  s = addDb(s, -24 + 10 * Math.log10(gauss(f, 1180, 0.03) + 1e-9));   // 山（つかむ例）
+  return s + (r() - 0.5) * 2.4;
+}
+
+// ===== 画面 1：スペクトル =====
+function screen1(win) {
+  const SW = 1070, SH = 880;
+  // 周波数と dB の写し（面の中の座標）
+  const PL = 16, PT = 148, PW = SW - 32, PH = SH - PT - 140;
+  const X0 = 36, X1 = PW - 44, Y0 = 30, Y1 = PH - 20;
+  const fx = (f) => X0 + (X1 - X0) * Math.log(f / 20) / Math.log(24000 / 20);
+  const eqY = (db) => Y0 + (Y1 - Y0) * (0.5 - db / 24);
+  const spY = (db) => Y0 + (Y1 - Y0) * (-db / 90);
+  const N = 520, fr = [], pre = [], post = [], hold = [];
+  const r = rng(7);
+  for (let i = 0; i < N; i++) { const f = 20 * Math.pow(24000 / 20, i / (N - 1)); fr.push(f); pre.push(preSpec(f, r)); }
+  for (let i = 0; i < N; i++) { const sm = (pre[Math.max(0, i - 1)] + 2 * pre[i] + pre[Math.min(N - 1, i + 1)]) / 4; pre[i] = sm; post.push(sm + eqDb(fr[i]) + (r() - 0.5) * 1.2); }
+  for (let i = 0; i < N; i++) { let m = -200; for (let j = Math.max(0, i - 3); j <= Math.min(N - 1, i + 3); j++) m = Math.max(m, post[j]); hold.push(m + 4 + r() * 1.5); }
+  const line = (ys, yf) => ys.map((v, i) => `${i ? 'L' : 'M'}${fx(fr[i]).toFixed(1)},${yf(Math.max(-90, Math.min(0, v))).toFixed(1)}`).join('');
+  const postPath = `${line(post, spY)}L${fx(24000)},${Y1}L${fx(20)},${Y1}Z`;
+  const eqLine = (fn) => fr.map((f, i) => `${i ? 'L' : 'M'}${fx(f).toFixed(1)},${eqY(Math.max(-14, Math.min(14, fn(f)))).toFixed(1)}`).join('');
+  const sel = BANDS[2];
+  const selFill = `${eqLine((f) => bandDb(sel, f))}L${fx(24000)},${eqY(0)}L${fx(20)},${eqY(0)}Z`;
+  // 格子
+  let grid = '';
+  for (const f of [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]) {
+    const x = fx(f);
+    grid += `<line x1="${x}" y1="${Y0}" x2="${x}" y2="${Y1}" style="stroke:var(--stroke-1)"/><text class="ruler-text" x="${x}" y="${Y1 + 15}" text-anchor="middle">${f >= 1000 ? `${f / 1000}k` : f}</text>`;
+  }
+  for (const db of [12, 6, 0, -6, -12]) {
+    const y = eqY(db);
+    grid += `<line x1="${X0}" y1="${y}" x2="${X1}" y2="${y}" style="stroke:${db === 0 ? 'var(--stroke-3)' : 'var(--stroke-1)'}"/><text class="ruler-text" x="${X0 - 6}" y="${y + 4}" text-anchor="end">${db > 0 ? '+' : ''}${db}</text>`;
+  }
+  for (const db of [0, -20, -40, -60, -80]) grid += `<text class="ruler-text" x="${X1 + 6}" y="${spY(db) + 4}" style="fill:var(--text-tertiary);opacity:.8">${db}</text>`;
+  grid += `<text class="ruler-text" x="${X0 - 6}" y="${Y0 - 12}" text-anchor="end">dB</text><text class="ruler-text" x="${X1 + 6}" y="${Y0 - 12}">dBFS</text>`;
+  // バンドの曲線と点
+  let bands = '';
+  for (const b of BANDS) if (b.on) bands += `<path d="${eqLine((f) => bandDb(b, f))}" style="fill:none;stroke:var(--eq-band);stroke-width:1"/>`;
+  let points = '';
+  for (const b of BANDS) {
+    const x = fx(b.f), y = eqY(b.type === 'hp' ? 0 : b.g);
+    const isSel = b === sel;
+    points += `<g><circle cx="${x}" cy="${y}" r="9.5" style="fill:${isSel ? 'var(--accent)' : 'var(--bg-media)'};stroke:${isSel ? 'var(--accent)' : b.on ? 'var(--text-primary)' : 'var(--text-tertiary)'};stroke-width:1.6;${b.on ? '' : 'stroke-dasharray:2.5 2'}"/><text x="${x}" y="${y + 3.6}" text-anchor="middle" style="font-size:10px;font-weight:700;fill:${isSel ? 'var(--on-accent)' : b.on ? 'var(--text-primary)' : 'var(--text-tertiary)'}">${b.n}</text></g>`;
+  }
+  // 選んだバンドの Q の幅の印
+  const bw = 1 / sel.q, fl = sel.f / Math.pow(2, bw / 2), fh = sel.f * Math.pow(2, bw / 2), yq = eqY(sel.g / 2);
+  const qMarks = [fl, fh].map((f) => `<line x1="${fx(f)}" y1="${yq - 7}" x2="${fx(f)}" y2="${yq + 7}" style="stroke:var(--accent);stroke-width:2;stroke-linecap:round"/>`).join('');
+  // 山をつかむ
+  let pk = 0; for (let i = 0; i < N; i++) if (fr[i] > 1050 && fr[i] < 1320 && (pk === 0 || post[i] > post[pk])) pk = i;
+  const px = fx(fr[pk]), py = spY(post[pk]);
+  const grab = `<circle cx="${px}" cy="${py}" r="7" style="fill:none;stroke:var(--text-primary);stroke-width:1.5"/><path d="M${px - 3.5},${py}h7M${px},${py - 3.5}v7" style="stroke:var(--text-primary);stroke-width:1.5;stroke-linecap:round"/><line x1="${px}" y1="${py + 9}" x2="${px}" y2="${Y1}" style="stroke:var(--text-primary);stroke-width:1;stroke-dasharray:2 3;opacity:.45"/>`;
+  const plane = `<svg class="layer" style="left:${PL}px;top:${PT}px" width="${PW}" height="${PH}">
+    ${grid}
+    <path d="${postPath}" style="fill:var(--spec-post);stroke:var(--spec-post-line);stroke-width:1"/>
+    <path d="${line(pre, spY)}" style="fill:none;stroke:var(--spec-pre);stroke-width:1"/>
+    <path d="${line(hold, spY)}" style="fill:none;stroke:var(--spec-hold);stroke-width:1"/>
+    <path d="${selFill}" style="fill:var(--eq-band-fill)"/>
+    ${bands}
+    <path d="${eqLine(eqDb)}" style="fill:none;stroke:var(--accent);stroke-width:2.2;stroke-linejoin:round"/>
+    ${qMarks}${grab}${points}
+  </svg>`;
+  const tipX = PL + px + 18, tipY = PT + py + 14;
+  const stage = `
+    <div class="layer" id="s1-strip" style="left:16px;top:60px;width:${SW - 32}px;height:72px"></div>
+    ${plane}
+    <div class="chips" style="left:${PL + X0}px;top:${PT + 2}px">
+      <span class="chip"><span class="swatch" style="background:var(--spec-post);border:1px solid var(--spec-post-line)"></span>後</span>
+      <span class="chip"><span class="swatch" style="border-top:1.5px solid var(--spec-pre);height:0;margin-top:2px"></span>前</span>
+      <span class="chip"><span class="swatch" style="border-top:1.5px solid var(--spec-hold);height:0;margin-top:2px"></span>最大の保持</span>
+    </div>
+    <div class="chips" style="right:${16 + 44}px;top:${PT + 2}px">
+      <button class="chip">和 ▾</button><button class="chip">±12 dB ▾</button><button class="chip">傾き 4.5 dB/oct ▾</button>
+    </div>
+    <div class="tooltip" style="left:${tipX}px;top:${tipY}px"><strong>1.18 kHz</strong> · D6 −8¢<br>スペクトル ${post[pk].toFixed(1)} dB · 曲線 ${eqDb(fr[pk]).toFixed(1)} dB<br><span style="color:var(--text-tertiary)">ドラッグしてこの山にバンドを作る</span></div>
+    <span class="layer" style="left:${PL + px + 5}px;top:${PT + py + 3}px">${ic.pointer}</span>`;
+  const bandRows = BANDS.map((b) => `<tr${b === sel ? ' data-selected' : ''}${b.on ? '' : ' data-off'}><td><span class="bn">${b.n}</span></td><td><span style="display:inline-flex;vertical-align:middle;color:var(--text-secondary)">${ic[b.icon]}</span></td><td>${b.f >= 1000 ? `${(b.f / 1000).toFixed(2)} kHz` : `${b.f} Hz`}</td><td>${b.type === 'hp' ? '—' : `${b.g > 0 ? '+' : b.g < 0 ? '−' : ''}${Math.abs(b.g).toFixed(1)}`}</td><td>${b.type === 'hp' ? b.slope.replace(' dB/oct', '') : b.q.toFixed(2)}</td><td>${b.ch}</td><td><span class="switch sm${b.on ? ' on' : ''}" style="display:inline-block;vertical-align:middle"></span></td></tr>`).join('');
+  const panel = `${opsList([['切り詰め', '0:00.120 – 3:12.500', true], ['フェード', '入 0.05 s · 出 2.00 s', true], ['EQ', '4 バンド · 最小位相', true], ['ラウドネスをそろえる', '−16 LUFS', true]], 2)}
+    <div class="sep"></div>
+    <div class="params">
+      <div class="phead"><h3>EQ</h3><span>5 バンドのうち 4 つが有効</span></div>
+      <div class="frow">位相<div class="seg"><button aria-pressed="true">最小</button><button aria-pressed="false">直線</button></div></div>
+      <div class="frow">出力の利得<span class="field">0.0 dB</span></div>
+      <table class="bands"><thead><tr><th></th><th>型</th><th>周波数</th><th>利得</th><th>Q／傾き</th><th>ch</th><th></th></tr></thead><tbody>${bandRows}</tbody></table>
+      <div class="box">
+        <h4><span class="bn" style="background:var(--accent);border-color:var(--accent);color:var(--on-accent)">3</span>バンド 3</h4>
+        <div class="fgrid">
+          <label>型<span class="field sel">ベル</span></label>
+          <label>チャンネル<span class="field sel">ステレオ</span></label>
+          <label>周波数<span class="field">2.80 kHz</span></label>
+          <label>利得<span class="field">−5.0 dB</span></label>
+          <label>Q<span class="field">6.00</span></label>
+          <label>傾き<span class="field" style="color:var(--text-tertiary)">—</span></label>
+        </div>
+        <div class="btns"><button class="pill">ソロで聴く</button><button class="pill">バンドを消す</button></div>
+      </div>
+    </div>`;
+  win.innerHTML = shell({
+    view: 1,
+    meta: '48 kHz · 24 ビット · ステレオ · 3:12.500 · WAV · 未保存',
+    stage, panel,
+    row2: `<span class="readout"><em>バンド 3</em>　ベル · 2.80 kHz · −5.0 dB · Q 6.00</span><button class="pill">EQ を外して聞く</button>`,
+    hint: '空きをダブルクリックでバンドを足し、山からドラッグで作ります。⌥ を押しながら点を押している間は、その帯だけを鳴らします',
+    left: '<span class="tag dim">アナライザ：再生位置</span><span class="tag">選択 0:38.000 – 0:46.000（0:08.000）</span>',
+    right: '<span class="tag dim">20 Hz – 24 kHz</span>',
+    badges: [[1, 10 + 760, 10 + 17], [2, 10 + 4, 10 + 92], [3, 10 + 16 + 36 + 236, 10 + 148 + 4], [4, 590, 520], [5, 10 + 16 + 540, 10 + 148 + 238], [6, 1066, 300], [7, 479, 757], [8, 930, 360]],
+  });
+  // 細い波形の帯（目盛り 20px＋曲の全体 52px。選択・再生位置）
+  const strip = win.querySelector('#s1-strip');
+  const w = SW - 32;
+  strip.insertAdjacentHTML('beforeend', `<svg class="layer" style="left:0;top:0" width="${w}" height="20">${rulerSvg(w, 0, DUR)}</svg>`);
+  const host = document.createElement('div'); host.className = 'layer'; host.style.cssText = 'left:0;top:20px'; strip.appendChild(host);
+  const ctx = canvasOf(host, w, 52);
+  drawWave(ctx, 0, 2, w, 48, 0, DUR, 11, tok('--text-secondary'));
+  const sx = (t) => t / DUR * w;
+  strip.insertAdjacentHTML('beforeend', `<div class="layer" style="left:${sx(38)}px;top:0;width:${sx(46) - sx(38)}px;height:72px;background:var(--wave-selection)"></div><div class="layer" style="left:${sx(42.318)}px;top:0;width:1.5px;height:72px;background:var(--accent)"></div><div class="layer" style="left:0;top:71px;width:${w}px;height:1px;background:var(--stroke-1)"></div>`);
+}
+
+// ===== スペクトログラムの作り物 =====
+function spectroLane(ctx, w, h, t0, t1, seed) {
+  const stops = ['--spectro-0', '--spectro-1', '--spectro-2', '--spectro-3', '--spectro-4'].map((n) => hexRgb(tok(n)));
+  const img = ctx.createImageData(w, h);
+  const r = rng(seed);
+  const chords = [[110, 138.6, 164.8], [87.3, 110, 130.8], [130.8, 164.8, 196], [98, 123.5, 146.8]];
+  const mel = [440, 493.9, 523.3, 587.3, 659.3, 587.3, 523.3, 493.9, 392, 440];
+  const freqs = [], lfs = [];
+  for (let j = 0; j < h; j++) { const f = 24000 * Math.pow(20 / 24000, j / (h - 1)); freqs.push(f); lfs.push(Math.log2(f)); }
+  for (let i = 0; i < w; i++) {
+    const t = t0 + (t1 - t0) * i / w;
+    const e = Math.max(0.02, env(t));
+    const comps = [];
+    const ch = chords[Math.floor(t / 2) % 4];
+    for (const n of ch) for (let k = 1; k <= 14; k++) comps.push([Math.log2(n * k), Math.pow(10, (-38 - 2.4 * k + 20 * Math.log10(e)) / 10), 0.012]);
+    const m = mel[Math.floor(t / 0.5) % mel.length] * (1 + 0.004 * Math.sin(t * 34));
+    const mp = (t % 0.5) / 0.5;
+    for (let k = 1; k <= 9; k++) comps.push([Math.log2(m * k), Math.pow(10, (-24 - 3 * k + 20 * Math.log10(e) - mp * 6) / 10), 0.01]);
+    comps.push([Math.log2(2800), Math.pow(10, (-60 + 6 * e) / 10), 0.03]);
+    const bp = t % 0.5, hp = (t + 0.25) % 0.5;
+    for (let j = 0; j < h; j++) {
+      const f = freqs[j], lf = lfs[j];
+      let p = Math.pow(10, (-92 + 10 * e - 3 * Math.log2(Math.max(f, 50) / 1000)) / 10);
+      if (f < 160) p += Math.pow(10, (-30 + 20 * Math.log10(e) - bp / 0.07 * 8.7 - 12 * Math.max(0, lf - Math.log2(55)) - 10 * Math.max(0, Math.log2(45) - lf)) / 10);
+      if (bp < 0.02) p += Math.pow(10, (-46 - 4 * Math.abs(lf - Math.log2(400))) / 10);
+      if (hp < 0.08 && f > 5000) p += Math.pow(10, (-56 - hp / 0.02 * 8.7 - 3 * Math.abs(lf - Math.log2(10000))) / 10);
+      for (const [lc, a, sg] of comps) { const d = (lf - lc) / sg; if (d > -4 && d < 4) p += a * Math.exp(-0.5 * d * d); }
+      if (f > 16000) p *= Math.pow(16000 / f, 6);
+      let v = (10 * Math.log10(p) + 96) / 90 + (r() - 0.5) * 0.03;
+      v = Math.max(0, Math.min(1, v));
+      const s = v * 4, k = Math.min(3, Math.floor(s)), u = s - k;
+      const o = (j * w + i) * 4;
+      for (let c = 0; c < 3; c++) img.data[o + c] = stops[k][c] + (stops[k + 1][c] - stops[k][c]) * u;
+      img.data[o + 3] = 255;
+    }
+  }
+  return img;
+}
+
+function lanesFrame(SW, t0, t1) {
+  // 目盛り 20px・全体図 24px・段 2 つ（波形の面と同じ並び）
+  const w = SW - 32, top = 60, laneTop = top + 20 + 24 + 8, laneH = Math.floor((880 - laneTop - 140 - 6) / 2);
+  return { w, top, laneTop, laneH };
+}
+
+function overviewHtml(w, t0, t1) {
+  return `<div class="layer" style="left:0;top:20px;width:${w}px;height:24px;background:var(--fill-1);border-radius:4px"></div>
+    <div class="layer ov" style="left:0;top:20px"></div>
+    <div class="layer" style="left:${t0 / DUR * w}px;top:20px;width:${(t1 - t0) / DUR * w}px;height:24px;background:var(--fill-2);border:1px solid var(--text-secondary);border-radius:3px"></div>`;
+}
+
+// ===== 画面 2：スペクトログラム =====
+function screen2(win) {
+  const SW = 1070, t0 = 30, t1 = 55;
+  const { w, top, laneTop, laneH } = lanesFrame(SW, t0, t1);
+  const tx = (t) => (t - t0) / (t1 - t0) * w;
+  const fy = (f) => laneH * Math.log(24000 / f) / Math.log(24000 / 20);
+  let flabels = '';
+  for (const f of [100, 1000, 10000]) flabels += `<span class="layer ruler-text" style="left:6px;top:${fy(f) - 7}px;font-size:var(--text-xs);color:var(--text-on-media);opacity:.75">${f >= 1000 ? `${f / 1000}k` : f}</span>`;
+  const lane = (k) => `<div class="layer lane" data-k="${k}" style="left:16px;top:${laneTop + k * (laneH + 6)}px;width:${w}px;height:${laneH}px;border-radius:4px;overflow:hidden">${flabels}<span class="layer" style="right:8px;top:6px;font-size:var(--text-xs);color:var(--text-on-media);opacity:.75">${k ? 'R' : 'L'}</span></div>`;
+  const stage = `
+    <div class="layer" style="left:16px;top:${top}px;width:${w}px;height:44px">
+      <svg class="layer" style="left:0;top:0" width="${w}" height="20">
+        <rect x="${tx(34)}" y="0" width="${tx(50) - tx(34)}" height="20" style="fill:var(--loop-region)"/>
+        ${rulerSvg(w, t0, t1)}
+        <rect x="${tx(34)}" y="0" width="1" height="20" style="fill:var(--accent)"/><rect x="${tx(50)}" y="0" width="1" height="20" style="fill:var(--accent)"/>
+      </svg>
+      ${overviewHtml(w, t0, t1)}
+    </div>
+    ${lane(0)}${lane(1)}
+    <div class="layer" style="left:${16 + tx(38)}px;top:${laneTop}px;width:${tx(41.5) - tx(38)}px;height:${laneH * 2 + 6}px;background:var(--wave-selection);border-left:1px solid var(--text-primary);border-right:1px solid var(--text-primary)"></div>
+    <div class="layer" style="left:${16 + tx(40.2)}px;top:${top}px;width:1.5px;height:${laneH * 2 + 6 + laneTop - top}px;background:var(--accent)"></div>
+    <div class="chips" style="right:16px;top:${laneTop + 6}px;margin-right:24px">
+      <button class="chip">EQ の後 ▾</button><button class="chip">チャンネルを分ける ▾</button><button class="chip">下限 −90 dB ▾</button><span class="chip legend">−90<span class="bar"></span>0 dB</span>
+    </div>`;
+  win.innerHTML = shell({
+    view: 2,
+    meta: '48 kHz · 24 ビット · ステレオ · 3:12.500 · WAV · 未保存',
+    stage,
+    panel: `${opsList([['切り詰め', '0:00.120 – 3:12.500', true], ['フェード', '入 0.05 s · 出 2.00 s', true], ['EQ', '4 バンド · 最小位相', true], ['ラウドネスをそろえる', '−16 LUFS', true]], -1)}
+      <div class="sep"></div>
+      <p style="margin:0;padding:0 var(--space-1-5);font-size:var(--text-sm);color:var(--text-tertiary);line-height:var(--leading-body)">操作を選ぶと、ここで引数を直せます。EQ を選ぶとスペクトルに替わります。</p>`,
+    row2: `<div class="grp"><span class="hint">始め</span><span class="field" style="min-width:92px">0:38.000</span><span class="hint">終わり</span><span class="field" style="min-width:92px">0:41.500</span></div><div class="grp"><button class="pill">切り詰める</button><button class="pill">ループにする</button></div>`,
+    hint: '',
+    left: '<span class="tag">選択 0:38.000 – 0:41.500（0:03.500）</span>',
+    right: '<span class="zoom"><button aria-label="縮小">−</button><span>25 秒</span><button aria-label="拡大">＋</button></span>',
+    badges: [[1, 10 + 16 + 120, 10 + laneTop + 60], [2, 10 + 1070 - 54, 10 + laneTop - 18], [3, 10 + 1070 - 490, 10 + laneTop - 18], [4, 10 + 16 + 640, 10 + laneTop + fy(2800) - 26]],
+  });
+  for (const el of win.querySelectorAll('.lane')) {
+    const k = Number(el.dataset.k);
+    const c = document.createElement('canvas'); c.width = w; c.height = laneH; c.style.cssText = `position:absolute;left:0;top:0;width:${w}px;height:${laneH}px`;
+    el.prepend(c);
+    c.getContext('2d').putImageData(spectroLane(c.getContext('2d'), w, laneH, t0, t1, 21 + k), 0, 0);
+  }
+  const ov = win.querySelector('.ov'); const octx = canvasOf(ov, w, 24); drawWave(octx, 0, 2, w, 20, 0, DUR, 5, tok('--text-tertiary'));
+}
+
+// ===== 画面 3：ダイナミクス =====
+function screen3(win) {
+  const SW = 1070, t0 = 30, t1 = 90;
+  const { w, top, laneTop, laneH } = lanesFrame(SW, t0, t1);
+  const tx = (t) => (t - t0) / (t1 - t0) * w;
+  const thr = -18, ratio = 4, knee = 6;
+  const grOf = (lv) => { const x = lv - thr; if (2 * x < -knee) return 0; if (2 * Math.abs(x) <= knee) return (1 / ratio - 1) * Math.pow(x + knee / 2, 2) / (2 * knee); return (1 / ratio - 1) * x; };
+  // GR の系列（1 列ごと、attack・release の一次の平滑）
+  const gr = []; let g = 0; const r = rng(3);
+  for (let i = 0; i < w; i++) {
+    const t = t0 + (t1 - t0) * (i + 0.5) / w;
+    const lv = 20 * Math.log10(Math.max(1e-4, env(t) * (0.8 + 0.2 * r()))) - 8;
+    const target = -grOf(lv);
+    g += (target > g ? 0.55 : 0.08) * (target - g);
+    gr.push(g);
+  }
+  let maxI = 0; gr.forEach((v, i) => { if (v > gr[maxI]) maxI = i; });
+  const grH = laneH * 0.42, gy = (db) => Math.min(1, db / 12) * grH;
+  const grSvg = (k) => {
+    const y0 = laneTop + k * (laneH + 6);
+    const pts = gr.map((v, i) => `${i},${(y0 + gy(v)).toFixed(1)}`).join(' L');
+    let ticks = '';
+    for (const db of [6, 12]) ticks += `<line x1="${w - 30}" y1="${y0 + gy(db)}" x2="${w}" y2="${y0 + gy(db)}" style="stroke:var(--stroke-3)"/><text class="ruler-text" x="${w - 4}" y="${y0 + gy(db) - 3}" text-anchor="end">−${db}</text>`;
+    return `<path d="M0,${y0} L${pts} L${w},${y0} Z" style="fill:var(--gr-fill)"/><path d="M${pts}" style="fill:none;stroke:var(--accent);stroke-width:1.5"/>${ticks}<text class="ruler-text" x="${w - 4}" y="${y0 + 12}" text-anchor="end">GR</text>`;
+  };
+  const mx = tx(t0 + (t1 - t0) * (maxI + 0.5) / w), my = laneTop + gy(gr[maxI]);
+  const stage = `
+    <div class="layer" style="left:16px;top:${top}px;width:${w}px;height:44px">
+      <svg class="layer" style="left:0;top:0" width="${w}" height="20">${rulerSvg(w, t0, t1)}</svg>
+      ${overviewHtml(w, t0, t1)}
+    </div>
+    <div class="layer wl" data-k="0" style="left:16px;top:${laneTop}px"></div>
+    <div class="layer wl" data-k="1" style="left:16px;top:${laneTop + laneH + 6}px"></div>
+    <div class="layer" style="left:16px;top:${laneTop + laneH + 2}px;width:${w}px;height:1px;background:var(--stroke-1)"></div>
+    <svg class="layer" style="left:16px;top:0" width="${w}" height="880">${grSvg(0)}${grSvg(1)}
+      <circle cx="${mx}" cy="${my}" r="4" style="fill:var(--accent)"/></svg>
+    <div class="tooltip" style="left:${16 + mx + 10}px;top:${my + 6}px"><strong>GR 最大 −${gr[maxI].toFixed(1)} dB</strong><br>${fmt(t0 + (t1 - t0) * (maxI + 0.5) / w)}</div>
+    <div class="layer" style="left:${16 + tx(42.318)}px;top:${top}px;width:1.5px;height:${laneH * 2 + 6 + laneTop - top}px;background:var(--accent)"></div>`;
+  // 伝達の曲線（入力 −48〜0 dB → 出力）
+  const S = 176, ax = (db) => (db + 48) / 48 * S, ay = (db) => S - (db + 48) / 48 * S;
+  let curve = ''; for (let i = 0; i <= 96; i++) { const x = -48 + i * 0.5; curve += `${i ? 'L' : 'M'}${ax(x).toFixed(1)},${ay(x + grOf(x)).toFixed(1)}`; }
+  let tgrid = ''; for (const d of [-36, -24, -12]) tgrid += `<line x1="${ax(d)}" y1="0" x2="${ax(d)}" y2="${S}" style="stroke:var(--stroke-1)"/><line x1="0" y1="${ay(d)}" x2="${S}" y2="${ay(d)}" style="stroke:var(--stroke-1)"/>`;
+  const lvNow = -9.4;
+  const transfer = `<svg width="${S + 26}" height="${S + 20}" style="overflow:visible">
+    <g transform="translate(22,0)">
+      <rect x="0" y="0" width="${S}" height="${S}" rx="6" style="fill:var(--bg-input);stroke:var(--stroke-2)"/>
+      ${tgrid}
+      <line x1="0" y1="${S}" x2="${S}" y2="0" style="stroke:var(--stroke-dashed);stroke-dasharray:3 3"/>
+      <line x1="${ax(thr)}" y1="0" x2="${ax(thr)}" y2="${S}" style="stroke:var(--text-tertiary);stroke-dasharray:2 3"/>
+      <path d="${curve}" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+      <circle cx="${ax(thr)}" cy="${ay(thr + grOf(thr))}" r="6" style="fill:var(--bg-media);stroke:var(--text-primary);stroke-width:1.6"/>
+      <circle cx="${ax(lvNow)}" cy="${ay(lvNow + grOf(lvNow))}" r="4.5" style="fill:var(--accent);stroke:var(--text-on-media);stroke-width:1"/>
+      <text class="ruler-text" x="${S / 2}" y="${S + 15}" text-anchor="middle">入力（dB）</text>
+      <text class="ruler-text" x="-6" y="${S / 2}" text-anchor="middle" transform="rotate(-90 -6 ${S / 2})">出力</text>
+    </g></svg>`;
+  const meter = (label, val, lv, isGr) => `<div class="meter"><span class="tube">${isGr ? `<span class="gr" style="height:${lv}%"></span>` : `<span class="lvl" style="height:${lv}%"></span>`}</span><b>${val}</b>${label}</div>`;
+  const panel = `${opsList([['EQ', '4 バンド · 最小位相', true], ['コンプ', 'パンチ · −18 dB · 4:1', true], ['リミッタ', '−1.0 dBTP', true], ['ラウドネスをそろえる', '−16 LUFS', true]], 1)}
+    <div class="sep"></div>
+    <div class="params" style="gap:var(--space-2-5)">
+      <div class="phead"><h3>コンプ</h3><span>パンチ · 4:1</span></div>
+      <div class="frow">スタイル<div class="seg"><button aria-pressed="false">クリーン</button><button aria-pressed="true">パンチ</button><button aria-pressed="false">オプト</button></div></div>
+      <div style="display:flex;align-items:flex-end;justify-content:space-between">${transfer}<div class="meters">${meter('入力', '−9.4', 78, false)}${meter('出力', '−11.6', 70, false)}${meter('GR', '−3.4', 26, true)}</div></div>
+      <div class="fgrid" style="grid-template-columns:1fr 1fr 1fr">
+        <label>しきい値<span class="field">−18.0 dB</span></label>
+        <label>比<span class="field">4.0 : 1</span></label>
+        <label>ニー<span class="field">6.0 dB</span></label>
+        <label>アタック<span class="field">10 ms</span></label>
+        <label>リリース<span class="field">120 ms</span></label>
+        <label>先読み<span class="field">2.0 ms</span></label>
+        <label>リンク<span class="field">100 %</span></label>
+        <label>ミックス<span class="field">100 %</span></label>
+        <label>出力<span class="field">+3.0 dB</span></label>
+      </div>
+      <div class="frow">サイドチェーン<span style="display:flex;gap:var(--space-2);align-items:center"><span style="color:var(--text-primary)">HP 120 Hz</span><button class="pill" style="height:26px">スペクトルで直す</button></span></div>
+    </div>`;
+  win.innerHTML = shell({
+    view: 0,
+    meta: '48 kHz · 24 ビット · ステレオ · 3:12.500 · WAV · 未保存',
+    stage, panel,
+    row2: `<div class="grp"><span class="hint">始め</span><span class="field" style="min-width:92px">—</span><span class="hint">終わり</span><span class="field" style="min-width:92px">—</span></div><div class="grp"><button class="pill" disabled style="opacity:.4">切り詰める</button><button class="pill" disabled style="opacity:.4">ループにする</button></div>`,
+    hint: '',
+    left: '<span class="tag">カーソル 0:42.318（2,031,264 標本）</span>',
+    right: '<span class="zoom"><button aria-label="縮小">−</button><span>60 秒</span><button aria-label="拡大">＋</button></span>',
+    badges: [[1, 10 + 16 + mx - 40, 10 + my - 30], [2, 1124, 350], [3, 1408, 356], [4, 1066, 309]],
+  });
+  for (const el of win.querySelectorAll('.wl')) {
+    const k = Number(el.dataset.k);
+    const ctx = canvasOf(el, w, laneH);
+    drawWave(ctx, 0, 4, w, laneH - 8, t0, t1, 40 + k, tok('--text-secondary'));
+  }
+  const ov = win.querySelector('.ov'); const octx = canvasOf(ov, w, 24); drawWave(octx, 0, 2, w, 20, 0, DUR, 5, tok('--text-tertiary'));
+}
+
+screen1(document.querySelector('#screen1 .win'));
+screen2(document.querySelector('#screen2 .win'));
+screen3(document.querySelector('#screen3 .win'));
+
+// 窓の幅に合わせて縮める
+function fit() {
+  for (const f of document.querySelectorAll('.fit')) {
+    const s = Math.min(1, f.clientWidth / 1440);
+    f.style.height = `${900 * s}px`;
+    f.firstElementChild.style.transform = `scale(${s})`;
+  }
+}
+addEventListener('resize', fit);
+fit();
+</script>
+</body>
+</html>
