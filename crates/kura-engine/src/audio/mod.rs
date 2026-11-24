@@ -7,6 +7,7 @@
 //! 状態を運ぶ操作（IIR・包絡線）は、操作が申告した「状態の表」の解析から区間を描く核にする（[`state`]。M17 段 1。
 //! docs/editing.md §18.1）。ラウドネスの計測の K 特性は解析（`crate::analysis`）の側で全体を順に流す。
 
+pub mod biquad;
 pub mod digest;
 pub mod resample;
 pub mod source;
