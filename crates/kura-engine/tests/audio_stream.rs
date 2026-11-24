@@ -30,8 +30,9 @@ use serde_json::json;
 
 const C: u64 = AUDIO_CHUNK as u64;
 
+/// 流れの網のエンジン：今の登録表に、試験の状態を運ぶ操作と状態の表の解析を足したもの（M17 段 1）。
 fn engine() -> Engine {
-    Engine::new().unwrap()
+    kura_engine::testing::stateful::engine().unwrap()
 }
 
 fn compile(engine: &Engine, g: &Graph, input: &Value) -> Option<Plan> {
@@ -98,13 +99,41 @@ impl AudioSink for Collect {
 /// E39：窓を連結したものが `render` の出力と同じ（量子化を含む）。区間を頼むと、その区間に掛かるチャンクだけを流す。
 #[test]
 fn streamed_windows_concatenate_to_render() {
+    let (checked, quantized, _) = windows_concatenate(39, 30, false);
+    assert!(checked > 20 && quantized > 3, "{checked} {quantized}");
+}
+
+/// E39（M17 段 1）：試験の状態を運ぶ操作を混ぜたランダムな文書でも、窓を連結したものが `render` の出力と同じ（窓ごとの
+/// 範囲の描画は前の値なしで、状態の表は流し解き 1 回）。
+#[test]
+fn stateful_windows_concatenate_to_render() {
+    let (checked, _, with_state) = windows_concatenate(139, 24, true);
+    assert!(checked > 16 && with_state > 8, "{checked} {with_state}");
+}
+
+/// E39 の本体：（確かめた文書, 量子化した文書, 試験の操作のある文書）。
+fn windows_concatenate(seed: u64, cases: usize, stateful: bool) -> (usize, usize, usize) {
     let engine = engine();
-    let mut r = determinism::rng(39);
-    let (mut checked, mut quantized) = (0, 0);
-    for case in 0..30 {
+    let mut r = determinism::rng(seed);
+    let (mut checked, mut quantized, mut with_state) = (0, 0, 0);
+    for case in 0..cases {
         let input = random_audio_input(&mut r).generate().unwrap();
         let len = 1 + below(&mut r, 4) as usize;
-        let g = random_audio_chain(&engine, &mut r, &input.shape(), len);
+        let g = if stateful {
+            kura_engine::testing::region::random_stateful_chain(
+                &engine,
+                &mut r,
+                &input.shape(),
+                len,
+            )
+        } else {
+            random_audio_chain(&engine, &mut r, &input.shape(), len)
+        };
+        with_state += usize::from(
+            g.nodes
+                .iter()
+                .any(|n| n.op == kura_engine::testing::stateful::OP_ID),
+        );
         let Some(plan) = compile(&engine, &g, &input) else {
             continue;
         };
@@ -196,7 +225,7 @@ fn streamed_windows_concatenate_to_render() {
         quantized += usize::from(g.outputs[0].quantize.is_some());
         checked += 1;
     }
-    assert!(checked > 20 && quantized > 3, "{checked} {quantized}");
+    (checked, quantized, with_state)
 }
 
 /// M13 段 3（E1）：`Engine::output_stream` の生産者を、全体・窓ごとに後ろから・区間を何度も頼んで流しても、`render` の出力と
@@ -789,6 +818,8 @@ fn audio_analyses(engine: &Engine) -> Vec<std::sync::Arc<dyn kura_engine::analys
         "audio.silence",
         "audio.loop",
         "audio.loudness_gating",
+        // M17 段 1：状態の表（試験の操作のもの。内部用でカタログに出ない）
+        kura_engine::testing::stateful::STATE_ID,
     ];
     let all: Vec<_> = ids
         .iter()

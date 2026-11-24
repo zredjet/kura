@@ -192,6 +192,13 @@ pub fn analyze_at<A: Analysis>(
         .map_err(|e| format!("{} v{v} の結果を読めない: {e}", A::ID))
 }
 
+/// E26 の網のエンジン：今の登録表に、試験の状態を運ぶ操作（`test.iir1`）とその状態の表の解析（`test.iir1_state`。どちらも
+/// 登録しない）を足したもの（M17 段 1）。今の操作・解析の確かめは変わらず、状態の表（バイナリの結果・`Perturb::Typed`）を
+/// 申告する核のある操作も同じ網に掛かる。
+fn stateful_engine() -> Engine {
+    kura_engine::testing::stateful::engine().unwrap()
+}
+
 fn pairs() -> Vec<&'static Pair> {
     pairs_image::PAIRS
         .iter()
@@ -469,7 +476,7 @@ fn kernel_engine(op: &dyn DynOp) -> Engine {
         .unwrap();
     Engine::with_registries(
         r,
-        kura_engine::analysis::registry().unwrap(),
+        kura_engine::testing::stateful::registries().unwrap().1,
         Limits::default(),
     )
     .unwrap()
@@ -502,19 +509,29 @@ fn same_result(a: &Result<Value, EngineError>, b: &Result<Value, EngineError>) -
 /// `NEEDS` のある操作で、計画が空になる（何も申告しない）例と理由（操作, 版, 例の名前, 理由）。一覧にない例の計画が
 /// 空なら失敗にする（引数によって申告をやめ、apply が自分で計る形を見逃さない）。一覧にあるのに計画が空でない例・
 /// ない例も失敗にする（一覧を古くしない）。
-const EMPTY_PLAN: &[(&str, u16, &str, &str)] = &[(
-    "image.trim_alpha",
-    1,
-    "rgb-is-untouched",
-    "アルファのない形式（Rgb8）は透明を表せず、何もしないので解かない",
-)];
+const EMPTY_PLAN: &[(&str, u16, &str, &str)] = &[
+    (
+        "image.trim_alpha",
+        1,
+        "rgb-is-untouched",
+        "アルファのない形式（Rgb8）は透明を表せず、何もしないので解かない",
+    ),
+    // M17 段 1：試験の状態を運ぶ操作（試験用のエンジンだけ）。何も変えない引数は入力のまま（Identity）で表を申告しない
+    // （docs/editing.md §18.1 の「何も変えない設定は核を Identity に」の形）
+    (
+        kura_engine::testing::stateful::OP_ID,
+        1,
+        "identity",
+        "wet 0・gain 0 dB は入力のまま（Identity）で、状態の表を申告しない",
+    ),
+];
 
 /// 構造の網：登録したすべての操作（旧版を含む）の例で、申告した解析を計画どおりに解き、実行器が渡した値＝別に求めた値、
 /// 渡した値を使っている（欄ごとの偽の値で出力が変わる）。NEEDS はどれも例の計画に載り、NEEDS のある操作で計画が空の
 /// 例は `EMPTY_PLAN` に載る。核の経路も同じ照合をする。
 #[test]
 fn e26_declared_analyses_match_and_are_used() {
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     let pairs = pairs();
     let mut failures = Vec::new();
     // （操作, 版）→ どれかの例の計画に載った申告
@@ -770,7 +787,7 @@ fn e26_declared_analyses_match_and_are_used() {
 /// 意味の対の表のすべての検査（行の版で）。
 #[test]
 fn e26_pairs_agree() {
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     let mut failures = Vec::new();
     for p in pairs() {
         if let Err(e) = (p.check)(&engine, p) {
@@ -895,7 +912,7 @@ fn coverage_failures(
 /// 登録したすべての解析は対の表か対のない解析の表に載る。表に、登録されていない操作・解析の版の行はない。
 #[test]
 fn e26_tables_cover_every_declaration_and_analysis() {
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     let failures = coverage_failures(&engine, &pairs(), &unpaired());
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }

@@ -26,16 +26,31 @@ use kura_engine::shape::Shape;
 use kura_engine::testgen::InputGen;
 use kura_engine::testing::region::{
     below, check_region, corrupt_outside, only_chunks, random_audio_area, random_audio_chain,
-    random_audio_input,
+    random_audio_input, random_stateful_chain,
 };
 use kura_engine::value::{AUDIO_CHUNK, Audio, ChunkSet};
 use kura_engine::{Digest, Issue, Limits, NoMonitor, Value, determinism};
+use rand_chacha::ChaCha8Rng;
 use serde_json::json;
 
 const C: u64 = AUDIO_CHUNK as u64;
 
 fn engine() -> Engine {
     Engine::new().unwrap()
+}
+
+/// 試験用のエンジン（今の登録表 ＋ 試験の状態を運ぶ操作 `test.iir1` とその表の解析。M17 段 1）。
+fn stateful_engine() -> Engine {
+    kura_engine::testing::stateful::engine().unwrap()
+}
+
+/// ランダムな音声の鎖（`stateful` なら試験の状態を運ぶ操作を混ぜる。`engine` は試験用のエンジン）。
+fn chain(engine: &Engine, r: &mut ChaCha8Rng, shape: &Shape, len: usize, stateful: bool) -> Graph {
+    if stateful {
+        random_stateful_chain(engine, r, shape, len)
+    } else {
+        random_audio_chain(engine, r, shape, len)
+    }
 }
 
 fn compile(engine: &Engine, g: &Graph, input: &Value) -> Option<Plan> {
@@ -99,18 +114,45 @@ fn frames_of(v: &Value) -> u64 {
 /// E37：ランダムな音声の文書とランダムな区間で、範囲の描画の有効なチャンクは全体の描画と同じ。
 #[test]
 fn audio_region_equals_full_on_random_documents() {
-    let engine = engine();
-    let mut r = determinism::rng(37);
-    let (mut checked, mut drawn, mut quantized, mut shared, mut lazy_runs) = (0, 0u64, 0, 0u64, 0);
-    for case in 0..60 {
+    let (checked, drawn, quantized, shared, lazy_runs, _) =
+        region_on_random_documents(&engine(), 37, 60, false);
+    assert!(
+        checked > 120 && drawn > 100 && quantized > 20 && shared > 0 && lazy_runs > 40,
+        "{checked} {drawn} {quantized} {shared} {lazy_runs}"
+    );
+}
+
+/// E37（M17 段 1）：試験の状態を運ぶ操作（状態の表を申告して表から区間を描く核。格子は C・C を割り切らない値・2C）を混ぜた
+/// ランダムな文書でも、範囲の描画の有効なチャンクは全体の描画と同じ（流し解き・揃えた逆写しを通る）。
+#[test]
+fn stateful_region_equals_full_on_random_documents() {
+    let (checked, drawn, _, _, lazy_runs, stateful) =
+        region_on_random_documents(&stateful_engine(), 137, 50, true);
+    assert!(
+        checked > 100 && drawn > 80 && lazy_runs > 30 && stateful > 20,
+        "{checked} {drawn} {lazy_runs} {stateful}"
+    );
+}
+
+/// E37 の本体：（確かめた数, 描いたチャンク, 量子化した文書, 共有したチャンク, 遅延の入力の回, 試験の操作のある文書の回）。
+fn region_on_random_documents(
+    engine: &Engine,
+    seed: u64,
+    cases: usize,
+    stateful: bool,
+) -> (usize, u64, usize, u64, usize, usize) {
+    let mut r = determinism::rng(seed);
+    let (mut checked, mut drawn, mut quantized, mut shared, mut lazy_runs, mut with_state) =
+        (0, 0u64, 0, 0u64, 0, 0);
+    for case in 0..cases {
         let input = random_audio_input(&mut r).generate().unwrap();
         let len = 1 + below(&mut r, 5) as usize;
-        let g = random_audio_chain(&engine, &mut r, &input.shape(), len);
-        let Some(plan) = compile(&engine, &g, &input) else {
+        let g = chain(engine, &mut r, &input.shape(), len, stateful);
+        let Some(plan) = compile(engine, &g, &input) else {
             continue;
         };
         let source = Digest([case as u8; 32]);
-        let Some((want, warnings)) = render(&engine, &plan, &input, source) else {
+        let Some((want, warnings)) = render(engine, &plan, &input, source) else {
             continue;
         };
         let doc = String::from_utf8_lossy(&g.to_canonical_json().unwrap()).into_owned();
@@ -158,13 +200,15 @@ fn audio_region_equals_full_on_random_documents() {
             shared += got.stats.shared_chunks;
             quantized += usize::from(g.outputs[0].quantize.is_some());
             lazy_runs += usize::from(!resident);
+            with_state += usize::from(
+                g.nodes
+                    .iter()
+                    .any(|n| n.op == kura_engine::testing::stateful::OP_ID),
+            );
             checked += 1;
         }
     }
-    assert!(
-        checked > 120 && drawn > 100 && quantized > 20 && shared > 0 && lazy_runs > 40,
-        "{checked} {drawn} {quantized} {shared} {lazy_runs}"
-    );
+    (checked, drawn, quantized, shared, lazy_runs, with_state)
 }
 
 /// E37 の網（検証の直し）：流れの窓が 2〜3 つになる長い音声（`random_long_audio_input`。8 kHz・リサンプルなしの鎖）で、
@@ -317,7 +361,8 @@ fn kernel_of(
 /// 無効なチャンクを読まない。出力のチャンクの区間を 1 つずつ・2 つまとめて・ランダムな区間で。
 #[test]
 fn audio_reach_is_sound() {
-    let engine = engine();
+    // 試験用のエンジン（今の登録表 ＋ 試験の状態を運ぶ操作）で、状態の表を使う核の `Aligned` も確かめる（M17 段 1）
+    let engine = stateful_engine();
     let mut r = determinism::rng(38);
     let mut checked = 0;
     for (op, name, params, input) in audio_cases(&engine) {
@@ -399,7 +444,7 @@ use rand_chacha::rand_core::Rng;
 /// 全体で `audio_reach` が同じ位置。
 #[test]
 fn audio_region_declarations_match() {
-    let engine = engine();
+    let engine = stateful_engine();
     let mut seen = std::collections::BTreeSet::new();
     for (op, name, params, input) in audio_cases(&engine) {
         let p = op.parse(&params).unwrap();
@@ -413,6 +458,17 @@ fn audio_region_declarations_match() {
             );
             assert_eq!(reach, Reach::SameTime);
         }
+        // 状態を運ぶ操作（M17 段 1）：変わった範囲は Prefix、核の読みは表の格子に揃えた Aligned（何も変えない引数は SameTime）
+        if op.id() == kura_engine::testing::stateful::OP_ID && reach != Reach::SameTime {
+            assert!(
+                matches!(
+                    op.reach(p.as_ref(), &[input.shape()]).unwrap(),
+                    Reach::Prefix { .. }
+                ),
+                "{name}"
+            );
+            assert!(matches!(reach, Reach::Aligned { before: 0, .. }), "{name}");
+        }
     }
     assert_eq!(
         seen.into_iter().collect::<Vec<_>>(),
@@ -424,6 +480,7 @@ fn audio_region_declarations_match() {
             "audio.resample",
             "audio.set_loop",
             "audio.trim",
+            kura_engine::testing::stateful::OP_ID,
         ]
     );
 }
@@ -857,7 +914,9 @@ fn upstream_measurements_are_solved_once_per_render() {
 use kura_engine::render::delta::OutputChange;
 use kura_engine::render::region::Spans;
 use kura_engine::render::view::{View, ViewRequest};
-use kura_engine::testing::region::{check_contains, random_audio_edit, reseeded};
+use kura_engine::testing::region::{
+    check_contains, random_audio_edit, random_audio_edit_in, reseeded,
+};
 
 fn inputs_of(v: &Value, source: Digest) -> BTreeMap<InputId, FingerprintedInput> {
     BTreeMap::from([(
@@ -912,6 +971,16 @@ struct AudioViewCounts {
 /// 切り替え・構造の手・入力だけの変更）で、表示の窓をときどき動かし、キャッシュの上限 0・1 MiB・1 GiB で回す。入力は 3 回に
 /// 1 回、遅延の値（源の参照のチャンク。継ぎはぎ・refine が源の参照を共有として扱う道）にする（検証の直し）。
 fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts {
+    audio_view_cases_in(engine, seed, cases, false)
+}
+
+/// [`audio_view_cases`] の、`stateful` なら試験の状態を運ぶ操作を混ぜる版（M17 段 1。`engine` は試験用のエンジン）。
+fn audio_view_cases_in(
+    engine: &Engine,
+    seed: u64,
+    cases: usize,
+    stateful: bool,
+) -> AudioViewCounts {
     let mut r = determinism::rng(seed);
     let mut c = AudioViewCounts::default();
     for case in 0..cases {
@@ -926,7 +995,7 @@ fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts
             }
         };
         let len = 1 + below(&mut r, 5) as usize;
-        let mut g = random_audio_chain(engine, &mut r, &input.shape(), len);
+        let mut g = chain(engine, &mut r, &input.shape(), len, stateful);
         let Some(plan) = compile(engine, &g, &input) else {
             continue;
         };
@@ -960,7 +1029,8 @@ fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts
                 let other = reseeded(&make, r.next_u64()).unwrap().generate().unwrap();
                 (g.clone(), "input", other)
             } else {
-                let Some((next, kind)) = random_audio_edit(engine, &mut r, &g, &input.shape())
+                let Some((next, kind)) =
+                    random_audio_edit_in(engine, &mut r, &g, &input.shape(), stateful)
                 else {
                     break;
                 };
@@ -1080,6 +1150,21 @@ fn audio_view_equals_render_on_random_edit_sequences() {
     for kind in [
         "gain", "fade", "loop", "target", "trim_end", "toggle", "input", "add", "remove",
     ] {
+        assert!(
+            c.kinds.get(kind).copied().unwrap_or(0) > 0,
+            "{kind} が起きない：{c:?}"
+        );
+    }
+}
+
+/// E38（M17 段 1）：試験の状態を運ぶ操作を混ぜた文書と手の列（表に入れない引数だけの手・表を解き直す手・上流の手）でも、
+/// 表示の経路の値は `render` と同じチャンクを持ち、報告は差を含み推論の中にある（`Prefix` の前の写し）。
+#[test]
+fn stateful_view_equals_render_on_random_edit_sequences() {
+    let c = audio_view_cases_in(&stateful_engine(), 138, 30, true);
+    // 状態を運ぶ操作の上流の手は終わりまで変わりうる（`Prefix` の前の写し）ので、継ぎはぎは今の操作だけの網より少ない
+    assert!(c.steps > 80 && c.patched > 5 && c.partial > 20, "{c:?}");
+    for kind in ["iir_out", "params", "add", "replace"] {
         assert!(
             c.kinds.get(kind).copied().unwrap_or(0) > 0,
             "{kind} が起きない：{c:?}"

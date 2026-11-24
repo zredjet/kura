@@ -87,8 +87,50 @@ pub struct StepReport {
 
 /// 長さ `seconds` 秒の音声で 1 手を描いて、E41 の 4 つを確かめる。
 fn one_step(seconds: u64) -> StepReport {
+    one_step_of(seconds, Engine::new().unwrap(), document)
+}
+
+/// trim → fade → test.iir1（状態を運ぶ試験の操作。M17 段 1）→ gain → set_loop。手（gain の引数）は状態を運ぶ操作の
+/// 下流なので、表は解き直さない。
+fn stateful_document(frames: u64, db: f64) -> Graph {
+    let mut g = Graph::new_single();
+    g.push_linear(
+        "audio.trim",
+        1,
+        json!({ "start": RATE + 123, "end": frames - RATE }),
+        1,
+    )
+    .unwrap();
+    g.push_linear(
+        "audio.fade",
+        1,
+        json!({ "fadeIn": 2 * RATE, "fadeOut": 3 * RATE, "curve": "equalPower" }),
+        2,
+    )
+    .unwrap();
+    g.push_linear(
+        kura_engine::testing::stateful::OP_ID,
+        1,
+        json!({ "b0": 0.4, "b1": 0.2, "a1": -0.7, "lookahead": 0, "link": true,
+                "grid": kura_engine::audio::state::STATE_GRID, "wet": 0.9, "gainDb": -1.0 }),
+        3,
+    )
+    .unwrap();
+    g.push_linear("audio.gain", 1, json!({ "db": db }), 4)
+        .unwrap();
+    g.push_linear(
+        "audio.set_loop",
+        1,
+        json!({ "loop": { "start": 10 * RATE, "end": 20 * RATE } }),
+        5,
+    )
+    .unwrap();
+    g
+}
+
+/// [`one_step`] の、エンジンと文書を選ぶ版。
+fn one_step_of(seconds: u64, engine: Engine, document: fn(u64, f64) -> Graph) -> StepReport {
     let frames = seconds * RATE;
-    let engine = Engine::new().unwrap();
     let src = Arc::new(SyntheticSource::new(RATE as u32, 2, frames, 7, LRU));
     let value = Value::Audio(Arc::new(
         Audio::from_source(src.clone(), AudioMeta::default()).unwrap(),
@@ -120,7 +162,10 @@ fn one_step(seconds: u64) -> StepReport {
     let first = engine
         .render_view(&plan, &inputs, &mut cache, &req, None, &NoMonitor)
         .unwrap();
-    assert_eq!(first.area.presolved, 1, "最初の表示で計測を流して解く");
+    assert_eq!(
+        first.area.presolved, 1,
+        "最初の表示で計測・状態の表を流して解く"
+    );
     let source_reads_first = src.stats().reads;
     // 1 手：ゲインの引数
     let next = engine.compile(&document(frames, -5.0), &shapes).unwrap();
@@ -194,6 +239,29 @@ fn one_step_on_six_minutes_stays_small() {
 fn one_step_on_sixty_minutes_stays_small() {
     let r = one_step(60 * 60);
     eprintln!("60 分：{r:?}");
+}
+
+/// E41（M17 段 1）：状態を運ぶ操作（表を流して解き、表から区間を描く核）の入った文書でも、6 分の音声の 1 手（下流の gain）は
+/// 見えている区間と試聴の区間の分だけを描き、源から読み、表を解き直さない。
+#[test]
+fn stateful_step_on_six_minutes_stays_small() {
+    one_step_of(
+        6 * 60,
+        kura_engine::testing::stateful::engine().unwrap(),
+        stateful_document,
+    );
+}
+
+/// E41（M17 段 1）：同じく 60 分（`--release -- --ignored`）。
+#[test]
+#[ignore = "重い（--release -- --ignored で回す）"]
+fn stateful_step_on_sixty_minutes_stays_small() {
+    let r = one_step_of(
+        60 * 60,
+        kura_engine::testing::stateful::engine().unwrap(),
+        stateful_document,
+    );
+    eprintln!("状態・60 分：{r:?}");
 }
 
 /// E41：3 時間でも同じ（`#[ignore]`）。
@@ -339,12 +407,60 @@ fn save_document(frames: u64) -> Graph {
     g
 }
 
+/// trim → fade → test.iir1（状態を運ぶ試験の操作）→ normalize → gain（M17 段 1 の E44 の文書。normalize の計測の流し解きの
+/// 中で状態の表を解くので、流し解きは入れ子で 2 回）。
+fn stateful_save_document(frames: u64) -> Graph {
+    let mut g = Graph::new_single();
+    g.push_linear(
+        "audio.trim",
+        1,
+        json!({ "start": RATE + 123, "end": frames - RATE }),
+        1,
+    )
+    .unwrap();
+    g.push_linear(
+        "audio.fade",
+        1,
+        json!({ "fadeIn": 2 * RATE, "fadeOut": 3 * RATE, "curve": "equalPower" }),
+        2,
+    )
+    .unwrap();
+    g.push_linear(
+        kura_engine::testing::stateful::OP_ID,
+        1,
+        json!({ "b0": 0.4, "b1": 0.2, "a1": -0.7, "lookahead": 37, "link": false,
+                "grid": kura_engine::audio::state::STATE_GRID, "wet": 0.9, "gainDb": -1.0 }),
+        3,
+    )
+    .unwrap();
+    g.push_linear(
+        "audio.normalize",
+        1,
+        json!({ "target": -16.0, "peakLimit": -1.0 }),
+        4,
+    )
+    .unwrap();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.5 }), 5)
+        .unwrap();
+    g
+}
+
 /// 長さ `seconds` 秒の合成の源（LRU 64 MiB）の文書を `formats` に流して書き、E44 の 3 つを確かめる。
 fn save_streams(seconds: u64, formats: &[(&'static str, serde_json::Value)]) -> Vec<SaveReport> {
+    save_streams_of(seconds, formats, Engine::new().unwrap(), save_document, 1)
+}
+
+/// [`save_streams`] の、エンジン・文書・流し解きの数（入れ子を含めて、源を全体で読む回数）を選ぶ版。
+fn save_streams_of(
+    seconds: u64,
+    formats: &[(&'static str, serde_json::Value)],
+    engine: Engine,
+    save_document: fn(u64) -> Graph,
+    presolves: u64,
+) -> Vec<SaveReport> {
     // 報告用に時間を測る（描画の外。値に効かない）
     #![allow(clippy::disallowed_methods)]
     let frames = seconds * RATE;
-    let engine = Engine::new().unwrap();
     let codecs = kura_engine::codec::CodecSet::pinned();
     let plan = {
         let shape = kura_engine::Shape::Audio {
@@ -415,9 +531,10 @@ fn save_streams(seconds: u64, formats: &[(&'static str, serde_json::Value)]) -> 
         assert_eq!(sink.len, se.bytes, "{report:?}");
         // (1) 見積もりのピーク ≤ N_save（源の LRU ＋ 128 MiB）
         assert!(report.estimate_peak <= LRU + 128 * MIB, "{report:?}");
-        // (2) 源が作ったチャンク ≤ パスの数 × 全体 ＋ 流し解き（全体を 1 回）。窓ごとに trim のずれで 1 チャンク多く掛かりうる
+        // (2) 源が作ったチャンク ≤ (パスの数 ＋ 流し解きの数) × 全体。流し解きは入れ子でも表・計測ごとに全体を 1 回ずつ読む
+        // （M17 段 1：入れ子の数だけ増える）。窓ごとに trim のずれで 1 チャンク多く掛かりうる
         let windows_per_pass = frames.div_ceil(16 * AUDIO_CHUNK as u64);
-        let bound = (u64::from(report.passes) + 1) * (input_chunks + windows_per_pass + 1);
+        let bound = (u64::from(report.passes) + presolves) * (input_chunks + windows_per_pass + 1);
         assert!(report.source_reads <= bound, "{report:?}・上限 {bound}");
         // (3) 出力を組まない：受け手に渡る窓は 16 チャンクまで
         assert!(report.max_window <= 16 * AUDIO_CHUNK as u64, "{report:?}");
@@ -431,6 +548,46 @@ fn save_streams(seconds: u64, formats: &[(&'static str, serde_json::Value)]) -> 
 fn two_minute_save_streams() {
     save_streams(2 * 60, &[("wav", json!({})), ("flac", json!({}))]);
     save_streams(30, &[("ogg", json!({ "quality": 5 }))]);
+}
+
+/// E44（M17 段 1）：状態を運ぶ操作と、その出力を計る normalize の入った文書（流し解きが入れ子で 2 回）を、2 分（Ogg Vorbis は
+/// 30 秒）で流して書く。
+#[test]
+fn stateful_two_minute_save_streams() {
+    let engine = || kura_engine::testing::stateful::engine().unwrap();
+    save_streams_of(
+        2 * 60,
+        &[("wav", json!({})), ("flac", json!({}))],
+        engine(),
+        stateful_save_document,
+        2,
+    );
+    save_streams_of(
+        30,
+        &[("ogg", json!({ "quality": 5 }))],
+        engine(),
+        stateful_save_document,
+        2,
+    );
+}
+
+/// E44（M17 段 1）：同じく 60 分（`--release -- --ignored`）。
+#[test]
+#[ignore = "重い（--release -- --ignored で回す）"]
+fn stateful_sixty_minute_save_streams() {
+    for r in save_streams_of(
+        60 * 60,
+        &[
+            ("wav", json!({})),
+            ("flac", json!({})),
+            ("ogg", json!({ "quality": 5 })),
+        ],
+        kura_engine::testing::stateful::engine().unwrap(),
+        stateful_save_document,
+        2,
+    ) {
+        eprintln!("状態・60 分：{r:?}");
+    }
 }
 
 /// E44：60 分・48 kHz ステレオを WAV・FLAC・ogg q5 に流して書く（`--release -- --ignored`）。

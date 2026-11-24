@@ -19,7 +19,9 @@ use kura_engine::render::cache::{FingerprintedInput, NodeCache};
 use kura_engine::render::region::Spans;
 use kura_engine::render::{Engine, InputValue, Plan};
 use kura_engine::testgen::InputGen;
-use kura_engine::testing::region::{below, random_audio_chain, random_audio_input};
+use kura_engine::testing::region::{
+    below, random_audio_chain, random_audio_input, random_stateful_chain,
+};
 use kura_engine::value::{AUDIO_CHUNK, Audio, AudioMeta, LoopRange, Marker};
 use kura_engine::{Digest, EngineError, Issue, Monitor, NoMonitor, Value, determinism};
 use serde_json::json;
@@ -222,6 +224,82 @@ fn streamed_encode_equals_encode_bytes() {
         );
     }
     assert!(checked > 150, "{checked}");
+}
+
+/// E43（M17 段 1）：試験の状態を運ぶ操作（状態の表を流して解き、表から区間を描く核）を混ぜたランダムな文書と、決まった
+/// 長さの鎖（状態を運ぶ操作 2 つ。格子 C と 3·4,096・先読み・リンク）で、流して書いたもの（WAV・FLAC・Ogg Vorbis の 2 回の
+/// 流し）が値を書いたものと同じ。
+#[test]
+fn stateful_streamed_encode_equals_encode_bytes() {
+    let engine = kura_engine::testing::stateful::engine().unwrap();
+    let codecs = CodecSet::pinned();
+    let targets = targets();
+    let mut r = determinism::rng(4302);
+    let (mut checked, mut with_state) = (0, 0);
+    for case in 0..16 {
+        let input = random_audio_input(&mut r).generate().unwrap();
+        let len = 1 + below(&mut r, 3) as usize;
+        let g = random_stateful_chain(&engine, &mut r, &input.shape(), len);
+        with_state += usize::from(
+            g.nodes
+                .iter()
+                .any(|n| n.op == kura_engine::testing::stateful::OP_ID),
+        );
+        checked += check_doc(
+            &engine,
+            &codecs,
+            &g,
+            &input,
+            Digest([case as u8; 32]),
+            &targets,
+            &format!("状態のランダム {case}"),
+        );
+    }
+    for (k, frames) in [0u64, 1, 33, 4_097, C + 1, 16 * C + 5]
+        .into_iter()
+        .enumerate()
+    {
+        let input = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 2,
+            frames,
+            seed: 40 + k as u64,
+        }
+        .generate()
+        .unwrap();
+        let mut g = Graph::new_single();
+        g.push_linear("audio.gain", 1, json!({ "db": -2.0 }), 1)
+            .unwrap();
+        for (i, (grid, lookahead, link)) in [(C, 0u64, false), (3 * 4_096, 37, true)]
+            .into_iter()
+            .enumerate()
+        {
+            g.push_linear(
+                kura_engine::testing::stateful::OP_ID,
+                1,
+                json!({ "b0": 0.4, "b1": 0.2, "a1": -0.7, "lookahead": lookahead, "link": link,
+                        "grid": grid, "wet": 0.9, "gainDb": -1.0 }),
+                2 + i as u64,
+            )
+            .unwrap();
+        }
+        let some: Vec<_> = targets
+            .iter()
+            .filter(|(f, o)| frames < 16 * C || *f != "ogg" || o.get("quality").is_none())
+            .cloned()
+            .collect();
+        checked += check_doc(
+            &engine,
+            &codecs,
+            &g,
+            &input,
+            Digest([8; 32]),
+            &some,
+            &format!("状態の長さ {frames}"),
+        );
+        with_state += 1;
+    }
+    assert!(checked > 60 && with_state > 10, "{checked} {with_state}");
 }
 
 /// 窓を 1 チャンクずつに縛る生産者（値の生産者を区間ごとに呼ぶ）。

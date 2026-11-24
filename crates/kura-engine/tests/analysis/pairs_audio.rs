@@ -9,8 +9,9 @@ use kura_engine::analysis::audio::loop_points::LoopAnalysis;
 use kura_engine::analysis::audio::loudness::{LoudnessAnalysis, Unmeasured};
 use kura_engine::analysis::audio::loudness_gating::LoudnessGating;
 use kura_engine::analysis::audio::silence::{SilenceAnalysis, SilenceParams};
-use kura_engine::analysis::{Analysis, NoParams};
+use kura_engine::analysis::{Analysis, AnyOutput, NoParams};
 use kura_engine::audio::render_all;
+use kura_engine::audio::state::StateTable;
 use kura_engine::digest::Digest;
 use kura_engine::op::Registry;
 use kura_engine::ops::audio::gain::GainKernel;
@@ -61,6 +62,16 @@ pub const PAIRS: &[Pair] = &[
         reads: &[],
         check: set_loop_is_read_back,
     },
+    // M17 段 1：試験の状態を運ぶ操作（登録しない。試験用のエンジンにだけある）。表の状態と「有限でない標本があったか」を
+    // 読む（旗はそのままの位置の元の値を出すかを決める）
+    Pair {
+        op: kura_engine::testing::stateful::OP_ID,
+        op_v: 1,
+        analysis: kura_engine::testing::stateful::STATE_ID,
+        analysis_v: 1,
+        reads: &["states", "nonFinite"],
+        check: iir_matches_the_sequential_reference,
+    },
 ];
 
 /// 対のない解析（どの操作とも意味の対を持たないもの）と理由。
@@ -71,31 +82,84 @@ pub const UNPAIRED: &[(&str, &str)] = &[(
 
 /// 偽の値の作り方（操作が申告する解析ごとに、結果の欄ごと。JSON の結果は欄の一覧が結果の欄と同じであること）。
 /// バイナリの結果の解析を申告させるときは、型付きの値を変える `Perturb::Typed` で欄ごとに足す。
-pub const FAKES: &[(&str, &[FakeField])] = &[(
-    "audio.loudness_gating",
-    &[
-        FakeField {
-            field: "integrated",
-            perturb: Perturb::Json(louder_integrated),
-        },
-        FakeField {
-            field: "samplePeak",
-            perturb: Perturb::Json(higher_sample_peak),
-        },
-        FakeField {
-            field: "truePeak",
-            perturb: Perturb::Json(higher_true_peak),
-        },
-        FakeField {
-            field: "blocks",
-            perturb: Perturb::Json(louder_blocks),
-        },
-        FakeField {
-            field: "measurable",
-            perturb: Perturb::Json(flip_measurable),
-        },
-    ],
-)];
+pub const FAKES: &[(&str, &[FakeField])] = &[
+    (
+        kura_engine::testing::stateful::STATE_ID,
+        &[
+            FakeField {
+                field: "states",
+                perturb: Perturb::Typed(shift_states),
+            },
+            FakeField {
+                field: "nonFinite",
+                perturb: Perturb::Typed(flip_non_finite),
+            },
+        ],
+    ),
+    (
+        "audio.loudness_gating",
+        &[
+            FakeField {
+                field: "integrated",
+                perturb: Perturb::Json(louder_integrated),
+            },
+            FakeField {
+                field: "samplePeak",
+                perturb: Perturb::Json(higher_sample_peak),
+            },
+            FakeField {
+                field: "truePeak",
+                perturb: Perturb::Json(higher_true_peak),
+            },
+            FakeField {
+                field: "blocks",
+                perturb: Perturb::Json(louder_blocks),
+            },
+            FakeField {
+                field: "measurable",
+                perturb: Perturb::Json(flip_measurable),
+            },
+        ],
+    ),
+];
+
+/// 状態の表の状態の語を +0.25 する（M17 段 1）。
+fn shift_states(out: &AnyOutput) -> Option<AnyOutput> {
+    let t = out.downcast_ref::<StateTable>()?;
+    Some(Arc::new(t.perturbed(|x| x + 0.25, t.non_finite())))
+}
+
+/// 状態の表の「有限でない標本があったか」を反転する（M17 段 1）。
+fn flip_non_finite(out: &AnyOutput) -> Option<AnyOutput> {
+    let t = out.downcast_ref::<StateTable>()?;
+    Some(Arc::new(t.perturbed(|x| x, !t.non_finite())))
+}
+
+/// 試験の状態を運ぶ操作（M17 段 1）：どの例（何も変えない例を含む）でも、出力は先頭から順に流した参照とビット一致する
+/// （表の解析で解いた状態から区間を描いた値が、順に流した値と同じ）。
+fn iir_matches_the_sequential_reference(engine: &Engine, p: &Pair) -> Result<(), String> {
+    use kura_engine::testing::stateful::{Iir1Params, reference};
+    for ex in p.examples(engine)? {
+        let input = ex.inputs[0].generate().map_err(err)?;
+        let out = p.apply(engine, ex.params.clone(), &input)?;
+        let params: Iir1Params = serde_json::from_value(ex.params.clone()).map_err(err)?;
+        let Value::Audio(a) = &input else {
+            return Err(format!("{}：音声ではない", ex.name));
+        };
+        let Value::Audio(got) = &out else {
+            return Err(format!("{}：出力が音声ではない", ex.name));
+        };
+        let want = reference(&params, a).map_err(err)?;
+        for (ch, w) in want.iter().enumerate() {
+            let mut g = vec![0f32; got.frames()];
+            got.read(ch, 0, &mut g).map_err(err)?;
+            if g.iter().zip(w).any(|(x, y)| x.to_bits() != y.to_bits()) || g.len() != w.len() {
+                return Err(format!("{}：チャンネル {ch} が参照と違う", ex.name));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// 小数（`Real`）を +1 する。有限でない（"nan"・"-inf"）なら −20 にする。
 fn bump_real(v: &mut serde_json::Value) {
@@ -144,6 +208,9 @@ pub fn kernel_registry(op: &str, v: u16) -> Option<Result<Registry, String>> {
     let mut r = Registry::empty();
     let added = match (op, v) {
         ("audio.normalize", 1) => r.add_current::<KernelOf<Normalize>>(),
+        (kura_engine::testing::stateful::OP_ID, 1) => {
+            r.add_current::<KernelOf<kura_engine::testing::stateful::Iir1Op>>()
+        }
         _ => return None,
     };
     Some(added.map(|()| r))

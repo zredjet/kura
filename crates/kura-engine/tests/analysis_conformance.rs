@@ -15,8 +15,10 @@ use kura_engine::value::PixelFormat;
 use kura_engine::{EngineError, IssueCode, Limits, NoMonitor, Shape, Value, ValueKind};
 use serde_json::json;
 
+/// 適合の網のエンジン：今の登録表に、試験の状態を運ぶ操作と状態の表の解析（内部用・バイナリの結果。M17 段 1）を足したもの。
 fn engine() -> Engine {
-    Engine::new().expect("登録表が作れること（同じ解析・版が 2 つない、申告した解析がある）")
+    kura_engine::testing::stateful::engine()
+        .expect("登録表が作れること（同じ解析・版が 2 つない、申告した解析がある）")
 }
 
 fn request(a: &Arc<dyn DynAnalysis>, params: &serde_json::Value) -> AnalysisRequest {
@@ -181,7 +183,7 @@ fn tighter(shape: &Shape) -> Limits {
 fn limits_are_checked_before_analyzing() {
     each_example(|_, a, ex, v| {
         let shape = v.shape();
-        let tight = Engine::with_limits(tighter(&shape)).unwrap();
+        let tight = kura_engine::testing::stateful::engine_with(tighter(&shape)).unwrap();
         let counter = CancelAfter::new(0);
         let r = tight.analyze_dyn(&request(a, &ex.params), v, &counter);
         assert!(
@@ -193,7 +195,7 @@ fn limits_are_checked_before_analyzing() {
         assert_eq!(counter.calls(), 0, "{} {}", a.id(), ex.name);
         // 結果の見積もり（か値の大きさ）が上限を超えるとき
         let estimate = a.estimate(&ex.params, &shape).unwrap();
-        let small = Engine::with_limits(Limits {
+        let small = kura_engine::testing::stateful::engine_with(Limits {
             max_value_bytes: estimate.bytes.saturating_sub(1),
             ..Limits::default()
         })

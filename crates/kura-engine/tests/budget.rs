@@ -37,8 +37,10 @@ use serde_json::json;
 
 const MIB: u64 = 1 << 20;
 
+/// 見積もりの網のエンジン：今の登録表に、試験の状態を運ぶ操作（`test.iir1`）と状態の表の解析を足したもの（M17 段 1。
+/// 状態の表の流し解き・核の作業領域も見積もりの約束に掛ける）。
 fn engine() -> Engine {
-    Engine::new().unwrap()
+    kura_engine::testing::stateful::engine().unwrap()
 }
 
 fn inputs_of(value: Value, source: Digest) -> BTreeMap<InputId, InputValue> {

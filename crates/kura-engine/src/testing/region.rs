@@ -1276,6 +1276,48 @@ pub fn random_long_audio_input(r: &mut ChaCha8Rng) -> InputGen {
 /// 核のずらした写しが入力の実体を別の番号の位置で共有する）・フェード・モノラル・ループ点・リサンプル（軽い比）・正規化
 /// （目標・上限）。
 pub fn random_audio_op(r: &mut ChaCha8Rng, shape: &Shape) -> (&'static str, serde_json::Value) {
+    random_audio_op_in(r, shape, false)
+}
+
+/// 試験の状態を運ぶ操作（`testing::stateful` の `test.iir1`。登録しない）のランダムな引数（M17 段 1）。格子は実物（C）・C を
+/// 割り切らない値（3·4,096・777）・C より大きい値（2C）・4,096、先読みは 0・1・37・300、ときどき何も変えない引数（Identity）。
+pub fn random_stateful_op(r: &mut ChaCha8Rng) -> (&'static str, serde_json::Value) {
+    let c = crate::value::AUDIO_CHUNK as u64;
+    let grid = [c, 3 * 4_096, 777, 2 * c, 4_096][below(r, 5) as usize];
+    let lookahead = [0u64, 1, 37, 300][below(r, 4) as usize];
+    let (wet, gain) = match below(r, 8) {
+        0 => (0.0, 0.0),
+        1 => (0.0, -2.0),
+        _ => (
+            [0.5, 1.0, 0.8][below(r, 3) as usize],
+            [0.0, -3.0, 2.5][below(r, 3) as usize],
+        ),
+    };
+    (
+        crate::testing::stateful::OP_ID,
+        json!({
+            "b0": below(r, 300) as f64 / 100.0 - 1.5,
+            "b1": below(r, 200) as f64 / 100.0 - 1.0,
+            "a1": below(r, 190) as f64 / 100.0 - 0.95,
+            "lookahead": lookahead,
+            "link": below(r, 2) == 0,
+            "grid": grid,
+            "wet": wet,
+            "gainDb": gain,
+        }),
+    )
+}
+
+/// [`random_audio_op`] の、`stateful` なら 4 回に 1 回は試験の状態を運ぶ操作（[`random_stateful_op`]）を選ぶ版（M17 段 1。
+/// 試験用のエンジン `testing::stateful::engine` で使う）。`stateful` が偽なら [`random_audio_op`] と同じ乱数の列。
+pub fn random_audio_op_in(
+    r: &mut ChaCha8Rng,
+    shape: &Shape,
+    stateful: bool,
+) -> (&'static str, serde_json::Value) {
+    if stateful && below(r, 4) == 0 {
+        return random_stateful_op(r);
+    }
     let (rate, frames) = match shape {
         Shape::Audio { rate, frames, .. } => (*rate, frames.max()),
         _ => (8_000, 1),
@@ -1336,7 +1378,17 @@ pub fn random_audio_op(r: &mut ChaCha8Rng, shape: &Shape) -> (&'static str, serd
 /// ランダムな音声の鎖：形 `shape` の音声の入力に、compile が通る音声の操作を `len` 個まで線形につなぐ。3 回に 1 回は
 /// 出力に量子化（8・16・24 ビット、TPDF・ディザなし）を付ける。
 pub fn random_audio_chain(engine: &Engine, r: &mut ChaCha8Rng, shape: &Shape, len: usize) -> Graph {
-    audio_chain_of(engine, r, shape, len, &|_| true)
+    audio_chain_of(engine, r, shape, len, &|_| true, false)
+}
+
+/// [`random_audio_chain`] の、試験の状態を運ぶ操作を混ぜる版（M17 段 1。`engine` は `testing::stateful::engine`）。
+pub fn random_stateful_chain(
+    engine: &Engine,
+    r: &mut ChaCha8Rng,
+    shape: &Shape,
+    len: usize,
+) -> Graph {
+    audio_chain_of(engine, r, shape, len, &|op| op != "audio.resample", true)
 }
 
 /// [`random_audio_chain`] の、リサンプルを使わない版（長い音声の網。デバッグのビルドで多相 FIR の全体を描くと重いため）。
@@ -1346,7 +1398,7 @@ pub fn random_long_audio_chain(
     shape: &Shape,
     len: usize,
 ) -> Graph {
-    audio_chain_of(engine, r, shape, len, &|op| op != "audio.resample")
+    audio_chain_of(engine, r, shape, len, &|op| op != "audio.resample", false)
 }
 
 fn audio_chain_of(
@@ -1355,6 +1407,7 @@ fn audio_chain_of(
     shape: &Shape,
     len: usize,
     allow: &dyn Fn(&str) -> bool,
+    stateful: bool,
 ) -> Graph {
     let mut g = Graph::new_single();
     let shapes = BTreeMap::from([(InputId(0), *shape)]);
@@ -1365,7 +1418,7 @@ fn audio_chain_of(
                 .ok()
                 .and_then(|p| p.output_shapes().first().map(|o| o.1))
                 .unwrap_or(*shape);
-            let (op, params) = random_audio_op(r, &now);
+            let (op, params) = random_audio_op_in(r, &now, stateful);
             if !allow(op) {
                 continue;
             }
@@ -1409,6 +1462,19 @@ pub fn random_audio_edit(
     g: &Graph,
     input: &Shape,
 ) -> Option<(Graph, &'static str)> {
+    random_audio_edit_in(engine, r, g, input, false)
+}
+
+/// [`random_audio_edit`] の、試験の状態を運ぶ操作を混ぜる版（M17 段 1）：置き換え・足す・引き直しで試験の操作も選び、試験の
+/// 操作のノードには、表に入れない引数（wet・gainDb）だけを変える手 `iir_out` も起きる。`stateful` が偽なら
+/// [`random_audio_edit`] と同じ乱数の列。
+pub fn random_audio_edit_in(
+    engine: &Engine,
+    r: &mut ChaCha8Rng,
+    g: &Graph,
+    input: &Shape,
+    stateful: bool,
+) -> Option<(Graph, &'static str)> {
     let shapes = BTreeMap::from([(InputId(0), *input)]);
     let plan = engine.compile(g, &shapes).ok()?;
     let shape_at = |k: usize| match k.checked_sub(1).and_then(|p| g.nodes.get(p)) {
@@ -1439,7 +1505,7 @@ pub fn random_audio_edit(
         let kind = match pick {
             7 => {
                 let node = next.nodes.get_mut(i)?;
-                let (op, params) = random_audio_op(r, &shape_at(i)?);
+                let (op, params) = random_audio_op_in(r, &shape_at(i)?, stateful);
                 if op == node.op {
                     continue;
                 }
@@ -1454,7 +1520,7 @@ pub fn random_audio_edit(
             }
             9 => {
                 let at = below(r, len as u64 + 1) as usize;
-                let (op, params) = random_audio_op(r, &shape_at(at)?);
+                let (op, params) = random_audio_op_in(r, &shape_at(at)?, stateful);
                 let id = crate::doc::NodeId(next.next_id);
                 next.next_id = next.next_id.checked_add(1)?;
                 next.nodes.insert(
@@ -1516,8 +1582,16 @@ pub fn random_audio_edit(
                         slot.params = p;
                         "target"
                     }
+                    // 試験の状態を運ぶ操作の、表に入れない引数だけの手（表を解き直さない）
+                    (5, crate::testing::stateful::OP_ID) if below(r, 2) == 0 => {
+                        let mut p = node.params.clone();
+                        p["wet"] = json!([0.25, 0.5, 1.0][below(r, 3) as usize]);
+                        p["gainDb"] = json!(below(r, 60) as f64 / 10.0 - 3.0);
+                        slot.params = p;
+                        "iir_out"
+                    }
                     (5, _) => {
-                        let (op, params) = random_audio_op(r, &shape_at(i)?);
+                        let (op, params) = random_audio_op_in(r, &shape_at(i)?, stateful);
                         if op != node.op {
                             continue;
                         }

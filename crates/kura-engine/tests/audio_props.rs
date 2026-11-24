@@ -192,7 +192,7 @@ fn for_each_audio_example(
         &[kura_engine::Issue],
     ),
 ) -> usize {
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     let mut checked = 0;
     for op in engine.registry().all() {
         for ex in op.examples().unwrap() {
@@ -230,6 +230,12 @@ fn for_each_audio_example(
         }
     }
     checked
+}
+
+/// E18 の網のエンジン：今の登録表に、試験の状態を運ぶ操作（`test.iir1`。状態の表を申告して表から区間を描く核。登録しない）を
+/// 足したもの（M17 段 1）。今の操作の確かめは変わらず、状態を運ぶ核も同じ網に掛かる。
+fn stateful_engine() -> Engine {
+    kura_engine::testing::stateful::engine().unwrap()
 }
 
 /// 音声のチャンクの長さ（E18 の区切りに使う）。
@@ -355,7 +361,7 @@ fn kernel_meta_warnings_and_errors_match_apply() {
             noise(192_000, 1, 1, 3),
         ),
     ];
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     for (id, params, input) in cases {
         let op = engine
             .registry()
@@ -387,7 +393,7 @@ fn kernel_meta_warnings_and_errors_match_apply() {
 #[test]
 fn e18_lazy_inputs_render_the_same() {
     use kura_engine::audio::source::MemorySource;
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     let mut checked = 0;
     for op in engine.registry().all() {
         for ex in op.examples().unwrap() {
@@ -466,7 +472,7 @@ fn e18_lazy_inputs_render_the_same() {
 fn e18_partial_inputs_render_the_same() {
     use kura_engine::render::audio::{chunk_spans, chunks_covering};
     use kura_engine::render::region::Area;
-    let engine = Engine::new().unwrap();
+    let engine = stateful_engine();
     let mut checked = 0;
     for op in engine.registry().all() {
         for ex in op.examples().unwrap() {
