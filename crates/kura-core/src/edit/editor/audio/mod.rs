@@ -144,6 +144,8 @@ pub struct AudioViewInfo {
     pub audition_id: String,
     /// 試聴の情報（頼みに試聴があるときだけ）。
     pub audition: Option<audition::AuditionInfo>,
+    /// 元のラウドネス（M17 段 6。`edit_measure` の `input` で計ったもの。計っていなければ `Idle`）。
+    pub input_loudness: measure::LoudnessState,
 }
 
 /// 開いている音声のエディタの状態（`State::audio`）。
@@ -520,7 +522,7 @@ impl Editor {
             Some(a) => {
                 let info = a.peaks.report();
                 let work = info.pending
-                    || a.measure.running(&id)
+                    || a.measure.has_work(&id)
                     || spec.iter().any(|s| s.pending)
                     || a.spec.average.running();
                 (info, work, a.measure.state(&id))
@@ -570,6 +572,11 @@ impl Editor {
                 .unwrap_or_default(),
             audition_id: String::new(),
             audition: None,
+            input_loudness: st
+                .audio
+                .as_ref()
+                .and_then(|a| a.measure.input_id.as_ref().map(|i| a.measure.state(i)))
+                .unwrap_or(measure::LoudnessState::Idle),
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
@@ -715,6 +722,11 @@ impl Editor {
                 .unwrap_or_default(),
             audition_id: String::new(),
             audition: None,
+            input_loudness: st
+                .audio
+                .as_ref()
+                .and_then(|a| a.measure.input_id.as_ref().map(|i| a.measure.state(i)))
+                .unwrap_or(measure::LoudnessState::Idle),
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }

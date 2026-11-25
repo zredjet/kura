@@ -26,6 +26,7 @@ use kura_engine::{EngineError, Shape};
 
 use super::super::view::AudioViewport;
 use super::super::{Editor, State, compile_without, settle};
+use super::measure::{LoudnessState, MeasureTarget};
 use super::slice::{Limit, Pace, WorkProgress};
 use super::solve::{Advanced, SYNC_SOLVE_NS, SolveRun, restore_finished};
 use super::{AudioViewInfo, audio_shape, is_short, samples_id, valid_runs, view_area};
@@ -59,6 +60,9 @@ pub struct AuditionInfo {
     /// 試聴の値の有効な区間（`/edit/{s}/audition/{auditionId}/pcm` で取れる所。チャンクに揃う。外したノードがもう外して
     /// あるときは表示の `valid`）。
     pub valid: Vec<(u64, u64)>,
+    /// 外して聞く音のラウドネス（`edit_measure` の `audition` で計ったもの。`auditionId` で覚える。計っていなければ
+    /// `Idle`。もう外してあるノードは出力のもの）。
+    pub loudness: LoudnessState,
 }
 
 /// 外したときの計画。
@@ -321,6 +325,7 @@ impl Editor {
                     node,
                     phase: AuditionPhase::Ready,
                     valid: info.valid.clone(),
+                    loudness: info.loudness.clone(),
                 });
                 return Ok(());
             }
@@ -329,6 +334,7 @@ impl Editor {
                     node,
                     phase: AuditionPhase::Unavailable,
                     valid: Vec::new(),
+                    loudness: LoudnessState::Idle,
                 });
                 return Ok(());
             }
@@ -338,6 +344,7 @@ impl Editor {
                     node,
                     phase: AuditionPhase::Solving(progress),
                     valid: Vec::new(),
+                    loudness: LoudnessState::Idle,
                 });
                 info.work = true;
                 self.count_resident(st);
@@ -365,6 +372,7 @@ impl Editor {
                     node,
                     phase: AuditionPhase::Unavailable,
                     valid: Vec::new(),
+                    loudness: LoudnessState::Idle,
                 });
                 return Ok(());
             }
@@ -385,6 +393,7 @@ impl Editor {
                     node,
                     phase: AuditionPhase::Solving(0.0),
                     valid: Vec::new(),
+                    loudness: LoudnessState::Idle,
                 });
                 info.work = true;
                 return Ok(());
@@ -409,6 +418,7 @@ impl Editor {
                         node,
                         phase: AuditionPhase::Unavailable,
                         valid: Vec::new(),
+                        loudness: LoudnessState::Idle,
                     });
                     return Ok(());
                 }
@@ -420,11 +430,26 @@ impl Editor {
             }
             self.pin_audition(st, &plan);
         }
+        // 外して聞く音が替わった（操作中でない確定の表示）：前の外して聞く音の計りかけを捨てる。表示の work には計りかけも数える
+        let settled = !avp.interacting && !st.session.is_provisional();
+        let loudness = match st.audio.as_mut() {
+            Some(a) => {
+                if settled {
+                    a.measure.retarget_role(MeasureTarget::Audition, &id);
+                }
+                if a.measure.running(&id) {
+                    info.work = true;
+                }
+                a.measure.state(&id)
+            }
+            None => LoudnessState::Idle,
+        };
         info.audition_id = id;
         info.audition = Some(AuditionInfo {
             node,
             phase: AuditionPhase::Ready,
             valid,
+            loudness,
         });
         self.count_resident(st);
         Ok(())

@@ -534,6 +534,38 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     expect(useAudioStore.getState().soloHeld).toBe(false);
   });
 
+  it('聞き比べの隣の［音量を合わせて聞く］（M17 段 6）：押すたびに切り替え、下げている量か計っていることを読み上げに添える', () => {
+    openState();
+    useAudioStore.setState({ matchOn: false, matchInfo: null });
+    render(<Editor />);
+    const button = screen.getByRole('button', { name: a.match });
+    expect(button).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(button);
+    expect(useAudioStore.getState().matchOn).toBe(true);
+    act(() =>
+      useAudioStore.setState({
+        matchInfo: { source: 0, edited: -6, bypassing: false, pending: false },
+      }),
+    );
+    const lowered = a.matchLowered(a.matchWho.edited, '6.0 dB');
+    expect(button).toHaveAccessibleDescription(lowered);
+    expect(button).toHaveAttribute('title', `${a.match}：${lowered}`);
+    act(() =>
+      useAudioStore.setState({
+        matchInfo: { source: 0, edited: -2.5, bypassing: true, pending: false },
+      }),
+    );
+    expect(button).toHaveAccessibleDescription(a.matchLowered(a.matchWho.audition, '2.5 dB'));
+    act(() =>
+      useAudioStore.setState({
+        matchInfo: { source: 0, edited: 0, bypassing: false, pending: true },
+      }),
+    );
+    expect(button).toHaveAccessibleDescription(a.matchMeasuring);
+    fireEvent.click(button);
+    expect(useAudioStore.getState().matchOn).toBe(false);
+  });
+
   it('カプセルの［一時的に外して聞く］（M17 段 6）：押すたびに切り替え、外した音を用意している間はその進み', () => {
     openState([eqNode([bell(2_800, -5)])]);
     useEditorStore.setState({ selected: 5 });
@@ -548,7 +580,15 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
       const v = useAudioStore.getState().view;
       if (!v) throw new Error('表示がない');
       useAudioStore.setState({
-        view: { ...v, audition: { node: 5, phase: { type: 'solving', progress: 0.4 }, valid: [] } },
+        view: {
+          ...v,
+          audition: {
+            node: 5,
+            phase: { type: 'solving', progress: 0.4 },
+            valid: [],
+            loudness: { type: 'idle' },
+          },
+        },
       });
     });
     expect(screen.getByText(a.spectrum.bypassPreparing('40%'))).toBeInTheDocument();

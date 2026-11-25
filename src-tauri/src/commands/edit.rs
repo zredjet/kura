@@ -100,7 +100,7 @@ pub struct EditAuditionRequestDto {
 }
 
 /// 試聴の様子（M17 段 6）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EditAuditionPhaseDto {
     /// 外した音を配れる（`auditionId` で取る）。
@@ -112,7 +112,7 @@ pub enum EditAuditionPhaseDto {
 }
 
 /// 試聴の情報（M17 段 6）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EditAuditionDto {
     /// 外すノード。
@@ -120,6 +120,8 @@ pub struct EditAuditionDto {
     pub phase: EditAuditionPhaseDto,
     /// 試聴の値の有効な区間（`/edit/{session}/audition/{auditionId}/pcm/…` で取れる所）。
     pub valid: Vec<EditSpanDto>,
+    /// 外して聞く音のラウドネス（`edit_measure` の `audition` で頼む。`auditionId` で覚える）。
+    pub loudness: EditLoudnessStateDto,
 }
 
 impl From<kura_core::edit::editor::audio::audition::AuditionInfo> for EditAuditionDto {
@@ -137,6 +139,29 @@ impl From<kura_core::edit::editor::audio::audition::AuditionInfo> for EditAuditi
                 .into_iter()
                 .map(|(start, end)| EditSpanDto { start, end })
                 .collect(),
+            loudness: a.loudness.into(),
+        }
+    }
+}
+
+/// 計る音の役（M17 段 6。音量を合わせて聞く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum EditMeasureTargetDto {
+    /// 今の出力（表示の `samplesId`）。
+    Output,
+    /// 元（全部のノードを外した計画の出力。入力の全体）。
+    Input,
+    /// 外して聞く音（`auditionId`。外して聞いていなければ invalid）。
+    Audition,
+}
+
+impl From<EditMeasureTargetDto> for kura_core::edit::editor::audio::measure::MeasureTarget {
+    fn from(t: EditMeasureTargetDto) -> Self {
+        match t {
+            EditMeasureTargetDto::Output => Self::Output,
+            EditMeasureTargetDto::Input => Self::Input,
+            EditMeasureTargetDto::Audition => Self::Audition,
         }
     }
 }
@@ -861,6 +886,8 @@ pub struct EditAudioViewDto {
     pub audition_id: String,
     /// 試聴の情報（頼みに試聴があるときだけ）。
     pub audition: Option<EditAuditionDto>,
+    /// 元のラウドネス（M17 段 6。`edit_measure` の `input` で頼む）。
+    pub input_loudness: EditLoudnessStateDto,
 }
 
 /// スペクトルの区間の平均の頼み（M17 段 4）。
@@ -1057,6 +1084,7 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             spec_average: v.spec_average.into_iter().map(Into::into).collect(),
             audition_id: v.audition_id,
             audition: v.audition.map(Into::into),
+            input_loudness: v.input_loudness.into(),
         }
     }
 }
@@ -1644,16 +1672,22 @@ pub async fn edit_sample(
 
 /// 音声のエディタ：今の rev の出力（量子化のあと）のラウドネス。出力の指紋ごとに覚え、短い音声はその場で計って `ready` を
 /// 返す（長い音声は計りを予約して `measuring` を返し、`edit_view { work: true }` の裏の仕事で計る）。描いている途中の表示を止めない。
+/// `target` で元・外して聞く音も計れる（M17 段 6。省けば今の出力）。
 #[tauri::command]
 #[specta::specta]
 pub async fn edit_measure(
     state: State<'_, AppState>,
     session: String,
+    target: Option<EditMeasureTargetDto>,
 ) -> Result<EditLoudnessStateDto, AppError> {
     let lib = state.session()?;
     blocking(move || {
         let env = EditorEnv::of(&lib)?;
-        Ok(editor::audio::measure::measure(&env, &session)?.into())
+        let target = target.map_or(
+            kura_core::edit::editor::audio::measure::MeasureTarget::Output,
+            Into::into,
+        );
+        Ok(editor::audio::measure::measure_target(&env, &session, target)?.into())
     })
     .await
 }
@@ -2417,7 +2451,9 @@ mod tests {
                     node: NodeId(3),
                     phase: kura_core::edit::editor::audio::audition::AuditionPhase::Solving(0.5),
                     valid: vec![(0, 65_536)],
+                    loudness: LoudnessState::Idle,
                 }),
+                input_loudness: LoudnessState::Idle,
             },
         ))));
         let json = serde_json::to_value(audio).unwrap();
@@ -2443,7 +2479,7 @@ mod tests {
         assert_eq!(
             json["view"]["audition"],
             json!({ "node": 3, "phase": { "type": "solving", "progress": 0.5 },
-                    "valid": [{ "start": 0, "end": 65536 }] })
+                    "valid": [{ "start": 0, "end": 65536 }], "loudness": { "type": "idle" } })
         );
         assert_eq!(json["view"]["workStalled"], json!(true));
         assert_eq!(

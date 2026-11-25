@@ -343,3 +343,119 @@ fn script(env: &Env, s: &str, n: u64) {
         .unwrap()
         .script = Some(n);
 }
+
+/// 全体の描画に当てたラウドネス（正）。
+fn whole_loudness(bytes: &[u8], graph: &Graph) -> super::measure::LoudnessValues {
+    use kura_engine::analysis::NoParams;
+    use kura_engine::analysis::audio::loudness::LoudnessAnalysis;
+    let want = rendered(bytes, "wav", graph);
+    let report = kura_engine::Engine::new()
+        .unwrap()
+        .analyze::<LoudnessAnalysis>(
+            &kura_engine::Value::Audio(want),
+            &NoParams {},
+            &kura_engine::NoMonitor,
+        )
+        .unwrap();
+    super::measure::values_of(&report)
+}
+
+fn ready(state: &super::measure::LoudnessState) -> super::measure::LoudnessValues {
+    match state {
+        super::measure::LoudnessState::Ready { values, .. } => values.clone(),
+        other => panic!("計れていない：{other:?}"),
+    }
+}
+
+/// 短い音声（M17 段 6 の音量を合わせて聞く）：元（全部のノードを外した計画）と外して聞く音をその場で計り、どちらも全体の
+/// 描画に当てた解析と同じ。元の id は編集しても変わらず（計り直さない）、表示の情報の `inputLoudness`・`audition.loudness`
+/// に載る。外して聞いていなければ外して聞く音は計れない。
+#[test]
+fn input_and_audition_loudness_are_measured_on_request() {
+    use super::measure::{MeasureTarget, measure_target};
+    let env = Env::new();
+    let frames = 6 * C;
+    let bytes = noise_wav(8_000, 1, frames, 66);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session.clone();
+    env.step(
+        &s,
+        vec![
+            add(0, "audio.gain", json!({ "db": -4.0 })),
+            add(1, "audio.eq", eq(6.0)),
+        ],
+        &spans(&[]),
+    );
+    assert!(matches!(
+        measure_target(&env.env(), &s, MeasureTarget::Audition),
+        Err(crate::edit::editor::EditorError::Invalid { .. })
+    ));
+    let input = measure_target(&env.env(), &s, MeasureTarget::Input).unwrap();
+    let want_input = whole_loudness(&bytes, &Graph::new_single());
+    assert_eq!(ready(&input), want_input);
+    // 編集しても元は同じ（覚えた結果を返す）
+    env.step(&s, vec![set(1, json!({ "db": -9.0 }))], &spans(&[]));
+    assert_eq!(
+        measure_target(&env.env(), &s, MeasureTarget::Input).unwrap(),
+        input
+    );
+    // 外して聞く音
+    env.step(&s, Vec::new(), &bypass(2, &[], false));
+    let audition = measure_target(&env.env(), &s, MeasureTarget::Audition).unwrap();
+    assert_eq!(ready(&audition), whole_loudness(&bytes, &only_gain(-9.0)));
+    let out = env.step(&s, Vec::new(), &bypass(2, &[], false));
+    let info = shown_audio(&out.view);
+    assert_eq!(info.input_loudness, input);
+    assert_eq!(info.audition.as_ref().unwrap().loudness, audition);
+}
+
+/// 長い音声：元・外して聞く音の計りは予約して裏の仕事で進め（出力の計りと別に持つ）、表示の出力が替わっても捨てない。
+/// 結果は全体の描画に当てた解析と同じ。
+#[test]
+fn long_input_loudness_runs_beside_the_output() {
+    use super::measure::{LoudnessState, MeasureTarget, measure, measure_target};
+    let env = Env::new();
+    let frames = 130 * C;
+    let bytes = noise_wav(8_000, 1, frames, 67);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let idle = Viewport::Audio(AudioViewport {
+        spans: vec![(0, C)],
+        work: false,
+        ..AudioViewport::idle()
+    });
+    let work = Viewport::Audio(AudioViewport {
+        spans: vec![(0, C)],
+        work: true,
+        ..AudioViewport::idle()
+    });
+    let s = env.open_with(id, idle.clone()).session.clone();
+    env.step(&s, vec![add(0, "audio.gain", json!({ "db": -3.0 }))], &idle);
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    assert!(matches!(
+        measure_target(&env.env(), &s, MeasureTarget::Input).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    // 出力を替えて（確定の表示）出力の計りかけは捨てても、元の計りかけは残る
+    let out = env.step(&s, vec![set(1, json!({ "db": -5.0 }))], &idle);
+    let info = shown_audio(&out.view);
+    assert!(matches!(
+        info.input_loudness,
+        LoudnessState::Measuring { .. }
+    ));
+    assert_eq!(info.loudness, LoudnessState::Idle, "出力の計りかけは捨てる");
+    assert!(info.work, "元を計っている間は裏の仕事がある");
+    let mut got = None;
+    for _ in 0..1_000 {
+        let out = env.step(&s, Vec::new(), &work);
+        let info = shown_audio(&out.view);
+        if let LoudnessState::Ready { .. } = info.input_loudness {
+            got = Some(info.input_loudness.clone());
+            break;
+        }
+    }
+    let got = got.expect("元を計り終えない");
+    assert_eq!(ready(&got), whole_loudness(&bytes, &Graph::new_single()));
+}

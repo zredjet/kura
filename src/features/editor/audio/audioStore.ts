@@ -58,6 +58,7 @@ import {
 } from './eqModel';
 import { defaultParams } from '../opsCatalog';
 import { drawSpectrum } from './drawSpectrum';
+import { dbToGain, type MatchLevels, matchGains } from './loudnessMatch';
 import { drawWave } from './drawWave';
 import { targetNode } from './handles';
 import {
@@ -232,12 +233,18 @@ export interface AudioEditorState {
   soloOn: boolean;
   /** スペクトルの面で Q を押している間（M17 段 6）。 */
   soloHeld: boolean;
+  /** 音量を合わせて聞く（M17 段 6。アプリを開いている間だけ覚える。localStorage には置かない）。 */
+  matchOn: boolean;
+  /**
+   * 合わせている様子（押してある間だけ）：鳴らす音ごとの下げる量（dB）と、比べる音を計っているか。
+   */
+  matchInfo: { source: number; edited: number; bypassing: boolean; pending: boolean } | null;
 }
 
 const IDLE_PLAY: AudioPlayState = { status: 'idle', mode: 'cursor' };
 
 function initialState(
-  keep?: Pick<AudioEditorState, 'loudnessTarget' | 'snapZero' | 'spectrum'>,
+  keep?: Pick<AudioEditorState, 'loudnessTarget' | 'snapZero' | 'spectrum' | 'matchOn'>,
 ): AudioEditorState {
   return {
     view: null,
@@ -264,6 +271,8 @@ function initialState(
     bypass: null,
     soloOn: false,
     soloHeld: false,
+    matchOn: keep?.matchOn ?? false,
+    matchInfo: null,
     spectrum: keep?.spectrum ?? loadSpectrumSettings(),
   };
 }
@@ -384,6 +393,21 @@ interface AudioRuntime {
   /** ドラッグの途中（取り消しを止める）。 */
   dragging: boolean;
   unsubscribe: () => void;
+  /** 音量を合わせて聞く（M17 段 6）：役ごとの最後に分かったラウドネス・頼んだ計り・鳴らす音ごとの倍率。 */
+  match: MatchState;
+}
+
+/** 音量を合わせて聞くの手元の状態。 */
+interface MatchState {
+  levels: MatchLevels;
+  /** `audition` の値を計った外したノード（替わったら捨てる）。 */
+  auditionNode: number | null;
+  /** 元の計りを頼んだ。 */
+  inputAsked: boolean;
+  /** 計りを頼んだ外して聞く音の id。 */
+  auditionAsked: string | null;
+  /** 鳴らす音ごとの倍率。 */
+  gains: { source: number; edited: number };
 }
 
 let current: AudioRuntime | null = null;
@@ -744,6 +768,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       controller.setPlaybackSpans(spans);
     },
     volume: () => usePlayerStore.getState().prefs.volume / 100,
+    // 音量を合わせて聞く（M17 段 6）：大きいほうを下げる倍率
+    level: (source) => (source === 'source' ? rt.match.gains.source : rt.match.gains.edited),
     hold: holdAudio,
     onEnded: (pos, source) => {
       if (ctx.current()) playEnded(pos, source);
@@ -914,6 +940,14 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     }
     // 外して聞く（M17 段 6）：頼みに試聴を載せる（すぐ頼む）
     if (s.bypass !== before.bypass) controller.setAudition(s.bypass);
+    // 音量を合わせて聞く（M17 段 6）
+    if (
+      s.matchOn !== before.matchOn ||
+      s.bypass !== before.bypass ||
+      (s.matchOn && s.loudness !== before.loudness)
+    ) {
+      syncMatch(rt);
+    }
     if (
       s.face !== before.face ||
       s.eqLocal !== before.eqLocal ||
@@ -980,6 +1014,13 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     measuredFor: null,
     measuringFor: null,
     measuringAfter: 0,
+    match: {
+      levels: { input: null, output: null, audition: null },
+      auditionNode: null,
+      inputAsked: false,
+      auditionAsked: null,
+      gains: { source: 1, edited: 1 },
+    },
     lastSentSeq: 0,
     lastView: null,
     dragging: false,
@@ -1042,6 +1083,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       const s = useAudioStore.getState();
       // ラウドネス（計っている間の裏の仕事を、波形の面が頼み直しを決める前に決める）
       applyLoudness(rt, view, s.loudness, info);
+      noteMatchLevels(rt, view);
       controller.applyView(view, isWorkRequest(info.viewport));
       spectrum.applyView(view);
       if (useAudioStore.getState().face === 'spectrum') {
@@ -1198,6 +1240,130 @@ function applyLoudness(
     }
   }
   rt.controller.setExtraWork(rt.measuringFor === id);
+}
+
+// ===== 音量を合わせて聞く（M17 段 6） =====
+
+/** ラウドネスの状態の値（今の id のものでなければ undefined：前の値のまま。計れなければ null）。 */
+function loudnessOf(l: EditLoudnessStateDto | undefined, id: string): number | null | undefined {
+  if (!l || (l.type !== 'ready' && l.type !== 'failed') || l.samplesId !== id) return undefined;
+  if (l.type === 'failed') return null;
+  const v = l.loudness.loudness;
+  return v !== null && Number.isFinite(v) ? v : null;
+}
+
+/** 外した音を鳴らしているか（外して聞く音を配れて、表示の音と違う）。 */
+function bypassing(view: EditAudioView | null): boolean {
+  return (
+    !!view &&
+    view.audition?.phase.type === 'ready' &&
+    view.auditionId !== view.samplesId &&
+    useAudioStore.getState().bypass === view.audition.node
+  );
+}
+
+/** 表示の結果から、役ごとの最後に分かったラウドネスを覚える（計り直している間は前の値のまま）。 */
+function noteMatchLevels(rt: AudioRuntime, view: EditAudioView): void {
+  const m = rt.match;
+  const out = loudnessOf(view.loudness, view.samplesId);
+  if (out !== undefined) m.levels.output = out;
+  const input = view.inputLoudness;
+  if (input.type === 'ready' || input.type === 'failed') {
+    const v = loudnessOf(input, input.samplesId);
+    if (v !== undefined) m.levels.input = v;
+  }
+  const a = view.audition;
+  if ((a?.node ?? null) !== m.auditionNode) {
+    // 外すノードが替わった・やめた：外した音の値は捨てる
+    m.auditionNode = a?.node ?? null;
+    m.levels.audition = null;
+    m.auditionAsked = null;
+  }
+  if (a?.phase.type === 'ready') {
+    const v =
+      view.auditionId === view.samplesId
+        ? m.levels.output
+        : loudnessOf(a.loudness, view.auditionId);
+    if (v !== undefined) m.levels.audition = v;
+  }
+  syncMatch(rt);
+}
+
+/**
+ * 合わせる量を決めて再生に当てる（押してある間）。比べる音の計りがなければ頼む（元は初めて押したとき、外した音は外して
+ * 聞いている間。手の途中・仮の表示では頼まない）。
+ */
+function syncMatch(rt: AudioRuntime): void {
+  const s = useAudioStore.getState();
+  const view = rt.lastView;
+  const m = rt.match;
+  const on = s.matchOn;
+  // 今の出力のラウドネス（右パネルと同じ：表示の結果か edit_measure の応え。計り直している間は前の値のまま）
+  if (view) {
+    const out = loudnessOf(s.loudness, view.samplesId);
+    if (out !== undefined) m.levels.output = out;
+  }
+  if (on && view && !rt.dragging && view.solving === null) {
+    const session = rt.ctx.session();
+    if (session && !m.inputAsked && view.inputLoudness.type === 'idle') {
+      m.inputAsked = true;
+      void measureEdit(session, 'input')
+        .then((state) => {
+          if (live() !== rt) return;
+          const v = loudnessOf(state, state.type === 'idle' ? '' : state.samplesId);
+          if (v !== undefined) {
+            m.levels.input = v;
+            syncMatch(rt);
+          }
+        })
+        .catch(() => {
+          // 頼み直せるようにする（次の表示の結果で）
+          m.inputAsked = false;
+        });
+    }
+    const a = view.audition;
+    if (
+      session &&
+      bypassing(view) &&
+      a?.loudness.type === 'idle' &&
+      m.auditionAsked !== view.auditionId
+    ) {
+      const id = view.auditionId;
+      m.auditionAsked = id;
+      void measureEdit(session, 'audition')
+        .then((state) => {
+          if (live() !== rt) return;
+          const v = loudnessOf(state, id);
+          if (v !== undefined && m.auditionNode === a.node) {
+            m.levels.audition = v;
+            syncMatch(rt);
+          }
+        })
+        .catch(() => {
+          if (m.auditionAsked === id) m.auditionAsked = null;
+        });
+    }
+  }
+  const playingBypass = bypassing(view);
+  const db = on ? matchGains(m.levels, playingBypass) : { source: 0, edited: 0 };
+  const gains = { source: dbToGain(db.source), edited: dbToGain(db.edited) };
+  const changed = gains.source !== m.gains.source || gains.edited !== m.gains.edited;
+  m.gains = gains;
+  if (changed) rt.player.relevel();
+  // 比べる音が 2 つそろっていない（計っている・計りを待っている）
+  const known = [m.levels.input, m.levels.output, playingBypass ? m.levels.audition : null].filter(
+    (v) => v !== null,
+  ).length;
+  const info = on
+    ? { source: db.source, edited: db.edited, bypassing: playingBypass, pending: known < 2 }
+    : null;
+  const prev = s.matchInfo;
+  if (JSON.stringify(prev) !== JSON.stringify(info)) useAudioStore.setState({ matchInfo: info });
+}
+
+/** 音量を合わせて聞く（M17 段 6）：押すたびに切り替える。 */
+export function toggleLoudnessMatch(): void {
+  useAudioStore.setState({ matchOn: !useAudioStore.getState().matchOn });
 }
 
 /** 一時的な誤りか（Busy：一括・保存が予算を使っている。IPC の外の誤り）。覚えずにあとで頼み直す。 */

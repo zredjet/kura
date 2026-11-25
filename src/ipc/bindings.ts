@@ -113,8 +113,15 @@ export const commands = {
 	/**
 	 *  音声のエディタ：今の rev の出力（量子化のあと）のラウドネス。出力の指紋ごとに覚え、短い音声はその場で計って `ready` を
 	 *  返す（長い音声は計りを予約して `measuring` を返し、`edit_view { work: true }` の裏の仕事で計る）。描いている途中の表示を止めない。
+	 *  `target` で元・外して聞く音も計れる（M17 段 6。省けば今の出力）。
 	 */
-	editMeasure: (session: string) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session })),
+	editMeasure: (session: string, target: 
+/**  今の出力（表示の `samplesId`）。 */
+"output" | 
+/**  元（全部のノードを外した計画の出力。入力の全体）。 */
+"input" | 
+/**  外して聞く音（`auditionId`。外して聞いていなければ invalid）。 */
+"audition" | null) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session, target })),
 	/**
 	 *  音声のエディタ：今の rev の出力の区間のスペクトルの帯ごとの平均と最大（M17 段 4。`kura-spec/1`）。求めるチャンクが少なければ
 	 *  その場で `ready` を返し、多ければ予約して `measuring` を返す（`edit_view { work: true }` の裏の仕事で求める。表示の情報の
@@ -1411,6 +1418,8 @@ export type EditAudioViewDto = {
 	auditionId: string,
 	/**  試聴の情報（頼みに試聴があるときだけ）。 */
 	audition: EditAuditionDto | null,
+	/**  元のラウドネス（M17 段 6。`edit_measure` の `input` で頼む）。 */
+	inputLoudness: EditLoudnessStateDto,
 };
 
 /**  音声の表示の要求。区間はどれも出力のフレーム。 */
@@ -1438,6 +1447,8 @@ export type EditAuditionDto = {
 	phase: EditAuditionPhaseDto,
 	/**  試聴の値の有効な区間（`/edit/{session}/audition/{auditionId}/pcm/…` で取れる所）。 */
 	valid: EditSpanDto[],
+	/**  外して聞く音のラウドネス（`edit_measure` の `audition` で頼む。`auditionId` で覚える）。 */
+	loudness: EditLoudnessStateDto,
 };
 
 /**  試聴の様子（M17 段 6）。 */
@@ -1667,6 +1678,15 @@ export type EditMarkerDto = {
 	pos: number,
 	name: string,
 };
+
+/**  計る音の役（M17 段 6。音量を合わせて聞く）。 */
+export type EditMeasureTargetDto = 
+/**  今の出力（表示の `samplesId`）。 */
+"output" | 
+/**  元（全部のノードを外した計画の出力。入力の全体）。 */
+"input" | 
+/**  外して聞く音（`auditionId`。外して聞いていなければ invalid）。 */
+"audition";
 
 /**  ノードの要約。 */
 export type EditNodeDto = {

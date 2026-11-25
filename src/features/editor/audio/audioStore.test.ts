@@ -49,6 +49,7 @@ import {
   setSpectrumSettings,
   spectrumController,
   toggleBypass,
+  toggleLoudnessMatch,
   toggleSolo,
   setSoloHeld,
   loadSpectrumSettings,
@@ -207,6 +208,8 @@ beforeEach(() => {
     snapshot: { ...usePlayerStore.getState().snapshot, playing: false },
   });
   useNoticeStore.setState({ message: null });
+  // 音量を合わせて聞くはアプリを開いている間覚える：テストごとに戻す
+  useAudioStore.setState({ matchOn: false });
 });
 
 afterEach(async () => {
@@ -454,6 +457,35 @@ describe('音声のアダプタ', () => {
       },
     }) as const;
   const ID = '00112233aabbccdd';
+
+  it('音量を合わせて聞く（M17 段 6）：初めて押したら元を 1 回だけ計り、大きいほう（編集後）を下げる。押した状態は閉じても覚える', async () => {
+    vi.mocked(measureEdit).mockImplementation(async (_s, target) =>
+      target === 'input' ? READY('aaaa000000000000', -20) : READY(ID, -14),
+    );
+    await open();
+    expect(useAudioStore.getState().matchInfo).toBeNull();
+    toggleLoudnessMatch();
+    await flush();
+    const asked = vi.mocked(measureEdit).mock.calls.filter((c) => c[1] === 'input');
+    expect(asked).toHaveLength(1);
+    expect(useAudioStore.getState().matchInfo).toEqual({
+      source: 0,
+      edited: -6,
+      bypassing: false,
+      pending: false,
+    });
+    // 次の表示が届いても元を頼み直さない
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 2 })));
+    pushEditorSteps([{ type: 'seal' }]);
+    await flush();
+    expect(vi.mocked(measureEdit).mock.calls.filter((c) => c[1] === 'input')).toHaveLength(1);
+    // やめると合わせない
+    toggleLoudnessMatch();
+    expect(useAudioStore.getState().matchInfo).toBeNull();
+    toggleLoudnessMatch();
+    await closeEditor();
+    expect(useAudioStore.getState().matchOn).toBe(true);
+  });
 
   it('ラウドネス：一時的な誤り（Busy）は確かな失敗として覚えず、あとで頼み直す', async () => {
     vi.mocked(measureEdit).mockRejectedValue(
@@ -1167,7 +1199,17 @@ describe('スペクトルの面の点の手（M17 段 5）', () => {
     selectNode(6);
     expect(useAudioStore.getState().bypass).toBeNull();
     vi.mocked(viewEdit).mockImplementation(async () =>
-      result(view({ audition: { node: 6, phase: { type: 'unavailable' }, valid: [] } }), keep),
+      result(
+        view({
+          audition: {
+            node: 6,
+            phase: { type: 'unavailable' },
+            valid: [],
+            loudness: { type: 'idle' },
+          },
+        }),
+        keep,
+      ),
     );
     toggleBypass();
     expect(useAudioStore.getState().bypass).toBe(6);

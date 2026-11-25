@@ -30,6 +30,7 @@ import {
   type EditImageViewportDto,
   type EditLoudnessDto,
   type EditLoudnessStateDto,
+  type EditMeasureTargetDto,
   type EditMarkerDto,
   type EditNodeDto,
   type EditOpenedDto_Serialize,
@@ -101,6 +102,7 @@ export type {
   EditImageViewportDto,
   EditLoudnessDto,
   EditLoudnessStateDto,
+  EditMeasureTargetDto,
   EditMarkerDto,
   EditNodeDto,
   EditPeaksInfoDto,
@@ -237,8 +239,11 @@ export function eqCurve(
  * 音声のラウドネスを計る（M13）：今の rev の出力（量子化のあと）の積分ラウドネス・LRA・トゥルーピーク。覚えていれば
  * それを返す。長い音声は裏の仕事で計る（`measuring`）。
  */
-export function measureEdit(session: string): Promise<EditLoudnessStateDto> {
-  return unwrap(commands.editMeasure(session));
+export function measureEdit(
+  session: string,
+  target: EditMeasureTargetDto | null = null,
+): Promise<EditLoudnessStateDto> {
+  return unwrap(commands.editMeasure(session, target));
 }
 
 /**

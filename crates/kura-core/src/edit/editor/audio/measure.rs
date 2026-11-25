@@ -22,6 +22,10 @@
 //!     { work: true }` でしか進まないので、フロントは `Measuring` の間 `work: true` の表示を頼み続ける。
 //! - `Latest` の世代を払い出さない（表示を止めない）。止まるのは閉じたときだけ。表示の情報の `loudness` にも、覚えている状態を
 //!   毎回載せる（計っている途中なら `Measuring`、覚えていなければ `Idle`）。
+//! - **計る音の役**（M17 段 6。音量を合わせて聞く。[`MeasureTarget`]）：今の出力のほかに、元（全部のノードを外した計画の出力。
+//!   入力の全体で、編集しても id は変わらない）と、外して聞く音（試聴の計画の出力）を計れる。計りかけは役ごとに 1 つ持ち
+//!   （`retarget` は出力の計りかけだけを捨てる）、裏の仕事の区切りは出力 → 外して聞く音 → 元の順に進める。結果はどれも出力の
+//!   指紋で同じ LRU に覚える。
 
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
@@ -33,6 +37,7 @@ use kura_engine::analysis::{Analysis, AnalysisRequest, Analyzed, NoParams, Reaso
 use kura_engine::audio::source::read_through;
 use kura_engine::audio::stream::{AudioSink, StreamEnd, StreamInfo};
 use kura_engine::monitor::Ticket;
+use kura_engine::render::Plan;
 use kura_engine::render::cache::RenderOptions;
 use kura_engine::render::estimate::{EstimateSpec, Source};
 use kura_engine::render::region::{Area, Spans};
@@ -110,8 +115,22 @@ pub fn values_of(r: &LoudnessReport) -> LoudnessValues {
     }
 }
 
+/// 計る音の役（M17 段 6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasureTarget {
+    /// 今の出力（表示の `samplesId`）。
+    Output,
+    /// 元（全部のノードを外した計画の出力。聞き比べの「元」）。
+    Input,
+    /// 外して聞く音（試聴の計画の出力。`auditionId`）。
+    Audition,
+}
+
 /// 長い音声の計りかけ（裏の仕事で窓ごとに進める）。
 struct MeasureRun {
+    /// 計る音の役と、流す計画。
+    role: MeasureTarget,
+    plan: Plan,
     /// 計っている出力の `samplesId`。
     samples_id: String,
     /// 出力の長さ（フレーム）。
@@ -139,7 +158,10 @@ impl MeasureRun {
 pub(crate) struct MeasureJob {
     /// (samplesId, 状態)。古い順。
     results: Vec<(String, LoudnessState)>,
-    run: Option<MeasureRun>,
+    /// 計りかけ（役ごとに 1 つまで）。
+    runs: Vec<MeasureRun>,
+    /// 元を計る計画の出力の id（一度計ると覚える。表示の情報の `inputLoudness` を引く）。
+    pub(crate) input_id: Option<String>,
     /// 裏の仕事で 1 チャンクを流して計る時間の見積もり（区切りの中で流す数を決める。段 7）。
     pub(crate) pace: Pace,
 }
@@ -147,7 +169,7 @@ pub(crate) struct MeasureJob {
 impl MeasureJob {
     /// 覚えている状態（計っている途中なら `Measuring`、なければ `Idle`）。
     pub(crate) fn state(&self, id: &str) -> LoudnessState {
-        if let Some(r) = self.run.as_ref().filter(|r| r.samples_id == id) {
+        if let Some(r) = self.runs.iter().find(|r| r.samples_id == id) {
             return LoudnessState::Measuring {
                 samples_id: id.to_string(),
                 progress: r.progress(),
@@ -161,14 +183,25 @@ impl MeasureJob {
 
     /// 出力 `id` を計っている途中か（裏の仕事が残っている）。
     pub(crate) fn running(&self, id: &str) -> bool {
-        self.run.as_ref().is_some_and(|r| r.samples_id == id)
+        self.runs.iter().any(|r| r.samples_id == id)
     }
 
-    /// 操作中でない確定の表示の出力が `id` になった：ほかの出力の計りかけを捨てる（仮の表示では呼ばない）。
+    /// 裏の仕事が残っているか（今の出力 `id` の計りかけか、元・外して聞く音の計りかけ）。
+    pub(crate) fn has_work(&self, id: &str) -> bool {
+        self.runs
+            .iter()
+            .any(|r| r.role != MeasureTarget::Output || r.samples_id == id)
+    }
+
+    /// 操作中でない確定の表示の出力が `id` になった：ほかの出力の計りかけを捨てる（仮の表示では呼ばない。元・外して聞く音の
+    /// 計りかけは捨てない）。
     pub(crate) fn retarget(&mut self, id: &str) {
-        if self.run.as_ref().is_some_and(|r| r.samples_id != id) {
-            self.run = None;
-        }
+        self.retarget_role(MeasureTarget::Output, id);
+    }
+
+    /// 役 `role` の計る音が `id` になった：その役のほかの音の計りかけを捨てる。
+    pub(crate) fn retarget_role(&mut self, role: MeasureTarget, id: &str) {
+        self.runs.retain(|r| r.role != role || r.samples_id == id);
     }
 
     fn remember(&mut self, id: &str, state: LoudnessState) {
@@ -183,7 +216,7 @@ impl MeasureJob {
     #[cfg(test)]
     pub(crate) fn run_position(&self) -> Option<(String, usize, usize)> {
         let c = AUDIO_CHUNK as u64;
-        self.run.as_ref().map(|r| {
+        self.runs.first().map(|r| {
             (
                 r.samples_id.clone(),
                 r.pos.div_ceil(c) as usize,
@@ -258,25 +291,58 @@ impl Editor {
         progress: &mut WorkProgress,
         ticket: &Ticket,
     ) {
-        if !st.audio.as_ref().is_some_and(|a| a.measure.running(id)) {
-            return;
+        // 出力（今の出力の計りかけだけ）→ 外して聞く音 → 元の順（M17 段 6）
+        for role in [
+            MeasureTarget::Output,
+            MeasureTarget::Audition,
+            MeasureTarget::Input,
+        ] {
+            let target = st.audio.as_ref().and_then(|a| {
+                a.measure
+                    .runs
+                    .iter()
+                    .find(|r| {
+                        r.role == role && (role != MeasureTarget::Output || r.samples_id == id)
+                    })
+                    .map(|r| (r.samples_id.clone(), r.plan.clone()))
+            });
+            let Some((run_id, plan)) = target else {
+                continue;
+            };
+            if !self.advance_run_measure(st, &run_id, &plan, limit, progress, ticket) {
+                return;
+            }
         }
-        let plan = st.plan.clone();
+    }
+
+    /// 計りかけ `id`（計画 `plan`）を区切りの中で流す。流し終えて解いたら真（続けて次の役の計りへ）、区切り・予算・中止・誤りで
+    /// 止まったら偽。
+    fn advance_run_measure(
+        &self,
+        st: &mut State,
+        id: &str,
+        plan: &Plan,
+        limit: &mut Limit,
+        progress: &mut WorkProgress,
+        ticket: &Ticket,
+    ) -> bool {
         let output = st.output;
         let c = AUDIO_CHUNK as u64;
+        let find = |job: &mut MeasureJob| job.runs.iter().position(|r| r.samples_id == id);
         loop {
             let Some(job) = st.audio.as_mut().map(|a| &mut a.measure) else {
-                return;
+                return false;
             };
             let pace = job.pace;
-            let Some(run) = job.run.as_mut() else {
-                return;
+            let Some(i) = find(job) else {
+                return false;
             };
+            let run = &mut job.runs[i];
             if run.pos >= run.frames {
                 break;
             }
             if ticket.canceled() {
-                return;
+                return false;
             }
             // 窓の途中でも、締め切りまでに流せるチャンクの数だけにする（続きは次の区切り）
             let n = limit.grant(
@@ -286,26 +352,30 @@ impl Editor {
                     .min(MEASURE_WINDOW_CHUNKS),
             );
             if n == 0 {
-                return;
+                return false;
             }
             let (a, b) = (run.pos, run.pos.saturating_add(n * c).min(run.frames));
             let started = Instant::now();
             let spans = Spans::one(a, b);
             let spec = EstimateSpec::new(0)
-                .all_inputs(&plan, Source::Held)
+                .all_inputs(plan, Source::Held)
                 .area(output, Area::samples(spans.clone()));
             if let Err(err) =
                 self.runtime
-                    .admit_preview(&plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
+                    .admit_preview(plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
             {
                 tracing::debug!(%err, "ラウドネスを計る予算が空いていないので、あとにします");
                 settle(st);
                 progress.blocked = true;
-                return;
+                return false;
             }
-            let Some(run) = st.audio.as_mut().and_then(|a| a.measure.run.as_mut()) else {
+            let Some(run) = st
+                .audio
+                .as_mut()
+                .and_then(|a| find(&mut a.measure).map(|i| &mut a.measure.runs[i]))
+            else {
                 settle(st);
-                return;
+                return false;
             };
             let (inputs, cache) = (&st.inputs, &mut st.cache);
             let mut feed = FanFeed {
@@ -316,15 +386,7 @@ impl Editor {
             // 流して読む読みは源の LRU に入れない（見えている区間のチャンクを追い出さない。段 7）
             let r = self.runtime.preview(|e| {
                 read_through(|| {
-                    e.stream_audio(
-                        &plan,
-                        inputs,
-                        cache,
-                        output,
-                        Some(&spans),
-                        &mut feed,
-                        ticket,
-                    )
+                    e.stream_audio(plan, inputs, cache, output, Some(&spans), &mut feed, ticket)
                 })
             });
             if feed.fed {
@@ -338,7 +400,7 @@ impl Editor {
                         a.measure.pace.note(n, started.elapsed());
                     }
                 }
-                Err(err) if matches!(err.root(), EngineError::Canceled) => return,
+                Err(err) if matches!(err.root(), EngineError::Canceled) => return false,
                 Err(err) => {
                     let state = LoudnessState::Failed {
                         samples_id: id.to_string(),
@@ -346,24 +408,24 @@ impl Editor {
                             .to_string(),
                     };
                     if let Some(a) = st.audio.as_mut() {
-                        a.measure.run = None;
+                        a.measure.runs.retain(|r| r.samples_id != id);
                         a.measure.remember(id, state);
                     }
                     progress.blocked = true;
-                    return;
+                    return false;
                 }
             }
         }
         // 流し終えた：解く（短い計算なので中止を見ない。新しい要求に取って代わられても計りかけを無駄にしない）
         let Some(a) = st.audio.as_mut() else {
-            return;
+            return false;
         };
-        let Some(run) = a.measure.run.take() else {
-            return;
+        let Some(i) = find(&mut a.measure) else {
+            return false;
         };
         let MeasureRun {
             fan, frames, meta, ..
-        } = run;
+        } = a.measure.runs.remove(i);
         let mut fan = fan.into_inner().unwrap_or_else(PoisonError::into_inner);
         fan.set_end(&StreamEnd {
             frames,
@@ -371,14 +433,15 @@ impl Editor {
         });
         let state = finished(id, fan.finish(&NoMonitor));
         a.measure.remember(id, state);
+        true
     }
 }
 
-/// 今の rev の出力の `samplesId`。
-fn current_id(editor: &super::super::Editor, st: &State) -> Result<String, EditorError> {
+/// 計画 `plan` の出力の id（`samplesId` と同じ求め方）。
+fn plan_id(editor: &super::super::Editor, st: &State, plan: &Plan) -> Result<String, EditorError> {
     let fps = editor
         .runtime
-        .preview(|e| e.fingerprints(&st.plan, &st.inputs))
+        .preview(|e| e.fingerprints(plan, &st.inputs))
         .map_err(|e| EditorError::from_engine("出力の指紋を求められません", e))?;
     fps.outputs
         .iter()
@@ -391,22 +454,32 @@ fn current_id(editor: &super::super::Editor, st: &State) -> Result<String, Edito
 /// 値も [`WHOLE_VIEW_BYTES`] 以下（モジュールの説明）。
 fn whole_is_short(
     editor: &super::super::Editor,
-    st: &State,
+    plan: &Plan,
     full: &kura_engine::Shape,
 ) -> Result<bool, EditorError> {
     if !is_short(full) {
         return Ok(false);
     }
-    let spec = EstimateSpec::new(0).all_inputs(&st.plan, Source::Held);
+    let spec = EstimateSpec::new(0).all_inputs(plan, Source::Held);
     let est = editor
         .runtime
-        .preview(|e| e.estimate(&st.plan, &spec, None))
+        .preview(|e| e.estimate(plan, &spec, None))
         .map_err(|e| EditorError::from_engine("全体の描画を見積もれません", e))?;
     Ok(est.nodes.iter().all(|n| n.value <= WHOLE_VIEW_BYTES))
 }
 
 /// 今の rev の出力のラウドネス（モジュールの説明）。
 pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, EditorError> {
+    measure_target(env, session, MeasureTarget::Output)
+}
+
+/// 役 `target` の音のラウドネス（モジュールの説明。M17 段 6）。外して聞く音は、外して聞いていなければ Invalid（もう外して
+/// あるノードなら今の出力と同じ）。
+pub fn measure_target(
+    env: &EditorEnv<'_>,
+    session: &str,
+    target: MeasureTarget,
+) -> Result<LoudnessState, EditorError> {
     let editor = editor_of(env, session)?;
     let mut guard = editor.lock_state();
     let st = guard.as_mut().ok_or(EditorError::NoSession)?;
@@ -416,30 +489,51 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
             issues: Vec::new(),
         });
     }
-    let full = st
-        .plan
-        .output_shapes()
-        .into_iter()
-        .find(|(id, _)| *id == st.output)
-        .map(|(_, s)| s)
-        .ok_or_else(|| EditorError::Failed("文書に出力がありません".into()))?;
     if st.audio.is_none() {
         return Err(EditorError::Invalid {
             message: "音声ではありません".into(),
             issues: Vec::new(),
         });
     }
-    let id = current_id(&editor, st)?;
-    if let Some(a) = st.audio.as_ref() {
+    let (plan, role) = match target {
+        MeasureTarget::Output => (st.plan.clone(), MeasureTarget::Output),
+        MeasureTarget::Input => (input_plan(&editor, st)?, MeasureTarget::Input),
+        MeasureTarget::Audition => match audition_plan(st) {
+            Some(Some(plan)) => (plan, MeasureTarget::Audition),
+            // もう外してある：今の出力と同じ音
+            Some(None) => (st.plan.clone(), MeasureTarget::Output),
+            None => {
+                return Err(EditorError::Invalid {
+                    message: "外して聞いていません".into(),
+                    issues: Vec::new(),
+                });
+            }
+        },
+    };
+    let full = plan
+        .output_shapes()
+        .into_iter()
+        .find(|(id, _)| *id == st.output)
+        .map(|(_, s)| s)
+        .ok_or_else(|| EditorError::Failed("文書に出力がありません".into()))?;
+    let id = plan_id(&editor, st, &plan)?;
+    if let Some(a) = st.audio.as_mut() {
+        if target == MeasureTarget::Input {
+            a.measure.input_id = Some(id.clone());
+        }
         let known = a.measure.state(&id);
         if !matches!(known, LoudnessState::Idle) {
             return Ok(known);
         }
     }
     // 流し解きの間（M17 段 3）は短い音声でもその場で計らない（今の計画で全体を描くと錠の中で入力の全体を流し直す）。予約して、
-    // 解き終えたあと裏の仕事で計る
-    let solving = st.audio.as_ref().is_some_and(|a| a.solve.is_some());
-    if solving || !whole_is_short(&editor, st, &full)? {
+    // 解き終えたあと裏の仕事で計る（外して聞く音は試聴の流し解きの間。元は状態の表が要らない）
+    let solving = st.audio.as_ref().is_some_and(|a| match role {
+        MeasureTarget::Output => a.solve.is_some(),
+        MeasureTarget::Audition => a.audition.solve.is_some(),
+        MeasureTarget::Input => false,
+    });
+    if solving || !whole_is_short(&editor, &plan, &full)? {
         // 長い音声：計りを予約する（裏の仕事で窓ごとに流して解く）
         let frames = audio_shape(&full)
             .map(|(_, _, n)| n)
@@ -453,7 +547,10 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
             .runtime
             .preview(|e| e.analyze_stream(std::slice::from_ref(&req), &full));
         if let Some(a) = st.audio.as_mut() {
-            a.measure.run = Some(MeasureRun {
+            a.measure.runs.retain(|r| r.role != role);
+            a.measure.runs.push(MeasureRun {
+                role,
+                plan: plan.clone(),
                 samples_id: id.clone(),
                 frames,
                 fan: Mutex::new(fan),
@@ -463,7 +560,6 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
             return Ok(a.measure.state(&id));
         }
     }
-    let plan = st.plan.clone();
     let spec = EstimateSpec::new(0).all_inputs(&plan, Source::Held);
     if let Err(e) = editor.runtime.admit_preview(
         &plan,
@@ -509,6 +605,34 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
         a.measure.remember(&id, state.clone());
     }
     Ok(state)
+}
+
+/// 元を計る計画：今の文書の写しで、全部のノードを外したもの（出力は入力をそのまま通す。M17 段 6）。
+fn input_plan(editor: &super::super::Editor, st: &State) -> Result<Plan, EditorError> {
+    let mut g = st.session.current().to_graph();
+    for n in &mut g.nodes {
+        n.enabled = false;
+    }
+    editor
+        .runtime
+        .preview(|e| e.compile(&g, &st.shapes))
+        .map_err(|issues| {
+            EditorError::from_engine("元を計る計画を作れません", EngineError::Invalid(issues))
+        })
+}
+
+/// 外して聞く音の計画（外して聞いていなければ None、もう外してあるノードなら Some(None)）。
+fn audition_plan(st: &State) -> Option<Option<Plan>> {
+    let a = st.audio.as_ref()?;
+    let (rev, _, built) = a.audition.built.as_ref()?;
+    if *rev != st.session.rev().0 {
+        return None;
+    }
+    match built {
+        super::audition::Built::Plan(plan) => Some(Some(plan.clone())),
+        super::audition::Built::Same => Some(None),
+        super::audition::Built::Unavailable => None,
+    }
 }
 
 #[cfg(test)]
