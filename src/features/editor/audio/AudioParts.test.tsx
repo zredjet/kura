@@ -461,6 +461,20 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     expect(useEditorStore.getState().doc.order).toContain(5);
   });
 
+  it('行を押して ⌫ を押すと、そのバンドだけ消える（押した行にフォーカスを移す。WebKit はボタンを押してもフォーカスを移さない）', () => {
+    openState([eqNode([bell(1_000, 0), bell(4_000, 0)])]);
+    useEditorStore.setState({ selected: 5 });
+    render(<Editor />);
+    const list = screen.getByRole('list', { name: a.spectrum.bands });
+    const row = within(list).getAllByRole('button')[0] as HTMLElement;
+    // jsdom の click もフォーカスを移さない（WebKit と同じ）
+    fireEvent.click(row);
+    expect(document.activeElement).toBe(row);
+    fireEvent.keyDown(document.activeElement as Element, { key: 'Backspace', bubbles: true });
+    expect(useAudioStore.getState().eqLocal?.bands).toHaveLength(1);
+    expect(useEditorStore.getState().doc.order).toContain(5);
+  });
+
   it('スペクトルのときのカプセルの下の段：選んだバンドの読みと使い方の一言', () => {
     openState([eqNode([bell(2_800, -5)])]);
     useEditorStore.setState({ selected: 5 });

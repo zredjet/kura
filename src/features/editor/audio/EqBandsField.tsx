@@ -121,7 +121,11 @@ export function EqBandsField({ node }: { node: number }) {
               aria-pressed={i === selected}
               data-eq-band-row={i}
               data-eq-node={node}
-              onClick={() => setEqBand(i)}
+              onClick={(e) => {
+                // WebKit は押したボタンにフォーカスを移さない：移さないと次の ⌫ が行に届かず、核の「操作を消す」になる
+                e.currentTarget.focus();
+                setEqBand(i);
+              }}
             >
               <span className={styles.eqIndex}>{i + 1}</span>
               <span>{bandDetail(b)}</span>
