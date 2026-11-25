@@ -179,16 +179,19 @@ impl Editor {
         let Some(mut run) = st.audio.as_mut().and_then(|a| a.solve.take()) else {
             return Ok(Advanced::Done);
         };
-        let r = self.advance_run(st, &mut run, limit, progress, mon);
+        let plan = st.plan.clone();
+        let r = self.advance_run(st, &plan, &mut run, limit, progress, mon);
         if let Some(a) = st.audio.as_mut() {
             a.solve = Some(run);
         }
         r
     }
 
-    fn advance_run(
+    /// 計画 `plan` の流し解きの仕事 `run` を区切り `limit` だけ進める（表示と試聴の計画で分け合う。M17 段 6）。
+    pub(in crate::edit::editor) fn advance_run(
         &self,
         st: &mut State,
+        plan: &kura_engine::render::Plan,
         run: &mut SolveRun,
         limit: &mut Limit,
         progress: &mut WorkProgress,
@@ -208,13 +211,12 @@ impl Editor {
             let Some((port, (a, b))) = run.job.next_span(n) else {
                 return Ok(Advanced::Done);
             };
-            let plan = st.plan.clone();
             let spec = EstimateSpec::new(0)
-                .all_inputs(&plan, Source::Held)
+                .all_inputs(plan, Source::Held)
                 .port_area(port, Area::span(a, b));
             if let Err(err) =
                 self.runtime
-                    .admit_preview(&plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
+                    .admit_preview(plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
             {
                 tracing::debug!(%err, "流し解きの区切りの確保が空いていないので、あとにします");
                 progress.blocked = true;
@@ -226,7 +228,7 @@ impl Editor {
             // 流して読む読みは源の LRU に入れない（見えている区間のチャンクを追い出さない）
             let r = self
                 .runtime
-                .preview(|e| read_through(|| run.job.step(e, &plan, inputs, cache, n, mon)));
+                .preview(|e| read_through(|| run.job.step(e, plan, inputs, cache, n, mon)));
             settle(st);
             match r {
                 Ok(p) => {
@@ -313,11 +315,7 @@ impl Editor {
             .and_then(|a| a.solve.as_ref())
             .map(|s| s.job.finished().to_vec())
             .unwrap_or_default();
-        for s in solved {
-            if !st.cache.contains_analysis(&s.key) {
-                st.cache.register_external_analysis(s.key, s.out, s.bytes);
-            }
-        }
+        restore_finished(st, solved);
     }
 
     /// 誤りが続いた仕事を捨て、その鍵の列を覚える（列が変わるまで錠の中で解く道で描く）。
@@ -339,6 +337,18 @@ impl Editor {
             .unwrap_or_default();
         for (k, out, bytes) in tables {
             st.cache.register_external_analysis(k, out, bytes);
+        }
+    }
+}
+
+/// 仕事が解いた結果のうちキャッシュにないものを、外の解析として入れ直す（表示と試聴の流し解きで分け合う）。
+pub(in crate::edit::editor) fn restore_finished(
+    st: &mut State,
+    solved: Vec<kura_engine::render::presolve::Solved>,
+) {
+    for s in solved {
+        if !st.cache.contains_analysis(&s.key) {
+            st.cache.register_external_analysis(s.key, s.out, s.bytes);
         }
     }
 }

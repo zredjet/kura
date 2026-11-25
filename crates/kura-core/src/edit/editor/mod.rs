@@ -1313,20 +1313,32 @@ fn handle_chain(
     let (audio::handles::Handle::Trim { .. }, Some(id)) = (handle, node) else {
         return now();
     };
-    let mut g = st.session.current().to_graph();
-    match g.nodes.iter_mut().find(|n| n.id == id) {
-        Some(n) if n.enabled => n.enabled = false,
-        // 外している（道具の途中）・ない（handle_edit が断る）なら今の計画
-        _ => return now(),
-    }
-    match e.compile(&g, &st.shapes) {
-        Ok(plan) => plan.time_chain(st.output).unwrap_or_default(),
-        Err(issues) => {
+    // 外している（道具の途中）・ない（handle_edit が断る）なら今の計画
+    match compile_without(e, st.session.current(), &st.shapes, id) {
+        None => now(),
+        Some(Ok(plan)) => plan.time_chain(st.output).unwrap_or_default(),
+        Some(Err(issues)) => {
             // 外すと計画を作れない文書では道具を開けない（仮に外す手が断られる）。今の計画で写す
             tracing::debug!(?issues, "対象を外した文書の計画を作れません");
             now()
         }
     }
+}
+
+/// 文書 `doc` の写しでノード `id` を外した（`enabled = false`）計画（文書は変えない。切り詰めの道具の写し・試聴の計画。
+/// M17 段 6）。ノードがない・もう外してあれば None。
+pub(crate) fn compile_without(
+    e: &Engine,
+    doc: &Snapshot,
+    shapes: &BTreeMap<InputId, Shape>,
+    id: NodeId,
+) -> Option<Result<Plan, Issues>> {
+    let mut g = doc.to_graph();
+    match g.nodes.iter_mut().find(|n| n.id == id) {
+        Some(n) if n.enabled => n.enabled = false,
+        _ => return None,
+    }
+    Some(e.compile(&g, shapes))
 }
 
 /// 開いているエディタ（セッションが違えば NoSession）。
