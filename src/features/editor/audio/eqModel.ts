@@ -150,6 +150,26 @@ export function qOfBandwidth(oct: number): number {
   return 1 / (2 * Math.sinh((Math.LN2 / 2) * Math.max(oct, 1e-6)));
 }
 
+/**
+ * ソロで鳴らす帯（M17 段 6）：ベル・ノッチ・バンドパスは中心と Q、シェルフ・カットは境の周波数を中心に 1 オクターブ、
+ * チルトはソロなし（null）。
+ */
+export function soloBandOf(b: EqBand): { freq: number; q: number } | null {
+  switch (b.type) {
+    case 'bell':
+    case 'notch':
+    case 'bandPass':
+      return { freq: b.freq, q: b.q };
+    case 'lowShelf':
+    case 'highShelf':
+    case 'lowCut':
+    case 'highCut':
+      return { freq: b.freq, q: qOfBandwidth(1) };
+    case 'tilt':
+      return null;
+  }
+}
+
 /** 選んだ点の左右の Q の印の周波数（Q を使わない型は null）。 */
 export function qHandles(b: EqBand): { lo: number; hi: number } | null {
   if (!hasQ(b.type)) return null;

@@ -11,7 +11,14 @@ import editorStyles from '../Editor.module.css';
 import { sendParam, useEditorStore } from '../editorStore';
 import { paramsOf } from '../opsCatalog';
 import styles from './Audio.module.css';
-import { AUDIO_TOOLS, type AudioTool, cancelTrim, setSelection, useAudioStore } from './audioStore';
+import {
+  AUDIO_TOOLS,
+  type AudioTool,
+  cancelTrim,
+  setSelection,
+  toggleBypass,
+  useAudioStore,
+} from './audioStore';
 import {
   clearLoop,
   confirmTrim,
@@ -253,12 +260,34 @@ function LoopFields({ rate, frames }: { rate: number; frames: number }) {
  */
 function SpectrumFields() {
   const node = useEditorStore((s) => targetNode(s.doc, s.selected, 'audio.eq'));
+  const bypass = useAudioStore((s) => s.bypass);
+  const audition = useAudioStore((s) => s.view?.audition ?? null);
+  // 外した音を用意している間（長い音声の流し解き。それまでは外していない音を鳴らす）
+  const preparing =
+    bypass !== null && audition?.node === bypass && audition.phase.type === 'solving'
+      ? audition.phase.progress
+      : null;
+  const ts = ja.editor.audio.spectrum;
   return (
     <div className={styles.specFields}>
       <span id={SPECTRUM_READING_ID} className={styles.specReading}>
-        {node === null ? ja.editor.audio.spectrum.usage : <BandReading node={node} />}
+        {node === null ? ts.usage : <BandReading node={node} />}
       </span>
-      {node !== null && <span className={styles.specUsage}>{ja.editor.audio.spectrum.usage}</span>}
+      {node !== null && (
+        <button
+          type="button"
+          className={editorStyles.pill}
+          aria-pressed={bypass !== null}
+          onClick={toggleBypass}
+        >
+          {ts.bypass}
+        </button>
+      )}
+      {node !== null && (
+        <span className={styles.specUsage} aria-live="polite">
+          {preparing !== null ? ts.bypassPreparing(`${Math.floor(preparing * 100)}%`) : ts.usage}
+        </span>
+      )}
     </div>
   );
 }

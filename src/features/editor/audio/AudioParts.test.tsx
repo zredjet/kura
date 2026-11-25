@@ -504,6 +504,59 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     expect(useEditorStore.getState().doc.order).toContain(5);
   });
 
+  it('ソロ（M17 段 6）：面で Q を押している間だけ（繰り返し・バンドを選んでいないときは何もしない）、［ソロで聞く］は押すたびに切り替え、チルトは押せない', () => {
+    openState([eqNode([bell(1_000, 0), { ...bell(4_000, 0), type: 'tilt' }])]);
+    useEditorStore.setState({ selected: 5 });
+    useAudioStore.setState({ face: 'spectrum', soloOn: false, soloHeld: false });
+    render(<Editor />);
+    const face = screen.getByRole('group', { name: a.spectrum.face });
+    fireEvent.keyDown(face, { key: 'q', bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(false);
+    fireEvent.keyDown(face, { key: ']', bubbles: true });
+    fireEvent.keyDown(face, { key: 'q', bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(true);
+    fireEvent.keyUp(face, { key: 'q', bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(false);
+    fireEvent.keyDown(face, { key: 'q', repeat: true, bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(false);
+    // 右パネルの［ソロで聞く］
+    const solo = screen.getByRole('button', { name: a.spectrum.solo });
+    expect(solo).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(solo);
+    expect(useAudioStore.getState().soloOn).toBe(true);
+    expect(solo).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(solo);
+    expect(useAudioStore.getState().soloOn).toBe(false);
+    // チルトは押せない（Q も効かない）
+    act(() => useAudioStore.setState({ eqBand: 1 }));
+    expect(screen.getByRole('button', { name: a.spectrum.solo })).toBeDisabled();
+    fireEvent.keyDown(face, { key: 'q', bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(false);
+  });
+
+  it('カプセルの［一時的に外して聞く］（M17 段 6）：押すたびに切り替え、外した音を用意している間はその進み', () => {
+    openState([eqNode([bell(2_800, -5)])]);
+    useEditorStore.setState({ selected: 5 });
+    useAudioStore.setState({ face: 'spectrum', bypass: null });
+    render(<Editor />);
+    const button = screen.getByRole('button', { name: a.spectrum.bypass });
+    expect(button).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(button);
+    expect(useAudioStore.getState().bypass).toBe(5);
+    expect(button).toHaveAttribute('aria-pressed', 'true');
+    act(() => {
+      const v = useAudioStore.getState().view;
+      if (!v) throw new Error('表示がない');
+      useAudioStore.setState({
+        view: { ...v, audition: { node: 5, phase: { type: 'solving', progress: 0.4 }, valid: [] } },
+      });
+    });
+    expect(screen.getByText(a.spectrum.bypassPreparing('40%'))).toBeInTheDocument();
+    fireEvent.click(button);
+    expect(useAudioStore.getState().bypass).toBeNull();
+    expect(screen.queryByText(a.spectrum.bypassPreparing('40%'))).toBeNull();
+  });
+
   it('スペクトルのときのカプセルの下の段：選んだバンドの読みと使い方の一言', () => {
     openState([eqNode([bell(2_800, -5)])]);
     useEditorStore.setState({ selected: 5 });

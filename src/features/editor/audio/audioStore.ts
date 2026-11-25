@@ -47,7 +47,15 @@ import {
   useEditorStore,
 } from '../editorStore';
 import { addSteps, type ParamGesture } from '../paramSend';
-import { approxCompatible, bandsJson, type EqBand, type EqParams, eqJson, readEq } from './eqModel';
+import {
+  approxCompatible,
+  bandsJson,
+  type EqBand,
+  type EqParams,
+  eqJson,
+  readEq,
+  soloBandOf,
+} from './eqModel';
 import { defaultParams } from '../opsCatalog';
 import { drawSpectrum } from './drawSpectrum';
 import { drawWave } from './drawWave';
@@ -60,6 +68,7 @@ import {
   type PlayRequest,
   type PlaySource,
   type SourceInfo,
+  playbackChange,
 } from './playback';
 import {
   DEFAULT_SPECTRUM_SETTINGS,
@@ -95,6 +104,8 @@ export interface AudioViewSummary {
    * もの）。手元の値・枠をこの表示から戻さず、解き終えた表示を待つ。
    */
   solving: number | null;
+  /** 試聴の情報（外して聞いている間。M17 段 6）。 */
+  audition: EditAudioView['audition'];
 }
 
 /** 切り詰めの枠（T）。 */
@@ -212,6 +223,15 @@ export interface AudioEditorState {
   eqLocal: { node: number | null; bands: EqBand[]; ticket: number | null } | null;
   /** キーの手のあとに読み上げる選んだバンドの読み（面の `aria-live`）。 */
   eqAnnounce: string;
+  /**
+   * 一時的に外して聞くノード（M17 段 6。文書に入らない・取り消しの外。スペクトルの面のイコライザだけ。面・見るノードが
+   * 替わった・ノードが消えた・閉じたらやめる）。
+   */
+  bypass: number | null;
+  /** ［ソロで聞く］を押してある（M17 段 6。選んだバンドに付いて行く）。 */
+  soloOn: boolean;
+  /** スペクトルの面で Q を押している間（M17 段 6）。 */
+  soloHeld: boolean;
 }
 
 const IDLE_PLAY: AudioPlayState = { status: 'idle', mode: 'cursor' };
@@ -241,6 +261,9 @@ function initialState(
     eqHover: null,
     eqLocal: null,
     eqAnnounce: '',
+    bypass: null,
+    soloOn: false,
+    soloHeld: false,
     spectrum: keep?.spectrum ?? loadSpectrumSettings(),
   };
 }
@@ -263,6 +286,7 @@ export function summarizeAudioView(view: EditAudioView): AudioViewSummary {
     sourceMap: view.sourceMap,
     nodes: view.nodes,
     solving: view.solving,
+    audition: view.audition,
   };
 }
 
@@ -452,12 +476,39 @@ export function setAudioFace(face: AudioFace): void {
   if (s.face === face) return;
   // ドラッグの途中は替えない（面を替えると押した要素が消えて離す手が来ず、ドラッグの印・仮の値が残る）
   if (live()?.dragging) return;
+  // 外して聞くのはスペクトルの面のイコライザだけ（M17 段 6）：面を替えたらやめる
+  if (s.bypass !== null) useAudioStore.setState({ bypass: null });
   if (face === 'spectrum') {
     if (s.trim) cancelTrim();
     useAudioStore.setState({ face, tool: 'select', local: null });
   } else {
     useAudioStore.setState({ face });
   }
+}
+
+/**
+ * 一時的に外して聞く（M17 段 6）：押すたびに、スペクトルの面が出すイコライザを外した音と今の音を切り替える。文書は変えない。
+ */
+export function toggleBypass(): void {
+  const s = useAudioStore.getState();
+  if (s.bypass !== null) {
+    useAudioStore.setState({ bypass: null });
+    return;
+  }
+  const target = spectrumTarget();
+  if (s.face !== 'spectrum' || target === null) return;
+  useAudioStore.setState({ bypass: target });
+}
+
+/** ［ソロで聞く］（M17 段 6）：押すたびに、選んだバンドだけを鳴らすのと全体を切り替える。 */
+export function toggleSolo(): void {
+  const s = useAudioStore.getState();
+  useAudioStore.setState({ soloOn: !s.soloOn });
+}
+
+/** Q を押している間のソロ（M17 段 6。離す・フォーカスが外れる・窓が隠れるとやめる）。 */
+export function setSoloHeld(on: boolean): void {
+  if (useAudioStore.getState().soloHeld !== on) useAudioStore.setState({ soloHeld: on });
 }
 
 /** 面が出すイコライザの入力のレート（周波数を収める・軸。なければ出力のレート）。 */
@@ -770,10 +821,15 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
   let lastTarget: number | null = null;
   const refreshEq = () => {
     const s = useAudioStore.getState();
-    // 見るイコライザが替わった：選んだバンドを外す（面によらない：右パネルの表は波形のときも出る）
+    // 見るイコライザが替わった：選んだバンドを外す（面によらない：右パネルの表は波形のときも出る）。外して聞いていたら
+    // やめる（外すのは面が出すイコライザだけ。M17 段 6）
     const targetNow = spectrumTarget();
     if (targetNow !== lastTarget) {
       lastTarget = targetNow;
+      if (s.bypass !== null && s.bypass !== targetNow) {
+        useAudioStore.setState({ bypass: null });
+        return;
+      }
       if (s.eqBand !== null) {
         useAudioStore.setState({ eqBand: null });
         return;
@@ -830,8 +886,34 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       compatible: approxCompatible(params.bands, s.spectrum.channel),
     });
   };
+  /**
+   * ソロ（M17 段 6）：押してある・Q を押している間、スペクトルの面で選んだバンドの帯だけを鳴らす（手元の値に付いて行く）。
+   * 選びを外した・チルトにした・面を替えたら［ソロで聞く］を切る。
+   */
+  const syncSolo = () => {
+    const s = useAudioStore.getState();
+    const wanted = (s.soloOn || s.soloHeld) && s.face === 'spectrum' && s.eqBand !== null;
+    const target = wanted ? eqTargetParams() : null;
+    const band = target && s.eqBand !== null ? target.params.bands[s.eqBand] : undefined;
+    const solo = band ? soloBandOf(band) : null;
+    player.setSolo(solo);
+    if (s.soloOn && (s.face !== 'spectrum' || s.eqBand === null || (band && !solo))) {
+      useAudioStore.setState({ soloOn: false });
+    }
+  };
   const offAudio = useAudioStore.subscribe((s, before) => {
     controller.setOverlay(overlayOf(s));
+    if (
+      s.soloOn !== before.soloOn ||
+      s.soloHeld !== before.soloHeld ||
+      s.face !== before.face ||
+      s.eqBand !== before.eqBand ||
+      s.eqLocal !== before.eqLocal
+    ) {
+      syncSolo();
+    }
+    // 外して聞く（M17 段 6）：頼みに試聴を載せる（すぐ頼む）
+    if (s.bypass !== before.bypass) controller.setAudition(s.bypass);
     if (
       s.face !== before.face ||
       s.eqLocal !== before.eqLocal ||
@@ -868,7 +950,10 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
           JSON.stringify(local.bands);
       if (acked || same) useAudioStore.setState({ eqLocal: null });
     }
-    if (now.doc !== before.doc || now.selected !== before.selected) refreshEq();
+    if (now.doc !== before.doc || now.selected !== before.selected) {
+      refreshEq();
+      syncSolo();
+    }
     if (now.selected !== before.selected || now.doc !== before.doc) {
       controller.setOverlay(overlayOf(useAudioStore.getState()));
       const chosenEq =
@@ -965,6 +1050,11 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       }
       refreshEq();
       feed.setView(view, view.changed);
+      // 外せない（ノードが消えた・外すと形が変わる）：外して聞くのをやめて知らせる（M17 段 6）
+      if (view.audition?.phase.type === 'unavailable' && s.bypass === view.audition.node) {
+        rt.patch.bypass = null;
+        notify(t.bypassUnavailable);
+      }
       const summary = summarizeAudioView(view);
       rt.patch.view = summary;
       // 再生：形が変わったら（切り詰めの始まり・レート・チャンネル数）元を通して位置を写して始め直し、ほかは変わった所
@@ -977,7 +1067,9 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
         ) {
           restartAfterReshape(rt, prev, view);
         } else {
-          player.refresh(view.changed);
+          // 鳴らす音が試聴の値なら、id が替わったときだけ全体を替える（M17 段 6）
+          const change = playbackChange(prev, view);
+          if (change) player.refresh(change);
         }
       }
       // カーソル・選択を新しい長さに収める

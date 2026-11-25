@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
+import { editAuditionPcmUrl, editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
 import { ContextPool } from '../../../lib/assetAudio';
 import { fakeFactory, type FakeContext, type FakeGain } from '../../../test/fakeAudio';
 import {
@@ -14,6 +14,8 @@ import {
   PcmFeed,
   type PlaySource,
   planSegments,
+  playbackChange,
+  playsAudition,
   SWITCH_AHEAD_SECONDS,
   SWITCH_MIN_MS,
 } from './playback';
@@ -344,6 +346,46 @@ describe('編集中の試聴の置き方', () => {
   });
 });
 
+describe('ソロ（M17 段 6）', () => {
+  it('ソロにしたときだけバンドパスの道を作り、全体の音量のあとで素通しと 10 ms で替える。やめると戻す・帯に付いて行く', () => {
+    const t = setup();
+    t.player.play({ from: 0, source: 'edited', info: t.info });
+    const ctx = t.ctx();
+    expect(ctx.biquads).toHaveLength(0);
+    const master = ctx.gains[0];
+    t.player.setSolo({ freq: 2_800, q: 6 });
+    const f = ctx.biquads[0];
+    expect(f?.type).toBe('bandpass');
+    expect(f?.frequency.ramps.at(-1)).toEqual([2_800, ctx.currentTime + CROSSFADE_SECONDS]);
+    expect(f?.Q.ramps.at(-1)?.[0]).toBe(6);
+    // 全体の音量 → 素通し・バンドパス（素通しは 1 → 0、通した音は 0 → 1）
+    const [dry, wet] = ctx.gains.slice(-2);
+    expect(master?.dest).toBe(f);
+    expect(f?.dest).toBe(wet);
+    expect(dry?.ramps.at(-1)?.[0]).toBe(0);
+    expect(wet?.ramps.at(-1)?.[0]).toBe(1);
+    // ナイキストの 0.49 倍まで
+    t.player.setSolo({ freq: 40_000, q: 2 });
+    expect(f?.frequency.ramps.at(-1)?.[0]).toBeCloseTo(R * 0.49, 6);
+    // やめる：素通しへ戻す（道は残す）
+    t.player.setSolo(null);
+    expect(dry?.ramps.at(-1)?.[0]).toBe(1);
+    expect(wet?.ramps.at(-1)?.[0]).toBe(0);
+    expect(ctx.biquads).toHaveLength(1);
+  });
+
+  it('鳴らす前に決めたソロは鳴らし始めに当て、止めても覚えている（鳴らし始めはしない）', () => {
+    const t = setup();
+    t.player.setSolo({ freq: 500, q: 1.414 });
+    expect(t.player.playing).toBe(false);
+    expect(t.player.soloing).toEqual({ freq: 500, q: 1.414 });
+    t.player.play({ from: 0, source: 'edited', info: t.info });
+    expect(t.ctx().biquads[0]?.frequency.value).toBe(500);
+    t.player.stop();
+    expect(t.player.soloing).toEqual({ freq: 500, q: 1.414 });
+  });
+});
+
 describe('手のあとの交差フェード', () => {
   function rampsOf(g: FakeGain | undefined) {
     return { sets: g?.gain.sets ?? [], ramps: g?.gain.ramps ?? [] };
@@ -541,6 +583,74 @@ describe('試聴の PCM を取る', () => {
     );
     await settle();
     expect(feed.peek('edited', 2)).toBeUndefined();
+  });
+
+  it('外して聞いている間（auditionId が samplesId と違う）、編集後の音は試聴の PCM を audition.valid の区間だけ別の表に取る（M17 段 6）', async () => {
+    const io = fakeFetch();
+    const output = new PcmChunkCache();
+    const feed = new PcmFeed({ fetch: io.fetch, output });
+    const total = CHUNK * 4;
+    feed.setSession('ab');
+    const shown = {
+      rev: 5,
+      samplesId: '0011223344556677',
+      valid: [{ start: 0, end: total }],
+      frames: total,
+      channels: 2,
+      rate: R,
+    };
+    const id = '8899aabbccddeeff';
+    const bypassed = {
+      ...shown,
+      auditionId: id,
+      audition: { valid: [{ start: 0, end: CHUNK * 2 }] },
+    };
+    expect(playsAudition(shown)).toBe(false);
+    expect(playsAudition({ ...shown, auditionId: shown.samplesId })).toBe(false);
+    expect(playsAudition(bypassed)).toBe(true);
+    // 表示の表にあるチャンクは、外して聞いている間は使わない
+    output.put(0, { rev: 5, start: 0, frames: CHUNK, planes: [new Float32Array(CHUNK)] });
+    feed.setView(bypassed, null);
+    expect(feed.peek('edited', 0)).toBeUndefined();
+    feed.want('edited', 0);
+    feed.want('edited', 2);
+    expect(io.calls).toEqual([editAuditionPcmUrl('ab', id, 0, CHUNK)]);
+    io.resolve(io.calls[0] ?? '', pcmBytes(0, total, 2, `kura-edit/1:${id}`));
+    await settle();
+    expect(feed.peek('edited', 0)?.frames).toBe(CHUNK);
+    expect(feed.auditionCache.peek(0)).toBeDefined();
+    // デコーダが表示の id のもの（外す前の音）は使わない
+    feed.want('edited', 1);
+    io.resolve(
+      editAuditionPcmUrl('ab', id, CHUNK, CHUNK * 2),
+      pcmBytes(1, total, 2, 'kura-edit/1:0011223344556677'),
+    );
+    await settle();
+    expect(feed.peek('edited', 1)).toBeUndefined();
+    // やめたら表示の表に戻り、試聴の表は空になる
+    feed.setView(shown, null);
+    expect(feed.peek('edited', 0)?.rev).toBe(5);
+    expect(feed.auditionCache.peek(0)).toBeUndefined();
+  });
+
+  it('鳴らす音の替わり：表示の音どうしなら changed、試聴の id が替われば全体、同じ試聴なら替えない（M17 段 6）', () => {
+    const base = {
+      rev: 1,
+      samplesId: '0011223344556677',
+      valid: [],
+      frames: 10,
+      channels: 1,
+      rate: R,
+    };
+    const spans = { type: 'spans' as const, spans: [{ start: 0, end: 5 }] };
+    const bypassed = { ...base, auditionId: 'ffeeddccbbaa9988', changed: spans };
+    expect(playbackChange(null, { ...base, changed: spans })).toEqual(spans);
+    expect(playbackChange(base, { ...base, rev: 2, changed: spans })).toEqual(spans);
+    expect(playbackChange(base, bypassed)).toEqual({ type: 'all' });
+    expect(playbackChange(bypassed, { ...bypassed, samplesId: '1111111111111111' })).toBeNull();
+    expect(playbackChange(bypassed, { ...base, changed: { type: 'spans', spans: [] } })).toEqual({
+      type: 'all',
+    });
   });
 
   it('取れなかったチャンクは期限（1 秒から倍々）が過ぎたら取り直す（出力も元も）。失敗の回数を知らせる', async () => {

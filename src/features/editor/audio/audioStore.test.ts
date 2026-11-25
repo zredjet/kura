@@ -48,6 +48,9 @@ import {
   setSelection,
   setSpectrumSettings,
   spectrumController,
+  toggleBypass,
+  toggleSolo,
+  setSoloHeld,
   loadSpectrumSettings,
   usableChannel,
   toggleAB,
@@ -63,6 +66,7 @@ import {
   setLoop as setLoopFromField,
 } from './audioTools';
 import { CHUNK, FAIL_RETRY_MS } from './pcmChunks';
+import type { EqBand } from './eqModel';
 import { SPECTRUM_POINTER } from './spectrumPointer';
 import { useMenuStore } from '../../../components/Menu/menuStore';
 import { audioView, type AudioViewOver, fakeFetch, pcmBytes } from './testAudioView';
@@ -1008,7 +1012,7 @@ describe('スペクトルの面（M17 段 5）', () => {
 });
 
 describe('スペクトルの面の点の手（M17 段 5）', () => {
-  const band = {
+  const band: EqBand = {
     type: 'bell',
     freq: 1_000,
     gainDb: 0,
@@ -1111,6 +1115,105 @@ describe('スペクトルの面の点の手（M17 段 5）', () => {
     expect(useAudioStore.getState().eqBand).toBe(1);
     selectNode(6);
     expect(useAudioStore.getState().eqBand).toBeNull();
+  });
+
+  it('一時的に外して聞く（M17 段 6）：面のイコライザを外す頼みをすぐ載せ、手は送らない。もう一度・面を替えるとやめる', async () => {
+    await openSpectrum(eqDoc([band]));
+    // 表示の応えは文書を変えない（差分の並びを今のまま）
+    vi.mocked(viewEdit).mockImplementation(async () =>
+      result(view(), { doc: { base: 1, order: [5], nodes: [], outputs: null } }),
+    );
+    vi.mocked(viewEdit).mockClear();
+    toggleBypass();
+    expect(useAudioStore.getState().bypass).toBe(5);
+    await flush();
+    const asked = vi.mocked(viewEdit).mock.calls.at(-1)?.[1];
+    expect(asked?.type === 'audio' && asked.audition).toEqual({ bypass: 5, spans: [] });
+    expect(stepEdit).not.toHaveBeenCalled();
+    toggleBypass();
+    expect(useAudioStore.getState().bypass).toBeNull();
+    await flush();
+    const plain = vi.mocked(viewEdit).mock.calls.at(-1)?.[1];
+    expect(plain?.type === 'audio' && plain.audition).toBeFalsy();
+    toggleBypass();
+    setAudioFace('wave');
+    expect(useAudioStore.getState().bypass).toBeNull();
+    // 波形のときは外せない
+    toggleBypass();
+    expect(useAudioStore.getState().bypass).toBeNull();
+  });
+
+  it('外して聞いているノードが外せない（Rust が unavailable を返した）ならやめて知らせる。見るイコライザが替わってもやめる', async () => {
+    await openSpectrum(
+      eqDoc(
+        [band],
+        {
+          6: {
+            id: 6,
+            op: 'audio.eq',
+            v: 1,
+            enabled: true,
+            params: { bands: [band], phase: 'minimum', gainDb: 0 },
+          },
+        },
+        [5, 6],
+      ),
+    );
+    // 表示の応えは文書を変えない（差分の並びを今のまま）
+    const keep = { doc: { base: 1, order: [5, 6], nodes: [], outputs: null } };
+    vi.mocked(viewEdit).mockImplementation(async () => result(view(), keep));
+    toggleBypass();
+    expect(useAudioStore.getState().bypass).toBe(5);
+    selectNode(6);
+    expect(useAudioStore.getState().bypass).toBeNull();
+    vi.mocked(viewEdit).mockImplementation(async () =>
+      result(view({ audition: { node: 6, phase: { type: 'unavailable' }, valid: [] } }), keep),
+    );
+    toggleBypass();
+    expect(useAudioStore.getState().bypass).toBe(6);
+    await flush(WAVE_IDLE_MS + 200);
+    expect(useAudioStore.getState().bypass).toBeNull();
+    expect(useNoticeStore.getState().message).toBe(ja.editor.audio.bypassUnavailable);
+  });
+
+  it('ソロ（M17 段 6）：押してある・Q の間、選んだバンドの帯を再生に渡す（手元の値に付いて行く）。チルト・選びを外す・面を替えると切る', async () => {
+    await openSpectrum(eqDoc([band, { ...band, type: 'lowShelf', freq: 200 }]));
+    const player = audioPlayer();
+    if (!player) throw new Error('再生がない');
+    useAudioStore.setState({ eqBand: 0 });
+    toggleSolo();
+    expect(player.soloing).toEqual({ freq: 1_000, q: 1 });
+    // 手元の値（ドラッグ）に付いて行く
+    useAudioStore.setState({
+      eqLocal: { node: 5, bands: [{ ...band, freq: 1_500 }, band], ticket: null },
+    });
+    expect(player.soloing?.freq).toBe(1_500);
+    useAudioStore.setState({ eqLocal: null, eqBand: 1 });
+    expect(player.soloing?.freq).toBe(200);
+    // 選びを外すと［ソロで聞く］を切る
+    useAudioStore.setState({ eqBand: null });
+    expect(player.soloing).toBeNull();
+    expect(useAudioStore.getState().soloOn).toBe(false);
+    // Q を押している間だけ
+    useAudioStore.setState({ eqBand: 0 });
+    setSoloHeld(true);
+    expect(player.soloing?.freq).toBe(1_000);
+    setSoloHeld(false);
+    expect(player.soloing).toBeNull();
+    // チルトはソロなし（押してあっても切る）
+    useAudioStore.setState({
+      eqLocal: { node: 5, bands: [{ ...band, type: 'tilt' }], ticket: null },
+    });
+    toggleSolo();
+    expect(player.soloing).toBeNull();
+    expect(useAudioStore.getState().soloOn).toBe(false);
+    // 面を替えると切る
+    useAudioStore.setState({ eqLocal: null });
+    toggleSolo();
+    expect(player.soloing).not.toBeNull();
+    setAudioFace('wave');
+    expect(player.soloing).toBeNull();
+    expect(useAudioStore.getState().soloOn).toBe(false);
   });
 
   it('選んだ点の上のホイールで Q（応えの前に続けても前の手を土台にする）。点の外では手にしない', async () => {

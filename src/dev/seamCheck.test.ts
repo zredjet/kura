@@ -226,6 +226,7 @@ function placed(abs: number, start: number, end: number, fadeIn = false): Placed
     cycle: end - start,
     planes: p.planes,
     fadeIn,
+    level: 1,
   };
 }
 

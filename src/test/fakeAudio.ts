@@ -11,6 +11,7 @@
 
 import type {
   AudioParamLike,
+  BiquadLike,
   BufferLike,
   ContextLike,
   GainLike,
@@ -46,12 +47,19 @@ export interface FakeGain extends GainLike {
   disconnected: boolean;
 }
 
+export interface FakeBiquad extends BiquadLike {
+  readonly frequency: FakeParam;
+  readonly Q: FakeParam;
+  dest: unknown;
+}
+
 export interface FakeContext extends ContextLike {
   /** 文脈の時刻（テストが進める）。 */
   currentTime: number;
   requested: number | undefined;
   sources: FakeSource[];
   gains: FakeGain[];
+  biquads: FakeBiquad[];
   buffers: FakeBuffer[];
   closed: boolean;
   /** 触ったら失敗にする（loopStart・loopEnd）。 */
@@ -73,6 +81,7 @@ export function fakeFactory(log: string[] = [], honor = true) {
       destination: { disconnect: () => undefined },
       sources: [],
       gains: [],
+      biquads: [],
       buffers: [],
       closed: false,
       touched: [],
@@ -153,6 +162,35 @@ export function fakeFactory(log: string[] = [], honor = true) {
         };
         ctx.gains.push(g);
         return g;
+      },
+      createBiquadFilter() {
+        const param = (value: number): FakeParam => {
+          const p: FakeParam = {
+            value,
+            sets: [],
+            ramps: [],
+            setValueAtTime: (v: number, t: number) => {
+              p.value = v;
+              p.sets.push([v, t]);
+            },
+            linearRampToValueAtTime: (v: number, t: number) => {
+              p.ramps.push([v, t]);
+            },
+          };
+          return p;
+        };
+        const f: FakeBiquad = {
+          type: 'lowpass',
+          frequency: param(350),
+          Q: param(1),
+          dest: null,
+          connect: (dest) => {
+            f.dest = dest;
+          },
+          disconnect: () => undefined,
+        };
+        ctx.biquads.push(f);
+        return f;
       },
       async decodeAudioData(data: ArrayBuffer): Promise<BufferLike> {
         log.push(`decode:${data.byteLength}`);

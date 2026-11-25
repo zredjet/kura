@@ -326,6 +326,8 @@ export class WaveController {
   private readonly extraReasons = new Set<string>();
   /** スペクトルの面の頼み（M17 段 5。null なら送らない：波形のときは今までと同じ頼み）。 */
   private spec: EditSpecRequestDto[] | null = null;
+  /** 一時的に外して聞くノード（M17 段 6）。 */
+  private auditionBypass: number | null = null;
   /** 細い波形の帯（スペクトルの面の上。曲の全体・1 段にまとめる・ズームしない）と、入る前の区間。 */
   private strip = false;
   private beforeStrip: { w: WaveWindow; fit: boolean } | null = null;
@@ -434,6 +436,17 @@ export class WaveController {
     if (overlay === this.overlay) return;
     this.overlay = overlay;
     this.invalidate();
+  }
+
+  /**
+   * 一時的に外して聞くノード（M17 段 6）：頼みに `audition` を載せる（外した音を再生の先読みの区間で描いてもらう。表示の
+   * 区間はそのまま：外した音を解いている間は表示の音を鳴らす）。替わったらすぐ頼む。
+   */
+  setAudition(bypass: number | null): void {
+    if (this.auditionBypass === bypass) return;
+    this.auditionBypass = bypass;
+    this.breakChain();
+    this.options.onIdle?.({ ...this.viewport(), work: this.solving }, false);
   }
 
   /** 再生の先読みに要る区間（ビューポートの `spans` の先頭に入れる）。 */
@@ -696,8 +709,14 @@ export class WaveController {
       focus: this.focusNode,
       work: false,
     };
-    // spec は波形のときは載せない（今までと同じ頼み：同じものを送らない比べが崩れない）
-    return this.spec ? { ...vp, spec: this.spec } : vp;
+    // spec・audition は頼むときだけ載せる（今までと同じ頼み：同じものを送らない比べが崩れない）
+    const withSpec = this.spec ? { ...vp, spec: this.spec } : vp;
+    return this.auditionBypass === null
+      ? withSpec
+      : {
+          ...withSpec,
+          audition: { bypass: this.auditionBypass, spans: this.extraSpans.slice(0, MAX_SPANS) },
+        };
   }
 
   /**

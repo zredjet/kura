@@ -32,13 +32,14 @@ import {
   nudgeCursor,
   selectAllAudio,
   setAudioFace,
+  setSoloHeld,
   toggleAB,
   toggleLoopAudition,
   togglePlay,
   useAudioStore,
 } from './audioStore';
 import { cancelAudioDrag, confirmTrim, selectAudioTool, setInOut } from './audioTools';
-import { spectrumKey } from './spectrumKeys';
+import { spectrumKey, spectrumKeyUp } from './spectrumKeys';
 import { SPECTRUM_POINTER } from './spectrumPointer';
 
 const TOOL_KEYS: Record<string, AudioTool> = { s: 'select', t: 'trim', f: 'fade', r: 'loop' };
@@ -145,5 +146,8 @@ export const AUDIO_KEYS: EditorKindKeys = {
   meta,
   down,
   escape,
+  // Q を離した・窓を離れた：ソロをやめる（M17 段 6）
+  up: spectrumKeyUp,
+  reset: () => setSoloHeld(false),
   selectAll: selectAllAudio,
 };

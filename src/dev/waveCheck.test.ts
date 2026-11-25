@@ -87,6 +87,7 @@ describe('置いた区間を窓にまとめる', () => {
       cycle: len,
       planes: [new Float32Array(len)],
       fadeIn,
+      level: 1,
     };
   }
 

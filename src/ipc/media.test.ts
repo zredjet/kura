@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   animUrl,
+  editAuditionPcmUrl,
   editInputPcmUrl,
   editPcmUrl,
   editPeaksUrl,
@@ -76,6 +77,18 @@ describe('URL', () => {
       'kura://localhost/edit/0a1b/input/pcm/65536-131072',
     );
     expect(editPeaksUrl('0a1b', 3, 1024, 2)).toBe('kura://localhost/edit/0a1b/3/peaks/1024/2');
+    // 試聴の PCM（M17 段 6）
+    expect(editAuditionPcmUrl('0a1b', '0123456789abcdef', 0, 9)).toBe(
+      'kura://localhost/edit/0a1b/audition/0123456789abcdef/pcm/0-9',
+    );
+    for (const [id, a, b] of [
+      ['0123456789ABCDEF', 0, 9],
+      ['0123456789abcde', 0, 9],
+      ['0123456789abcdef', 9, 9],
+      ['0123456789abcdef', 0.5, 9],
+    ] as const) {
+      expect(() => editAuditionPcmUrl('0a1b', id, a, b)).toThrow(RangeError);
+    }
   });
 
   it.each([

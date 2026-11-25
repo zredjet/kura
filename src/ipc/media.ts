@@ -151,6 +151,27 @@ export function editInputPcmUrl(session: string, start: number, end: number): st
   return `${BASE}/edit/${session}/input/pcm/${start}-${end}`;
 }
 
+/** 試聴の id（`auditionId`：出力の指紋の先頭 8 バイトの小文字の 16 進）。 */
+const AUDITION_ID = /^[0-9a-f]{16}$/;
+
+/**
+ * 音声エディタの試聴の PCM（M17 段 6。一時的に外して聞く音）：`/edit/{session}/audition/{auditionId}/pcm/{start}-{end}`
+ * （キャッシュしない）。区間は出力のフレーム。形が合わなければ RangeError。
+ */
+export function editAuditionPcmUrl(
+  session: string,
+  auditionId: string,
+  start: number,
+  end: number,
+): string {
+  if (!SESSION_ID.test(session) || !AUDITION_ID.test(auditionId) || !isSpan(start, end)) {
+    throw new RangeError(
+      `エディタの試聴の PCM の指定が正しくありません：${session}/${auditionId}/${start}-${end}`,
+    );
+  }
+  return `${BASE}/edit/${session}/audition/${auditionId}/pcm/${start}-${end}`;
+}
+
 /**
  * 音声エディタの波形の段のタイル：`/edit/{session}/{rev}/peaks/{bin}/{tile}`（immutable）。`rev` は表示の結果の
  * `peaks.rev`、`bin` は段のビンのフレーム数（`peaks.bins` のどれか）、`tile` はタイルの番号（1 枚 `peaks.tileBins` ビン）。

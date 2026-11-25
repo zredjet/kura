@@ -8,7 +8,7 @@ import { EQ_LIMITS } from '../../../ipc/edit';
 import editorStyles from '../Editor.module.css';
 import { useEditorStore } from '../editorStore';
 import styles from './Audio.module.css';
-import { sendEqBands, setEqBand, useAudioStore, useEqPort } from './audioStore';
+import { sendEqBands, setEqBand, toggleSolo, useAudioStore, useEqPort } from './audioStore';
 import {
   BAND_CHANNELS,
   BAND_TYPES,
@@ -100,6 +100,7 @@ export function EqBandsField({ node }: { node: number }) {
   const bands = useEqBands(node);
   const selected = useAudioStore((s) => s.eqBand);
   const { rate } = useEqPort();
+  const soloOn = useAudioStore((s) => s.soloOn);
   const enabledCount = bands.filter((b) => b.enabled).length;
   const full = bands.length >= EQ_LIMITS.maxBands;
   const band = selected === null ? undefined : bands[selected];
@@ -211,6 +212,16 @@ export function EqBandsField({ node }: { node: number }) {
               onChange={(v) => set(selected, { channel: v as EqBand['channel'] })}
             />
           </label>
+          <button
+            type="button"
+            className={editorStyles.pill}
+            aria-pressed={soloOn}
+            disabled={band.type === 'tilt'}
+            title={ts.soloHint}
+            onClick={toggleSolo}
+          >
+            {ts.solo}
+          </button>
           <button
             type="button"
             className={styles.eqRemove}

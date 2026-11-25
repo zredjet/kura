@@ -18,9 +18,16 @@
  */
 
 import type { EditSpanDto, EditSpansChangeDto } from '../../../ipc/edit';
-import { editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
+import { editAuditionPcmUrl, editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
 import { MAX_RATE, MIN_RATE, readPcmWav } from '../../../lib/asset/wav';
-import type { ContextLike, ContextPool, GainLike, SourceLike } from '../../../lib/assetAudio';
+import type {
+  AudioParamLike,
+  BiquadLike,
+  ContextLike,
+  ContextPool,
+  GainLike,
+  SourceLike,
+} from '../../../lib/assetAudio';
 import {
   CHUNK,
   chunkOf,
@@ -174,6 +181,34 @@ export interface FeedView {
   frames: number;
   channels: number;
   rate: number;
+  /**
+   * 鳴らす音の id（M17 段 6。重ねがなければ `samplesId`。違えば、編集後の音は試聴の PCM を `audition.valid` の区間で取る）。
+   * 省けば `samplesId`。
+   */
+  auditionId?: string;
+  audition?: { valid: readonly EditSpanDto[] } | null;
+}
+
+/** 鳴らす音が試聴の値か（`auditionId` が `samplesId` と違う）。 */
+export function playsAudition(view: FeedView): boolean {
+  return view.auditionId !== undefined && view.auditionId !== view.samplesId;
+}
+
+/**
+ * 表示の結果が替わったとき、鳴らしている編集後の音のどこが替わったか（M17 段 6）。鳴らす音が前も今も表示の音なら表示の
+ * `changed`、どちらかが試聴の値で id が替われば全体、同じ試聴の値なら替わらない（null）。
+ */
+export function playbackChange(
+  prev: FeedView | null,
+  view: FeedView & { changed: EditSpansChangeDto },
+): EditSpansChangeDto | null {
+  if (!prev) return view.changed;
+  const before = playsAudition(prev);
+  const now = playsAudition(view);
+  if (!before && !now) return view.changed;
+  const prevId = prev.auditionId ?? prev.samplesId;
+  const nowId = view.auditionId ?? view.samplesId;
+  return prevId === nowId ? null : { type: 'all' };
 }
 
 /**
@@ -189,8 +224,12 @@ export class PcmFeed {
   private readonly loading = new Set<string>();
   private readonly failures: FailureMarks;
   private epoch = 0;
+  /** 試聴の値の表の世代（鳴らす音の id が替わったら進める）。 */
+  private auditionEpoch = 0;
   private disposed = false;
   readonly inputCache: PcmChunkCache;
+  /** 試聴の値の表（M17 段 6。波形の拡大とは分ける：波形は文書の値のまま）。 */
+  readonly auditionCache: PcmChunkCache;
 
   constructor(
     private readonly deps: {
@@ -205,6 +244,7 @@ export class PcmFeed {
     },
   ) {
     this.inputCache = deps.input ?? new PcmChunkCache();
+    this.auditionCache = new PcmChunkCache();
     this.failures = new FailureMarks(deps.now);
   }
 
@@ -219,26 +259,80 @@ export class PcmFeed {
 
   /** 表示の結果（出力が変わったら読んでいる途中のものは古い）。 */
   setView(view: FeedView, changed: EditSpansChangeDto | null): void {
+    const prevAudition = this.view && playsAudition(this.view) ? this.view.auditionId : null;
     this.view = view;
     if (changed && (changed.type === 'all' || changed.spans.length > 0)) {
       this.epoch++;
       for (const k of [...this.loading]) if (k.startsWith('e')) this.loading.delete(k);
       this.failures.clear('e');
     }
+    // 鳴らす試聴の値が替わった（外す・やめる・外した音が変わった）：試聴の表を空にし、読んでいる途中のものを捨てる
+    const audition = playsAudition(view) ? view.auditionId : null;
+    if (audition !== prevAudition) {
+      this.auditionEpoch++;
+      this.auditionCache.clear();
+      for (const k of [...this.loading]) if (k.startsWith('a')) this.loading.delete(k);
+      this.failures.clear('a');
+    }
   }
 
-  /** 手元のチャンク。 */
+  /** 手元のチャンク（編集後の音は、外して聞いている間は試聴の値）。 */
   peek(source: PlaySource, index: number): PcmChunk | undefined {
-    return source === 'edited' ? this.deps.output.peek(index) : this.inputCache.peek(index);
+    if (source === 'source') return this.inputCache.peek(index);
+    return this.view && playsAudition(this.view)
+      ? this.auditionCache.peek(index)
+      : this.deps.output.peek(index);
   }
 
   /** チャンクを取りに行く（手元にある・読んでいる・取れない区間・取り直す期限の前は何もしない）。 */
   want(source: PlaySource, index: number): void {
     if (this.disposed || !this.session || this.peek(source, index)) return;
-    const key = `${source === 'edited' ? 'e' : 'i'}${index}`;
+    const audition = source === 'edited' && !!this.view && playsAudition(this.view);
+    const key = `${source === 'source' ? 'i' : audition ? 'a' : 'e'}${index}`;
     if (this.loading.has(key)) return;
-    if (source === 'edited') this.loadOutput(index, key);
+    if (audition) this.loadAudition(index, key);
+    else if (source === 'edited') this.loadOutput(index, key);
     else this.loadInput(index, key);
+  }
+
+  /** 試聴の値のチャンク（`/edit/{s}/audition/{auditionId}/pcm`。`audition.valid` に覆われるものだけ）。 */
+  private loadAudition(index: number, key: string): void {
+    const view = this.view;
+    const session = this.session;
+    const id = view?.auditionId;
+    if (!view || !session || !id) return;
+    const span = chunkSpan(index, view.frames);
+    if (!span || !covered(view.audition?.valid ?? [], span[0], span[1])) return;
+    const failKey = `${key}@${id}`;
+    if (this.failures.blocked(failKey)) return;
+    const [a, b] = span;
+    const epoch = this.auditionEpoch;
+    const decoder = DECODER_PREFIX + id;
+    this.loading.add(key);
+    this.deps
+      .fetch(editAuditionPcmUrl(session, id, a, b))
+      .then((buf) => {
+        if (this.disposed || epoch !== this.auditionEpoch || !this.loading.has(key)) return;
+        const pcm = readPcmWav(buf);
+        if (!pcm || pcm.info.start !== a || pcm.frames !== b - a || pcm.info.decoder !== decoder) {
+          this.failed(failKey, 'edited', index);
+          return;
+        }
+        this.failures.ok(failKey);
+        this.auditionCache.put(index, {
+          rev: view.rev,
+          start: a,
+          frames: b - a,
+          planes: pcm.planes,
+        });
+        this.deps.onLoaded?.();
+      })
+      .catch(() => {
+        if (!this.disposed && epoch === this.auditionEpoch) this.failed(failKey, 'edited', index);
+      })
+      .finally(() => {
+        if (epoch === this.auditionEpoch) this.loading.delete(key);
+      });
   }
 
   /** 取れなかった印を付けて知らせる。 */
@@ -336,6 +430,10 @@ export interface PlayerDeps {
   need?(source: PlaySource, spans: EditSpanDto[]): void;
   /** 音量（0〜1）。 */
   volume(): number;
+  /**
+   * 音ごとの利得（倍率。M17 段 6 の音量を合わせて聞く：大きいほうを下げる。省けば 1）。値が替わったら `relevel` を呼ぶ。
+   */
+  level?(source: PlaySource): number;
   /** 文脈を使っている印（`holdAudio`）。戻り値で外す。 */
   hold?(): () => void;
   timer?: PlayerTimer;
@@ -370,6 +468,8 @@ export interface PlacedRecord {
   /** バッファに写した標本（チャンネルごと。チャンクの切り出し、短いループはつないだもの）。 */
   planes: Float32Array<ArrayBuffer>[];
   fadeIn: boolean;
+  /** 区間の利得（倍率。音量を合わせて聞くとき 1 より小さい。M17 段 6）。 */
+  level: number;
 }
 
 /** 交差フェードの記録（自己点検）：替える位置 T（文脈のフレーム）と、止めた音・入れた音。 */
@@ -425,6 +525,8 @@ interface Placed {
   stopAt: number | null;
   /** 記録（自己点検）。 */
   record: PlacedRecord;
+  /** 置いたときの利得（交差フェードで止めるとき、この値から 0 へ）。 */
+  level: number;
 }
 
 /** 鳴らしている計画。 */
@@ -481,10 +583,25 @@ function repeatPlanes(planes: readonly Float32Array[], reps: number): Float32Arr
   });
 }
 
+/** ソロで鳴らす帯（バンドパスの中心の周波数と Q。M17 段 6）。 */
+export interface SoloBand {
+  freq: number;
+  q: number;
+}
+
+/** ソロの中心の周波数（文脈のナイキストの 0.49 倍まで）。 */
+function soloFreq(freq: number, rate: number): number {
+  return Math.max(10, Math.min(freq, rate * 0.49));
+}
+
 /** 編集中の試聴（一度に 1 つ）。 */
 export class EditorPlayer {
   private ctx: ContextLike | null = null;
   private master: GainLike | null = null;
+  /** ソロ（M17 段 6）：鳴らしている音をその帯だけにする（null なら全体）。 */
+  private solo: SoloBand | null = null;
+  /** ソロの道（全体の音量のあと：素通しとバンドパスを 10 ms で替える。初めてソロにしたときに作る）。 */
+  private soloNodes: { dry: GainLike; filter: BiquadLike; wet: GainLike } | null = null;
   private plan: Plan | null = null;
   private placed: Placed[] = [];
   private timerId: number | null = null;
@@ -507,6 +624,71 @@ export class EditorPlayer {
   /** 鳴らしているか。 */
   get playing(): boolean {
     return this.plan !== null;
+  }
+
+  /**
+   * ソロ（M17 段 6）：鳴らしている音（編集後でも元でも）を帯 `band` だけにする（null で全体に戻す）。替えは 10 ms のランプで、
+   * 帯を動かしても付いて行く。鳴らしていなければ覚えておき、鳴らし始めたら当てる（鳴らし始めはしない）。
+   */
+  setSolo(band: SoloBand | null): void {
+    const now = this.solo;
+    if (band === null ? now === null : now !== null && now.freq === band.freq && now.q === band.q) {
+      return;
+    }
+    this.solo = band ? { freq: band.freq, q: band.q } : null;
+    this.applySolo();
+  }
+
+  /** ソロの帯（なければ null。テスト）。 */
+  get soloing(): SoloBand | null {
+    return this.solo;
+  }
+
+  private applySolo(): void {
+    const ctx = this.ctx;
+    const master = this.master;
+    if (!ctx || !master) return;
+    const band = this.solo;
+    if (!band && !this.soloNodes) return;
+    const nodes = this.soloNodes ?? this.buildSolo(ctx, master, band);
+    const t = ctx.currentTime;
+    const end = t + CROSSFADE_SECONDS;
+    const ramp = (p: AudioParamLike, v: number) => {
+      p.setValueAtTime(p.value, t);
+      p.linearRampToValueAtTime(v, end);
+    };
+    if (band) {
+      ramp(nodes.filter.frequency, soloFreq(band.freq, ctx.sampleRate));
+      ramp(nodes.filter.Q, band.q);
+    }
+    ramp(nodes.dry.gain, band ? 0 : 1);
+    ramp(nodes.wet.gain, band ? 1 : 0);
+  }
+
+  /** ソロの道を作る：全体の音量 → 素通し（1）→ 出口、全体の音量 → バンドパス → 通した音（0）→ 出口。 */
+  private buildSolo(
+    ctx: ContextLike,
+    master: GainLike,
+    band: SoloBand | null,
+  ): { dry: GainLike; filter: BiquadLike; wet: GainLike } {
+    const dry = ctx.createGain();
+    dry.gain.value = 1;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    if (band) {
+      filter.frequency.value = soloFreq(band.freq, ctx.sampleRate);
+      filter.Q.value = band.q;
+    }
+    const wet = ctx.createGain();
+    wet.gain.value = 0;
+    master.disconnect();
+    master.connect(dry);
+    dry.connect(ctx.destination);
+    master.connect(filter);
+    filter.connect(wet);
+    wet.connect(ctx.destination);
+    this.soloNodes = { dry, filter, wet };
+    return this.soloNodes;
   }
 
   /** 鳴らしている音（していなければ null）。 */
@@ -553,6 +735,8 @@ export class EditorPlayer {
     master.gain.value = this.deps.volume();
     master.connect(ctx.destination);
     this.master = master;
+    this.soloNodes = null;
+    if (this.solo) this.applySolo();
     this.plan = {
       source: req.source,
       info: req.info,
@@ -578,6 +762,12 @@ export class EditorPlayer {
     this.placed = [];
     this.master?.disconnect();
     this.master = null;
+    if (this.soloNodes) {
+      this.soloNodes.dry.disconnect();
+      this.soloNodes.filter.disconnect();
+      this.soloNodes.wet.disconnect();
+      this.soloNodes = null;
+    }
     this.plan = null;
     this.ctx = null;
     this.refreshWanted = false;
@@ -629,6 +819,19 @@ export class EditorPlayer {
     if (next.start === plan.loop.start && next.end === plan.loop.end) return;
     plan.loop = next;
     this.recutLoop(next);
+    this.tick();
+  }
+
+  /**
+   * 音ごとの利得（`level`）が替わった（M17 段 6）：同じ音を新しい利得で置き直す（今 + 60 ms から 10 ms の交差フェード。
+   * 元を鳴らしていても）。
+   */
+  relevel(): void {
+    const plan = this.plan;
+    if (!plan || !this.ctx) return;
+    const level = this.deps.level?.(plan.source) ?? 1;
+    if (this.placed.every((p) => p.fading || p.level === level)) return;
+    this.refreshWanted = true;
     this.tick();
   }
 
@@ -898,11 +1101,12 @@ export class EditorPlayer {
     src.buffer = buffer;
     const gain = ctx.createGain();
     const when = abs / rate;
+    const level = this.deps.level?.(plan.source) ?? 1;
     if (fadeIn) {
       gain.gain.setValueAtTime(0, when);
-      gain.gain.linearRampToValueAtTime(1, when + CROSSFADE_SECONDS);
+      gain.gain.linearRampToValueAtTime(level, when + CROSSFADE_SECONDS);
     } else {
-      gain.gain.value = 1;
+      gain.gain.value = level;
     }
     src.connect(gain);
     gain.connect(master);
@@ -916,6 +1120,7 @@ export class EditorPlayer {
       cycle: end - start,
       planes,
       fadeIn,
+      level,
     };
     this.placed.push({
       start,
@@ -927,6 +1132,7 @@ export class EditorPlayer {
       fading: false,
       stopAt: null,
       record,
+      level,
     });
     this.deps.onPlaced?.(record);
   }
@@ -966,7 +1172,7 @@ export class EditorPlayer {
       if (p.abs >= t) {
         this.kill(p);
       } else if (endAbs > t) {
-        p.gain.gain.setValueAtTime(1, when);
+        p.gain.gain.setValueAtTime(p.level, when);
         p.gain.gain.linearRampToValueAtTime(0, when + CROSSFADE_SECONDS);
         try {
           p.src.stop(when + CROSSFADE_SECONDS);

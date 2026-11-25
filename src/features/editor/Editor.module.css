@@ -630,6 +630,12 @@
   background: var(--fill-3);
 }
 
+/* 押してある間だけ効く切り替え（一時的に外して聞く・ソロで聞く。M17 段 6） */
+.pill[aria-pressed='true'] {
+  border-color: var(--accent);
+  background: var(--fill-pressed);
+}
+
 .pill:disabled {
   opacity: 0.45;
 }

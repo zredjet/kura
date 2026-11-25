@@ -9,9 +9,16 @@
  */
 
 import { EQ_LIMITS } from '../../../ipc/edit';
-import { eqInputRate, eqTargetParams, sendEqBands, setEqBand, useAudioStore } from './audioStore';
+import {
+  eqInputRate,
+  eqTargetParams,
+  sendEqBands,
+  setEqBand,
+  setSoloHeld,
+  useAudioStore,
+} from './audioStore';
 import { bandSummary } from './EqBandsField';
-import { type EqBand, clampFreq, clampGain, clampQ, hasGain } from './eqModel';
+import { type EqBand, clampFreq, clampGain, clampQ, hasGain, soloBandOf } from './eqModel';
 
 /** 面・行の印（キーの行き先の見分け）。 */
 export const FACE_ATTR = 'data-spectrum-face';
@@ -55,6 +62,13 @@ function nudged(b: EqBand, key: string, k: number, rate: number): { band: EqBand
     return { band: { ...b, slope: stepSlope(b.slope, dir) }, field: 'slope' };
   }
   return { band: { ...b, q: clampQ(b.q * Math.pow(1.1, dir * k), b.type) }, field: 'q' };
+}
+
+/** キーを離した：Q ならソロをやめる（取ったら真）。 */
+export function spectrumKeyUp(e: KeyboardEvent): boolean {
+  if (e.key.toLowerCase() !== 'q' || !useAudioStore.getState().soloHeld) return false;
+  setSoloHeld(false);
+  return true;
 }
 
 /**
@@ -101,6 +115,12 @@ export function spectrumKey(e: KeyboardEvent, key: string): boolean | null {
     return true;
   }
   // 面
+  // Q を押している間、選んだバンドの帯だけを鳴らす（M17 段 6。修飾キーなし・繰り返しは見ない。離すのは `spectrumKeyUp`）
+  if (key === 'q') {
+    const b = sel === null ? undefined : bands[sel];
+    if (!e.repeat && !e.shiftKey && !e.altKey && b && soloBandOf(b)) setSoloHeld(true);
+    return true;
+  }
   if (key === '[' || key === ']') {
     if (bands.length === 0) return true;
     const to =

@@ -1298,6 +1298,7 @@ export const ja = {
       position: (now: string, total: string) => `${now} / ${total}`,
       rateUnsupported: (n: string) => `このサンプルレート（${n} Hz）は再生できません`,
       abUnavailable: '元との対応が分からないので聞き比べられません',
+      bypassUnavailable: 'この操作は外して聞けません',
       playFailed: (reason: string) => `再生できませんでした：${reason}`,
       pcmUnavailable: '音の標本を取れませんでした',
       noLoop: 'ループ点がありません',
@@ -1433,7 +1434,13 @@ export const ja = {
         slopeValue: (v: number) => `${v} dB/oct`,
         off: 'オフ',
         noBand: 'バンドを選んでいません',
-        usage: '空きをダブルクリックでベルを足し、山からドラッグで作ります',
+        usage:
+          '空きをダブルクリックでベルを足し、山からドラッグで作ります。Q を押している間は選んだバンドだけを鳴らします。外して聞いても文書は変えません',
+        /** 試聴だけの重ね（M17 段 6）。 */
+        bypass: '一時的に外して聞く',
+        bypassPreparing: (percent: string) => `外した音を用意しています… ${percent}`,
+        solo: 'ソロで聞く',
+        soloHint: 'このバンドの帯だけを鳴らします（面で Q を押している間も）',
       },
     },
   },

@@ -40,6 +40,14 @@ export interface GainLike extends AudioNodeLike {
   connect(dest: AudioNodeLike): unknown;
 }
 
+/** BiquadFilterNode のうち使う所（音声エディタのソロのバンドパス。M17 段 6）。 */
+export interface BiquadLike extends AudioNodeLike {
+  type: string;
+  readonly frequency: AudioParamLike;
+  readonly Q: AudioParamLike;
+  connect(dest: AudioNodeLike): unknown;
+}
+
 /** AudioBuffer のうち使う所。 */
 export interface BufferLike {
   readonly length: number;
@@ -66,6 +74,7 @@ export interface ContextLike {
   createBuffer(channels: number, frames: number, rate: number): BufferLike;
   createBufferSource(): SourceLike;
   createGain(): GainLike;
+  createBiquadFilter(): BiquadLike;
   decodeAudioData(data: ArrayBuffer): Promise<BufferLike>;
   resume(): Promise<void>;
   close(): Promise<void>;

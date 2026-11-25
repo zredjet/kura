@@ -462,17 +462,22 @@ export const offlineCrossfade: RenderCrossfade = async (record, base, frames, fa
     // 先に start（stop を先に呼ぶと InvalidStateError）。窓の頭より前に始まった区間はバッファの中をずらして鳴らす
     const { when, offset } = crossfadePlacement(r, base, rate);
     src.start(when, offset);
+    // 区間の利得（音量を合わせて聞く。M17 段 6）もエディタと同じに当てる
+    const level = r.level;
     if (role === 'old') {
       if (fade) {
-        gain.gain.setValueAtTime(1, t);
+        gain.gain.setValueAtTime(level, t);
         gain.gain.linearRampToValueAtTime(0, t + xf);
         src.stop(Math.max(when, t + xf));
       } else {
+        gain.gain.value = level;
         src.stop(Math.max(when, t));
       }
     } else if (fade) {
       gain.gain.setValueAtTime(0, when);
-      gain.gain.linearRampToValueAtTime(1, when + xf);
+      gain.gain.linearRampToValueAtTime(level, when + xf);
+    } else {
+      gain.gain.value = level;
     }
   };
   for (const r of record.old) put(r, 'old');

@@ -10,6 +10,7 @@ import styles from './Audio.module.css';
 import {
   sealEq,
   setEqHover,
+  setSoloHeld,
   setSpectrumSettings,
   spectrumController,
   useAudioStore,
@@ -412,7 +413,11 @@ export function SpectrumStage() {
           const { x, y } = local(e);
           SPECTRUM_POINTER.contextMenu(e.clientX, e.clientY, x, y);
         }}
-        onBlur={sealEq}
+        onBlur={() => {
+          sealEq();
+          // Q を押したままフォーカスが外れた：ソロをやめる（離すキーが面に届かない）
+          setSoloHeld(false);
+        }}
       >
         <canvas ref={canvasRef} className={styles.wave} aria-hidden="true" />
         <span className={styles.srOnly} aria-live="polite">

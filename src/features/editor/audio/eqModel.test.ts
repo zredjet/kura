@@ -15,6 +15,7 @@ import {
   qHandles,
   qOfBandwidth,
   readEq,
+  soloBandOf,
 } from './eqModel';
 
 describe('イコライザの引数を画面で扱う', () => {
@@ -78,6 +79,19 @@ describe('イコライザの引数を画面で扱う', () => {
     expect(approxCompatible([{ ...all, channel: 'left' }], { type: 'index', index: 1 })).toBe(
       false,
     );
+  });
+
+  it('ソロの帯（M17 段 6）：ベル・ノッチ・バンドパスは中心と Q、シェルフ・カットは境で 1 オクターブ、チルトはなし', () => {
+    const bell = newBell(2_800, -5, 6);
+    expect(soloBandOf(bell)).toEqual({ freq: 2_800, q: 6 });
+    expect(soloBandOf({ ...bell, type: 'notch' })).toEqual({ freq: 2_800, q: 6 });
+    expect(soloBandOf({ ...bell, type: 'bandPass' })).toEqual({ freq: 2_800, q: 6 });
+    for (const type of ['lowShelf', 'highShelf', 'lowCut', 'highCut'] as const) {
+      const solo = soloBandOf({ ...bell, type });
+      expect(solo?.freq).toBe(2_800);
+      expect(bandwidthOct(solo?.q ?? 0)).toBeCloseTo(1, 9);
+    }
+    expect(soloBandOf({ ...bell, type: 'tilt' })).toBeNull();
   });
 
   it('書き方：「2.80 kHz」「−5.0 dB」', () => {
