@@ -226,6 +226,19 @@ fn answer(
             }
         };
     }
+    if let Route::EditAuditionPcm {
+        session,
+        id,
+        start,
+        end,
+    } = &route
+    {
+        let Some(engine) = served.engine else {
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let body = edit_audio::serve_audition_pcm(engine, session, id, *start, *end);
+        return pcm_body_response(body, route.cache_control(), head);
+    }
     if let Route::EditInputPcm {
         session,
         start,

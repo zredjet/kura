@@ -497,6 +497,10 @@ struct Published {
     peaks_before: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
     /// スペクトルのタイルの置き場（M17 段 4。`/edit/{s}/spec/…` が読む。中身は変わらない）。
     spec: audio::spec::SpecStore,
+    /// 公開した今と直前の試聴の値（M17 段 6。`auditionId` と表示。`/edit/{s}/audition/{id}/pcm` が読む。id が同じなら中身も
+    /// 同じ）。
+    audition_now: Option<(String, View)>,
+    audition_before: Option<(String, View)>,
 }
 
 /// 開いているエディタの状態（`Editor::state` の錠の中）。
@@ -741,6 +745,37 @@ impl Editor {
             })
     }
 
+    /// 試聴の値を公開する（今のものは直前になる）。
+    fn publish_audition(&self, id: String, view: View) {
+        let mut p = self.lock_published();
+        p.audition_before = p.audition_now.take();
+        p.audition_now = Some((id, view));
+    }
+
+    /// 公開した試聴の値を片付ける（試聴をやめた）。
+    fn clear_audition(&self) {
+        let mut p = self.lock_published();
+        p.audition_now = None;
+        p.audition_before = None;
+    }
+
+    /// 公開した今か直前の試聴の値のうち、`auditionId` が同じで区間 `area` を有効なチャンクで覆うもの（今を先に。配信用。
+    /// なければ None）。
+    pub fn published_audition_covering(
+        &self,
+        id: &str,
+        area: &kura_engine::render::region::Area,
+    ) -> Option<PartialValue> {
+        let p = self.lock_published();
+        [p.audition_now.as_ref(), p.audition_before.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|(i, _)| i == id)
+            .map(|(_, v)| v.value())
+            .find(|v| v.covers(area))
+            .cloned()
+    }
+
     /// 閉じる：中止 → 保存に貸していた入力を引き上げる → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り
     /// 置きの持ち主のときだけ。閉じ終わる前に開いた次のエディタの取り置きは消さない）。待っている下書きを置いてから下書きの
     /// スレッドを止める。2 回目からは何もしない。
@@ -915,6 +950,12 @@ impl Editor {
                 inputs_only.register_external_analysis(*k, out.clone(), *bytes);
             }
         }
+        // 試聴の計画が握る結果（M17 段 6）も同じ
+        if let Some(a) = st.audio.as_ref() {
+            for (k, out, bytes) in &a.audition.tables {
+                inputs_only.register_external_analysis(*k, out.clone(), *bytes);
+            }
+        }
         if st.cache.bytes() <= inputs_only.bytes() {
             return;
         }
@@ -923,8 +964,9 @@ impl Editor {
         for input in st.inputs.values() {
             st.cache.register_external(&input.value);
         }
-        // 握る計画の結果（古い計画の道。M17 段 3）は入れ直す
+        // 握る計画の結果（古い計画の道。M17 段 3）と試聴が握る結果（M17 段 6）は入れ直す
         self.rehold(st);
+        self.rehold_audition(st);
         if let Err(err) = st.lease.settle(&mut st.cache) {
             tracing::warn!(%err, "エディタの確保を戻せませんでした");
         }
@@ -2056,6 +2098,7 @@ fn finish_open(
             stale: false,
             solve_failed: None,
             spec: Default::default(),
+            audition: Default::default(),
             #[cfg(test)]
             script: None,
         }

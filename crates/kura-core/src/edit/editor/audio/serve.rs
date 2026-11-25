@@ -3,6 +3,9 @@
 //! - `/edit/{s}/{rev}/pcm/{a}-{b}`（[`serve_pcm`]）：エディタが公開した今か直前の表示（rev が同じで区間を覆うもの。今を先に）の、
 //!   出力のフレーム `[a, b)` の PCM。M11 の WAV（kura チャンク付き。`asset::pcm::write_wav`）で、kura チャンクは `{ start: a, total: 出力の長さ,
 //!   loop: 出力のループ, decoder: "kura-edit/1:" + samplesId }`。区間が表示の値の有効なチャンクに覆われなければ 404。
+//! - `/edit/{s}/audition/{auditionId}/pcm/{a}-{b}`（[`serve_audition_pcm`]。M17 段 6）：公開した今か直前の試聴の値（一時的に
+//!   外して聞く音。`auditionId` が同じで区間を覆うもの）の PCM。kura チャンクのデコーダは `kura-edit/1:{auditionId}`、ほかは
+//!   `/pcm` と同じ。区間が有効なチャンクに覆われなければ 404。
 //! - `/edit/{s}/input/pcm/{a}-{b}`（[`serve_input_pcm`]）：元（文書の入力）の PCM。遅延の値なら源の LRU を通って読む。kura チャンクは
 //!   `{ total: 元の長さ, loop: 元のループ, decoder: 元の読み取りのデコーダ }`。
 //! - どれも描いている途中の錠を待たない（`published` を短く持って写すだけ）。予算は M11 の `/pcm` と同じく、写す分と書く分を
@@ -117,6 +120,46 @@ pub fn serve_pcm(
         .ok_or(PcmError::NotFound)?;
     let meta = value.audio_meta().cloned().unwrap_or_default();
     let decoder = format!("{EDIT_DECODER_PREFIX}{samples_id}");
+    let form = Form {
+        channels: usize::from(channels),
+        rate,
+        total,
+        meta: &meta,
+        decoder: &decoder,
+    };
+    write_span(engine, &form, (start, end, floats), |ch, at, out| {
+        value.audio_read(ch, at, out)
+    })
+}
+
+/// 公開した試聴の値（`auditionId` が `id`）の、フレーム `[start, end)` の PCM の WAV（モジュールの説明）。
+pub fn serve_audition_pcm(
+    engine: &EngineServices,
+    session: &str,
+    id: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, PcmError> {
+    let editor = engine.editor_for(session).ok_or(PcmError::NotFound)?;
+    // 形は id で決まる（同じ id は同じ出力）。範囲の外は覆う値を探す前に 416
+    let any = editor
+        .published_audition_covering(id, &Area::Empty)
+        .ok_or(PcmError::NotFound)?;
+    let kura_engine::Shape::Audio {
+        rate,
+        channels,
+        frames,
+    } = any.shape()
+    else {
+        return Err(PcmError::NotFound);
+    };
+    let total = frames.max();
+    let floats = check_span(start, end, total, u64::from(channels))?;
+    let value = editor
+        .published_audition_covering(id, &Area::span(start, end))
+        .ok_or(PcmError::NotFound)?;
+    let meta = value.audio_meta().cloned().unwrap_or_default();
+    let decoder = format!("{EDIT_DECODER_PREFIX}{id}");
     let form = Form {
         channels: usize::from(channels),
         rate,

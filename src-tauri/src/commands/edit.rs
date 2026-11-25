@@ -85,6 +85,60 @@ pub struct EditAudioViewportDto {
     /// スペクトルの頼み（2 つまで：前と後。M17 段 4。省けば頼まない）。
     #[serde(default)]
     pub spec: Vec<EditSpecRequestDto>,
+    /// 試聴の頼み（一時的に外して聞く。M17 段 6。省けば頼まない）。
+    #[serde(default)]
+    pub audition: Option<EditAuditionRequestDto>,
+}
+
+/// 試聴の頼み（M17 段 6）：ノード `bypass` を外した音を、区間 `spans`（再生の先読み。長い音声だけ使う）で描いて配る。文書は
+/// 変えない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditAuditionRequestDto {
+    pub bypass: u32,
+    pub spans: Vec<EditSpanDto>,
+}
+
+/// 試聴の様子（M17 段 6）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EditAuditionPhaseDto {
+    /// 外した音を配れる（`auditionId` で取る）。
+    Ready,
+    /// 外した音の流し解きを裏で進めている（その間の `auditionId` は `samplesId`：外していない音）。
+    Solving { progress: f64 },
+    /// 外せない（文書にないノード・外すと出力の形が変わる・計画を作れない）。
+    Unavailable,
+}
+
+/// 試聴の情報（M17 段 6）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditAuditionDto {
+    /// 外すノード。
+    pub node: u32,
+    pub phase: EditAuditionPhaseDto,
+    /// 試聴の値の有効な区間（`/edit/{session}/audition/{auditionId}/pcm/…` で取れる所）。
+    pub valid: Vec<EditSpanDto>,
+}
+
+impl From<kura_core::edit::editor::audio::audition::AuditionInfo> for EditAuditionDto {
+    fn from(a: kura_core::edit::editor::audio::audition::AuditionInfo) -> Self {
+        use kura_core::edit::editor::audio::audition::AuditionPhase;
+        Self {
+            node: a.node.0,
+            phase: match a.phase {
+                AuditionPhase::Ready => EditAuditionPhaseDto::Ready,
+                AuditionPhase::Solving(progress) => EditAuditionPhaseDto::Solving { progress },
+                AuditionPhase::Unavailable => EditAuditionPhaseDto::Unavailable,
+            },
+            valid: a
+                .valid
+                .into_iter()
+                .map(|(start, end)| EditSpanDto { start, end })
+                .collect(),
+        }
+    }
 }
 
 /// スペクトルのチャンネル（M17 段 4）：番号（0 から）・M・S・和（各チャンネルのパワーの和）。中身のない変種も `{}` の形に
@@ -202,6 +256,12 @@ impl From<EditViewportDto> for Viewport {
                         spans: r.spans.into_iter().map(|s| (s.start, s.end)).collect(),
                     })
                     .collect(),
+                audition: v.audition.map(|a| {
+                    kura_core::edit::editor::audio::audition::AuditionRequest {
+                        bypass: NodeId(a.bypass),
+                        spans: a.spans.into_iter().map(|s| (s.start, s.end)).collect(),
+                    }
+                }),
             }),
         }
     }
@@ -796,6 +856,11 @@ pub struct EditAudioViewDto {
     /// 最後に頼んだスペクトルの区間の平均（向きごとに 1 つ）の状態（値は載せない。`ready` になったら `edit_spec_average` を
     /// 頼み直すと覚えた値が返る。`idle` は出力が変わって予約を捨てたので、頼み直す）。
     pub spec_average: Vec<EditSpecAverageStatusDto>,
+    /// 鳴らす音の指紋（M17 段 6）。試聴の重ねがなければ `samplesId`。違えば、再生は
+    /// `/edit/{session}/audition/{auditionId}/pcm/{a}-{b}`（デコーダ `kura-edit/1:{auditionId}`）を `audition.valid` の区間で取る。
+    pub audition_id: String,
+    /// 試聴の情報（頼みに試聴があるときだけ）。
+    pub audition: Option<EditAuditionDto>,
 }
 
 /// スペクトルの区間の平均の頼み（M17 段 4）。
@@ -990,6 +1055,8 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             solving: v.solving,
             spec: v.spec.into_iter().map(Into::into).collect(),
             spec_average: v.spec_average.into_iter().map(Into::into).collect(),
+            audition_id: v.audition_id,
+            audition: v.audition.map(Into::into),
         }
     }
 }
@@ -2037,7 +2104,31 @@ mod tests {
                 focus: None,
                 work: true,
                 spec: Vec::new(),
+                audition: None,
             })
+        );
+        // 試聴の頼み（M17 段 6）：外すノードと区間。知らない項目は拒む
+        let vp: EditViewportDto = serde_json::from_value(json!({
+            "type": "audio", "visible": null, "spans": [], "interacting": false, "focus": null, "work": false,
+            "audition": { "bypass": 4, "spans": [{ "start": 0, "end": 65536 }] }
+        }))
+        .unwrap();
+        let Viewport::Audio(a) = Viewport::from(vp) else {
+            panic!("音声の頼みではありません");
+        };
+        assert_eq!(
+            a.audition,
+            Some(kura_core::edit::editor::audio::audition::AuditionRequest {
+                bypass: NodeId(4),
+                spans: vec![(0, 65_536)],
+            })
+        );
+        assert!(
+            serde_json::from_value::<EditViewportDto>(json!({
+                "type": "audio", "visible": null, "spans": [], "interacting": false, "focus": null, "work": false,
+                "audition": { "bypass": 4, "spans": [], "solo": 1 }
+            }))
+            .is_err()
         );
         // スペクトルの頼み（M17 段 4）
         let vp: EditViewportDto = serde_json::from_value(json!({
@@ -2321,6 +2412,12 @@ mod tests {
                     key: "00112233445566778899aabbccddeeff".into(),
                     phase: SpecAveragePhase::Measuring { progress: 0.25 },
                 }],
+                audition_id: "fedcba9876543210".into(),
+                audition: Some(kura_core::edit::editor::audio::audition::AuditionInfo {
+                    node: NodeId(3),
+                    phase: kura_core::edit::editor::audio::audition::AuditionPhase::Solving(0.5),
+                    valid: vec![(0, 65_536)],
+                }),
             },
         ))));
         let json = serde_json::to_value(audio).unwrap();
@@ -2342,6 +2439,12 @@ mod tests {
                      "phase": { "type": "measuring", "progress": 0.25 } }])
         );
         assert_eq!(json["view"]["samplesId"], json!("0123456789abcdef"));
+        assert_eq!(json["view"]["auditionId"], json!("fedcba9876543210"));
+        assert_eq!(
+            json["view"]["audition"],
+            json!({ "node": 3, "phase": { "type": "solving", "progress": 0.5 },
+                    "valid": [{ "start": 0, "end": 65536 }] })
+        );
         assert_eq!(json["view"]["workStalled"], json!(true));
         assert_eq!(
             json["view"]["changed"],

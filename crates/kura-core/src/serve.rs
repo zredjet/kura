@@ -94,6 +94,14 @@ pub enum Route {
         start: u64,
         end: u64,
     },
+    /// 音声のエディタの試聴の PCM（M17 段 6。一時的に外して聞く音）：公開した今か直前の試聴の値のうち `auditionId`（小文字の
+    /// 16 進 16 文字）が同じものの、出力のフレーム `[start, end)`。
+    EditAuditionPcm {
+        session: String,
+        id: String,
+        start: u64,
+        end: u64,
+    },
     /// 音声のエディタの波形の段のタイル：公開した段の世代 `rev`（表示の情報の `peaks.rev`。文書の rev ではない）の段 `bin`
     /// （1 ビンのフレーム数）のタイル `tile`（1,024 ビンずつ）。(セッション, 世代, 段, タイル) の中身は変わらない。
     EditPeaks {
@@ -144,7 +152,10 @@ impl Route {
             | Self::Edit { .. }
             | Self::EditPeaks { .. }
             | Self::EditSpec { .. } => Some(IMMUTABLE),
-            Self::Pcm { .. } | Self::EditPcm { .. } | Self::EditInputPcm { .. } => Some("no-store"),
+            Self::Pcm { .. }
+            | Self::EditPcm { .. }
+            | Self::EditInputPcm { .. }
+            | Self::EditAuditionPcm { .. } => Some("no-store"),
             Self::File { .. } | Self::Play { .. } => None,
         }
     }
@@ -213,6 +224,19 @@ fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
             key: key.to_string(),
             channel: channel.to_string(),
             chunk,
+        });
+    }
+    if second == "audition" {
+        let id = parts.next().filter(|i| is_audition_id(i))?.to_string();
+        let (start, end) = match (parts.next()?, parts.next()?, parts.next()) {
+            ("pcm", span, None) => parse_span(span)?,
+            _ => return None,
+        };
+        return Some(Route::EditAuditionPcm {
+            session,
+            id,
+            start,
+            end,
         });
     }
     if second == "input" {
@@ -284,6 +308,14 @@ fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
 }
 
 /// `{start}-{end}`（10 進、`start < end`。等しい・逆なら None）。
+/// 試聴の id（`auditionId`：出力の指紋の先頭 8 バイトの小文字の 16 進）。
+fn is_audition_id(text: &str) -> bool {
+    text.len() == 16
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn parse_span(span: &str) -> Option<(u64, u64)> {
     let (start, end) = span.split_once('-')?;
     let (start, end) = (parse_decimal(start)?, parse_decimal(end)?);
@@ -322,6 +354,7 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         | Route::Edit { .. }
         | Route::EditPcm { .. }
         | Route::EditInputPcm { .. }
+        | Route::EditAuditionPcm { .. }
         | Route::EditPeaks { .. }
         | Route::EditSpec { .. } => {
             return None;
@@ -640,10 +673,24 @@ mod tests {
         assert_eq!(
             parse_route("/edit/3fa9c0de/input/pcm/0-1"),
             Some(Route::EditInputPcm {
-                session,
+                session: session.clone(),
                 start: 0,
                 end: 1
             })
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/audition/0123456789abcdef/pcm/0-9"),
+            Some(Route::EditAuditionPcm {
+                session,
+                id: "0123456789abcdef".into(),
+                start: 0,
+                end: 9
+            })
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/audition/0123456789abcdef/pcm/0-9")
+                .and_then(|r| r.cache_control()),
+            Some("no-store")
         );
         for bad in [
             "/edit/3fa9c0de/12/pcm/5-5",
@@ -657,6 +704,12 @@ mod tests {
             "/edit/3fa9c0de/input/wave/0-5",
             "/edit/3fa9c0de/input/pcm/0-5/x",
             "/edit/3fa9c0de/input/3/pcm/0-5",
+            "/edit/3fa9c0de/audition/0123456789abcde/pcm/0-5",
+            "/edit/3fa9c0de/audition/0123456789ABCDEF/pcm/0-5",
+            "/edit/3fa9c0de/audition/0123456789abcdef/pcm/5-5",
+            "/edit/3fa9c0de/audition/0123456789abcdef/pcm/0-5/x",
+            "/edit/3fa9c0de/audition/0123456789abcdef/wave/0-5",
+            "/edit/3fa9c0de/audition/pcm/0-5",
             "/edit/3fa9c0de/x/pcm/0-5",
         ] {
             assert_eq!(parse_route(bad), None, "{bad}");

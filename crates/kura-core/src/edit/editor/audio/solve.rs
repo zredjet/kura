@@ -285,7 +285,12 @@ impl Editor {
         let old = st.audio.as_mut().and_then(|a| a.held.take());
         if let Some(old) = old {
             for (k, _, _) in old.tables {
-                if !tables.iter().any(|(t, _, _)| *t == k) {
+                // 試聴の計画が握っているもの（M17 段 6）は外さない
+                let auditioned = st
+                    .audio
+                    .as_ref()
+                    .is_some_and(|a| a.audition.tables.iter().any(|(t, _, _)| *t == k));
+                if !tables.iter().any(|(t, _, _)| *t == k) && !auditioned {
                     // ふつうの項目に戻す（取り消しで戻ったとき、追い出されていなければ解き直さない）
                     st.cache.demote_external_analysis(&k);
                 }

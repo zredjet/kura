@@ -38,6 +38,9 @@ export function audioView(over: AudioViewOver = {}): EditAudioView {
     loop: null,
     markers: [],
     samplesId: '00112233aabbccdd',
+    // 試聴の重ねがなければ鳴らす音の id は samplesId と同じ（M17 段 6）
+    auditionId: over.samplesId ?? '00112233aabbccdd',
+    audition: null,
     changed: { type: 'all' },
     metaChanged: false,
     valid: [],

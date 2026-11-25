@@ -12,6 +12,9 @@
 //! - **予算**：公開した今と直前の表示の値（`resident_bytes`）を、エディタの確保の `extra` で数える（画像は数えない。
 //!   docs/editing.md §12.10）。
 
+pub mod audition;
+#[cfg(test)]
+mod audition_tests;
 pub mod eq_curve;
 pub mod handles;
 #[cfg(test)]
@@ -136,6 +139,11 @@ pub struct AudioViewInfo {
     pub spec: Vec<spec::SpecPortInfo>,
     /// 最後に頼んだスペクトルの区間の平均の状態（`edit_spec_average`。値は載せない）。
     pub spec_average: Vec<spec_average::SpecAverageStatus>,
+    /// 鳴らす音の指紋（M17 段 6。試聴の重ねがなければ `samplesId`。外して聞いている間は試聴の計画の出力の指紋で、
+    /// `/edit/{s}/audition/{auditionId}/pcm/{a}-{b}` で取る。デコーダは `kura-edit/1:{auditionId}`）。
+    pub audition_id: String,
+    /// 試聴の情報（頼みに試聴があるときだけ）。
+    pub audition: Option<audition::AuditionInfo>,
 }
 
 /// 開いている音声のエディタの状態（`State::audio`）。
@@ -158,6 +166,8 @@ pub(crate) struct AudioState {
     pub(crate) solve_failed: Option<Vec<kura_engine::render::cache::Fingerprint>>,
     /// スペクトルのタイルの仕事（M17 段 4）。
     pub(crate) spec: spec::SpecJob,
+    /// 試聴の計画（一時的に外して聞く。M17 段 6）。
+    pub(crate) audition: audition::AuditionState,
     /// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数で区切る（`slice::Limit::Chunks`）。
     #[cfg(test)]
     pub(crate) script: Option<u64>,
@@ -291,7 +301,8 @@ pub(crate) fn audio_viewport(vp: &Viewport) -> AudioViewport {
 }
 
 impl Editor {
-    /// 今の文書の音声の出力を、表示の範囲（[`view_area`]）だけ描いて公開する（`Editor::render` の音声の枝）。
+    /// 今の文書の音声の出力を、表示の範囲（[`view_area`]）だけ描いて公開する（`Editor::render` の音声の枝）。試聴の頼みが
+    /// あれば、その流し解きを表示より先に進め、表示のあとに試聴の値を描いて添える（M17 段 6。[`audition`]）。
     pub(super) fn render_audio(
         &self,
         st: &mut State,
@@ -300,16 +311,16 @@ impl Editor {
         full: Shape,
         started: Instant,
     ) -> Result<ViewOutcome, EditorError> {
-        let Some((rate, channels, frames)) = audio_shape(&full) else {
+        if audio_shape(&full).is_none() {
             return Ok(ViewOutcome::Failed(Problem {
                 code: ProblemCode::Invalid,
                 message: "長さの分からない音声は表示できません".into(),
                 issues: Vec::new(),
             }));
-        };
+        }
         let avp = audio_viewport(vp);
-        // 裏の仕事の区切り（`work` の頼みだけ）：流し解き（操作中でも）→ 波形の段 → 長い音声の計り（操作中は進めない）の順に
-        // 1 つの締め切りを分け合う
+        // 裏の仕事の区切り（`work` の頼みだけ）：試聴の流し解き → 表示の流し解き（操作中でも）→ 波形の段 → 長い音声の計り
+        // （操作中は進めない）の順に 1 つの締め切りを分け合う
         let mut limit = avp
             .work
             .then(|| slice::Limit::Deadline(Instant::now() + peaks::WORK_SLICE));
@@ -321,10 +332,57 @@ impl Editor {
             *l = slice::Limit::Chunks(n);
         }
         let mut progress = slice::WorkProgress::default();
+        // 試聴の計画（聞こえる音を先に替える）
+        let mut prep = self.prepare_audition(st, &avp, &full);
+        if self
+            .advance_audition(st, &mut prep, limit.as_mut(), &mut progress, ticket)
+            .is_err()
+        {
+            return self.interrupted();
+        }
+        let outcome =
+            self.render_display(st, &avp, ticket, &full, started, &mut limit, &mut progress)?;
+        let ViewOutcome::Shown(ViewInfo::Audio(mut info)) = outcome else {
+            return Ok(outcome);
+        };
+        if self
+            .attach_audition(st, &mut info, prep, &avp, &full, ticket)
+            .is_err()
+        {
+            return self.interrupted();
+        }
+        Ok(ViewOutcome::Shown(ViewInfo::Audio(info)))
+    }
+
+    /// 描いている途中で中止された：閉じたなら Canceled、新しい頼みに取って代わられたなら Superseded。
+    fn interrupted(&self) -> Result<ViewOutcome, EditorError> {
+        if self.cancel.canceled() {
+            Err(EditorError::Canceled)
+        } else {
+            Ok(ViewOutcome::Superseded)
+        }
+    }
+
+    /// 表示を描いて公開する（[`Self::render_audio`] の表示の分）。
+    #[allow(clippy::too_many_arguments)]
+    fn render_display(
+        &self,
+        st: &mut State,
+        avp: &AudioViewport,
+        ticket: &Ticket,
+        full: &Shape,
+        started: Instant,
+        limit: &mut Option<slice::Limit>,
+        progress: &mut slice::WorkProgress,
+    ) -> Result<ViewOutcome, EditorError> {
+        let Some((rate, channels, frames)) = audio_shape(full) else {
+            return failed(EditorError::Failed("長さの分からない音声です".into()));
+        };
+        let avp = avp.clone();
         // M17 段 3：流し解きが重い手は裏の仕事にし、解き終えるまで握る計画で描く
-        if let solve::Gate::Background = self.solve_gate(st, &full) {
+        if let solve::Gate::Background = self.solve_gate(st, full) {
             let done = match limit.as_mut() {
-                Some(l) => match self.advance_solve(st, l, &mut progress, ticket) {
+                Some(l) => match self.advance_solve(st, l, progress, ticket) {
                     Ok(solve::Advanced::Done) => {
                         // 解いた結果がキャッシュから消えていれば入れ直す（錠の中で解き直さない）
                         self.restore_solved(st);
@@ -346,10 +404,10 @@ impl Editor {
                 None => false,
             };
             if !done {
-                return self.render_held(st, &avp, ticket, started, limit.is_some(), &progress);
+                return self.render_held(st, &avp, ticket, started, limit.is_some(), progress);
             }
         }
-        let area = view_area(&full, &avp);
+        let area = view_area(full, &avp);
         let plan = st.plan.clone();
         let spec = EstimateSpec::new(0)
             .all_inputs(&plan, Source::Held)
@@ -425,18 +483,10 @@ impl Editor {
             key.copy_from_slice(&out_fp.0.0[..16]);
             a.spec.note_output(key, (rate, channels, frames), &changed);
         }
-        let spec = self.advance_spec(
-            st,
-            &plan,
-            &value,
-            &avp,
-            limit.as_mut(),
-            &mut progress,
-            ticket,
-        );
+        let spec = self.advance_spec(st, &plan, &value, &avp, limit.as_mut(), progress, ticket);
         // 区間の平均の予約（タイルのあと。操作中は進めない）
         if let Some(l) = limit.as_mut().filter(|_| !avp.interacting) {
-            self.advance_spec_average(st, &plan, l, &mut progress, ticket);
+            self.advance_spec_average(st, &plan, l, progress, ticket);
         }
         let settled = !avp.interacting && !st.session.is_provisional();
         if let Some(a) = st.audio.as_mut() {
@@ -450,7 +500,7 @@ impl Editor {
         // 裏の仕事の区切りの残り（操作中は波形の段・計りを進めない）：波形の段を先に、残った時間で長い音声の計りを進める。
         // 窓の途中でもチャンクごとに締め切りを見る（`slice`）
         if avp.interacting {
-            limit = None;
+            *limit = None;
         }
         self.advance_peaks(
             st,
@@ -459,11 +509,11 @@ impl Editor {
             &area,
             &avp,
             limit.as_mut(),
-            &mut progress,
+            progress,
             ticket,
         );
         if let Some(limit) = limit.as_mut() {
-            self.advance_measure(st, &id, limit, &mut progress, ticket);
+            self.advance_measure(st, &id, limit, progress, ticket);
         }
         self.count_resident(st);
         let (peaks, work, loudness) = match st.audio.as_mut() {
@@ -518,6 +568,8 @@ impl Editor {
                 .as_ref()
                 .map(|a| a.spec.average.statuses())
                 .unwrap_or_default(),
+            audition_id: String::new(),
+            audition: None,
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
@@ -661,6 +713,8 @@ impl Editor {
                 .as_ref()
                 .map(|a| a.spec.average.statuses())
                 .unwrap_or_default(),
+            audition_id: String::new(),
+            audition: None,
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
@@ -710,8 +764,17 @@ impl Editor {
                 .flatten()
                 .map(|(_, p)| peak_bytes(p))
                 .fold(0u64, u64::saturating_add);
+            // 試聴の値（M17 段 6。id が同じ今と直前は同じ値を分け合うことがあるが、別に数える）
+            let audition = [p.audition_now.as_ref(), p.audition_before.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|(_, v)| v.value().resident_bytes())
+                .fold(0u64, u64::saturating_add);
             // スペクトルのタイルの置き場（M17 段 4）
-            views.saturating_add(peaks).saturating_add(p.spec.bytes())
+            views
+                .saturating_add(peaks)
+                .saturating_add(p.spec.bytes())
+                .saturating_add(audition)
         };
         // 波形の段の作りかけと、スペクトルのチャンク・まとまりの要約（M17 段 4）
         let run = st.audio.as_ref().map_or(0, |a| {
@@ -723,22 +786,26 @@ impl Editor {
         });
         // 流し解きの作りかけ（進めている仕事の結果の見積もり）と、解けた結果のうちキャッシュにないもの（仕事だけが持つ。
         // キャッシュにあるものはキャッシュが数える）
-        let solving = st
-            .audio
-            .as_ref()
-            .and_then(|a| a.solve.as_ref())
-            .map_or(0, |s| {
-                let finished = s.job.finished();
-                let solved = finished.iter().fold(0u64, |a, x| a.saturating_add(x.bytes));
-                let uncached = finished
-                    .iter()
-                    .filter(|x| !st.cache.contains_analysis(&x.key))
-                    .fold(0u64, |a, x| a.saturating_add(x.bytes));
-                self.runtime
-                    .preview(|e| s.job.held_bytes(e))
-                    .saturating_sub(solved)
-                    .saturating_add(uncached)
-            });
+        // （表示と試聴の流し解き。M17 段 6）
+        let run_bytes = |s: &solve::SolveRun| {
+            let finished = s.job.finished();
+            let solved = finished.iter().fold(0u64, |a, x| a.saturating_add(x.bytes));
+            let uncached = finished
+                .iter()
+                .filter(|x| !st.cache.contains_analysis(&x.key))
+                .fold(0u64, |a, x| a.saturating_add(x.bytes));
+            self.runtime
+                .preview(|e| s.job.held_bytes(e))
+                .saturating_sub(solved)
+                .saturating_add(uncached)
+        };
+        let solving = st.audio.as_ref().map_or(0, |a| {
+            [a.solve.as_ref(), a.audition.solve.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(run_bytes)
+                .fold(0u64, u64::saturating_add)
+        });
         st.lease
             .set_extra(bytes.saturating_add(run).saturating_add(solving));
         settle(st);

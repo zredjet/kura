@@ -1404,6 +1404,13 @@ export type EditAudioViewDto = {
 	 *  頼み直すと覚えた値が返る。`idle` は出力が変わって予約を捨てたので、頼み直す）。
 	 */
 	specAverage: EditSpecAverageStatusDto[],
+	/**
+	 *  鳴らす音の指紋（M17 段 6）。試聴の重ねがなければ `samplesId`。違えば、再生は
+	 *  `/edit/{session}/audition/{auditionId}/pcm/{a}-{b}`（デコーダ `kura-edit/1:{auditionId}`）を `audition.valid` の区間で取る。
+	 */
+	auditionId: string,
+	/**  試聴の情報（頼みに試聴があるときだけ）。 */
+	audition: EditAuditionDto | null,
 };
 
 /**  音声の表示の要求。区間はどれも出力のフレーム。 */
@@ -1420,6 +1427,35 @@ export type EditAudioViewportDto = {
 	work: boolean,
 	/**  スペクトルの頼み（2 つまで：前と後。M17 段 4。省けば頼まない）。 */
 	spec?: EditSpecRequestDto[],
+	/**  試聴の頼み（一時的に外して聞く。M17 段 6。省けば頼まない）。 */
+	audition?: EditAuditionRequestDto | null,
+};
+
+/**  試聴の情報（M17 段 6）。 */
+export type EditAuditionDto = {
+	/**  外すノード。 */
+	node: number,
+	phase: EditAuditionPhaseDto,
+	/**  試聴の値の有効な区間（`/edit/{session}/audition/{auditionId}/pcm/…` で取れる所）。 */
+	valid: EditSpanDto[],
+};
+
+/**  試聴の様子（M17 段 6）。 */
+export type EditAuditionPhaseDto = 
+/**  外した音を配れる（`auditionId` で取る）。 */
+{ type: "ready" } | 
+/**  外した音の流し解きを裏で進めている（その間の `auditionId` は `samplesId`：外していない音）。 */
+{ type: "solving"; progress: number | null } | 
+/**  外せない（文書にないノード・外すと出力の形が変わる・計画を作れない）。 */
+{ type: "unavailable" };
+
+/**
+ *  試聴の頼み（M17 段 6）：ノード `bypass` を外した音を、区間 `spans`（再生の先読み。長い音声だけ使う）で描いて配る。文書は
+ *  変えない。
+ */
+export type EditAuditionRequestDto = {
+	bypass: number,
+	spans: EditSpanDto[],
 };
 
 /**  変わったタイル。 */

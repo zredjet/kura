@@ -92,6 +92,8 @@ pub struct AudioViewport {
     pub work: bool,
     /// スペクトルの頼み（2 つまで：前と後。M17 段 4）。
     pub spec: Vec<super::audio::spec::SpecRequest>,
+    /// 試聴の頼み（一時的に外して聞く。M17 段 6）。
+    pub audition: Option<super::audio::audition::AuditionRequest>,
 }
 
 impl AudioViewport {
@@ -104,6 +106,7 @@ impl AudioViewport {
             focus: None,
             work: true,
             spec: Vec::new(),
+            audition: None,
         }
     }
 }
