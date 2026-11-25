@@ -1,6 +1,8 @@
 import { type PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-import { Select } from '../../../components/Select/Select';
+import { ChevronDownIcon } from '../../../components/icons/ChevronDownIcon';
+import { MoreIcon } from '../../../components/icons/MoreIcon';
+import { type MenuAction, openMenuBelow } from '../../../components/Menu/menuStore';
 import { ja } from '../../../i18n/ja';
 import type { EditSpecChannelDto } from '../../../ipc/edit';
 import { useEditorStore } from '../editorStore';
@@ -87,106 +89,136 @@ function channelOptions(channels: number): { value: string; label: string }[] {
   return out;
 }
 
-/** 面の右上の札：線の見本つきの凡例と、表示の設定（表示だけ。文書に入らない）。 */
-function SpectrumChip() {
+/** 面の左上の凡例（線の見本つき。押せない文字）。 */
+function SpectrumLegend({ left }: { left: number }) {
+  const doc = useEditorStore((s) => s.doc);
+  const selected = useEditorStore((s) => s.selected);
+  // 見るイコライザがなければ「出力」だけ
+  const hasTarget = targetNode(doc, selected, 'audio.eq') !== null;
+  return (
+    <ul
+      className={styles.specLegend}
+      style={{ left }}
+      aria-label={ts.legendLabel}
+      data-spec-chip=""
+    >
+      <li>
+        <span className={`${styles.swatch} ${styles.swatchPost}`} aria-hidden="true" />
+        {hasTarget ? ts.legend.post : ts.legend.output}
+      </li>
+      {hasTarget && (
+        <li>
+          <span className={`${styles.swatch} ${styles.swatchPre}`} aria-hidden="true" />
+          {ts.legend.pre}
+        </li>
+      )}
+      <li>
+        <span className={`${styles.swatch} ${styles.swatchHold}`} aria-hidden="true" />
+        {ts.legend.hold}
+      </li>
+    </ul>
+  );
+}
+
+/** 選ぶメニューの項目（今の値に印）。 */
+function choices<T>(
+  list: readonly T[],
+  now: T,
+  label: (v: T) => string,
+  set: (v: T) => void,
+): MenuAction[] {
+  return list.map((v) => ({ label: label(v), checked: v === now, onSelect: () => set(v) }));
+}
+
+/**
+ * 面の右上の表示の設定（表示だけ。文書に入らない）：今の値を出したボタン（チャンネル・イコライザの目盛り）と［…］（落ちる
+ * 速さ・傾きの補正・スペクトルの範囲・最大の保持を消す）。押すと下にメニューを開く。押せるものだけ枠と地を付け、凡例と
+ * 見分ける（画面での確かめ：凡例と見分けにくかった）。
+ */
+function SpectrumControls() {
   const settings = useAudioStore((s) => s.spectrum);
   // 選べるチャンネルは、面が出すノードの入力の数（なければ出力の数）
   const { channels } = useEqPort();
-  const doc = useEditorStore((s) => s.doc);
-  const selected = useEditorStore((s) => s.selected);
-  const [open, setOpen] = useState(false);
-  // 見るイコライザがなければ「出力」だけ
-  const hasTarget = targetNode(doc, selected, 'audio.eq') !== null;
   const channel = usableChannel(settings.channel, channels);
+  const options = channelOptions(channels);
+  const channelLabel =
+    options.find((o) => o.value === channelValue(channel))?.label ?? ts.channelNames.sum;
   return (
-    <div className={styles.specChip} data-spec-chip="">
-      <ul className={styles.specLegend} aria-label={ts.settings}>
-        <li>
-          <span className={`${styles.swatch} ${styles.swatchPost}`} aria-hidden="true" />
-          {hasTarget ? ts.legend.post : ts.legend.output}
-        </li>
-        {hasTarget && (
-          <li>
-            <span className={`${styles.swatch} ${styles.swatchPre}`} aria-hidden="true" />
-            {ts.legend.pre}
-          </li>
-        )}
-        <li>
-          <span className={`${styles.swatch} ${styles.swatchHold}`} aria-hidden="true" />
-          {ts.legend.hold}
-        </li>
-      </ul>
+    <div className={styles.specControls} data-spec-chip="">
       <button
         type="button"
-        className={styles.specSettingsButton}
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        className={styles.specButton}
+        aria-haspopup="menu"
+        aria-label={ts.valueLabel(ts.channel, channelLabel)}
+        title={ts.channel}
+        disabled={options.length < 2}
+        onClick={(e) =>
+          openMenuBelow(
+            e.currentTarget,
+            ts.channel,
+            options.map((o) => ({
+              label: o.label,
+              checked: o.value === channelValue(channel),
+              onSelect: () => setSpectrumSettings({ channel: channelOf(o.value) }),
+            })),
+          )
+        }
       >
-        {ts.settings}
+        {channelLabel}
+        <ChevronDownIcon size={12} strokeWidth={2} />
       </button>
-      {open && (
-        <div className={styles.specSettings} role="group" aria-label={ts.settings}>
-          <label>
-            <span>{ts.fall}</span>
-            <Select
-              value={String(settings.fall)}
-              options={SPECTRUM_CHOICES.fall.map((v) => ({
-                value: String(v),
-                label: ts.fallValue(v),
-              }))}
-              onChange={(v) => setSpectrumSettings({ fall: Number(v) })}
-            />
-          </label>
-          <label>
-            <span>{ts.tilt}</span>
-            <Select
-              value={String(settings.tilt)}
-              options={SPECTRUM_CHOICES.tilt.map((v) => ({
-                value: String(v),
-                label: ts.tiltValue(v),
-              }))}
-              onChange={(v) => setSpectrumSettings({ tilt: Number(v) })}
-            />
-          </label>
-          <label>
-            <span>{ts.channel}</span>
-            <Select
-              value={channelValue(channel)}
-              options={channelOptions(channels)}
-              onChange={(v) => setSpectrumSettings({ channel: channelOf(v) })}
-            />
-          </label>
-          <label>
-            <span>{ts.range}</span>
-            <Select
-              value={String(settings.range)}
-              options={SPECTRUM_CHOICES.range.map((v) => ({
-                value: String(v),
-                label: ts.rangeValue(v),
-              }))}
-              onChange={(v) => setSpectrumSettings({ range: Number(v) })}
-            />
-          </label>
-          <label>
-            <span>{ts.eqScale}</span>
-            <Select
-              value={String(settings.eqScale)}
-              options={SPECTRUM_CHOICES.eqScale.map((v) => ({
-                value: String(v),
-                label: ts.eqScaleValue(v),
-              }))}
-              onChange={(v) => setSpectrumSettings({ eqScale: Number(v) })}
-            />
-          </label>
-          <button
-            type="button"
-            className={styles.specReset}
-            onClick={() => spectrumController()?.resetHold()}
-          >
-            {ts.resetHold}
-          </button>
-        </div>
-      )}
+      <button
+        type="button"
+        className={styles.specButton}
+        aria-haspopup="menu"
+        aria-label={ts.valueLabel(ts.eqScale, ts.eqScaleValue(settings.eqScale))}
+        title={ts.eqScale}
+        onClick={(e) =>
+          openMenuBelow(
+            e.currentTarget,
+            ts.eqScale,
+            choices(SPECTRUM_CHOICES.eqScale, settings.eqScale, ts.eqScaleValue, (v) =>
+              setSpectrumSettings({ eqScale: v }),
+            ),
+          )
+        }
+      >
+        {ts.eqScaleValue(settings.eqScale)}
+        <ChevronDownIcon size={12} strokeWidth={2} />
+      </button>
+      <button
+        type="button"
+        className={`${styles.specButton} ${styles.specMore}`}
+        aria-haspopup="menu"
+        aria-label={ts.settings}
+        title={ts.settings}
+        onClick={(e) =>
+          openMenuBelow(e.currentTarget, ts.settings, [
+            {
+              label: ts.fall,
+              submenu: choices(SPECTRUM_CHOICES.fall, settings.fall, ts.fallValue, (v) =>
+                setSpectrumSettings({ fall: v }),
+              ),
+            },
+            {
+              label: ts.tilt,
+              submenu: choices(SPECTRUM_CHOICES.tilt, settings.tilt, ts.tiltValue, (v) =>
+                setSpectrumSettings({ tilt: v }),
+              ),
+            },
+            {
+              label: ts.range,
+              submenu: choices(SPECTRUM_CHOICES.range, settings.range, ts.rangeValue, (v) =>
+                setSpectrumSettings({ range: v }),
+              ),
+            },
+            'separator',
+            { label: ts.resetHold, onSelect: () => spectrumController()?.resetHold() },
+          ])
+        }
+      >
+        <MoreIcon size={14} />
+      </button>
     </div>
   );
 }
@@ -202,6 +234,7 @@ export function SpectrumStage() {
   const openId = useEditorStore((s) => s.openId);
   const phase = useEditorStore((s) => s.phase);
   const [stripHeight, setStripHeight] = useState(0);
+  const [legendLeft, setLegendLeft] = useState<number>(AXIS.left);
   const [hover, setHover] = useState<{ x: number; y: number; lines: string[] } | null>(null);
   const pointer = useRef<number | null>(null);
   const announce = useAudioStore((s) => s.eqAnnounce);
@@ -239,6 +272,8 @@ export function SpectrumStage() {
     const measure = () => {
       const r = host.getBoundingClientRect();
       const base = measureWaveInsets(host);
+      // 凡例は面の中の左端（イコライザの dB の目盛りの右）に揃える
+      setLegendLeft(base.left + AXIS.left);
       controller.setInsets({
         top: AXIS.top,
         left: base.left + AXIS.left,
@@ -394,7 +429,8 @@ export function SpectrumStage() {
             ))}
           </div>
         )}
-        <SpectrumChip />
+        <SpectrumLegend left={legendLeft} />
+        <SpectrumControls />
       </div>
     </div>
   );

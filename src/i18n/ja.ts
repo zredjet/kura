@@ -1379,7 +1379,10 @@ export const ja = {
         /** 右下：周波数の範囲。 */
         freqRange: (lo: string, hi: string) => `${lo} – ${hi}`,
         legend: { post: '後', pre: '前', hold: '最大の保持', output: '出力' },
+        legendLabel: '凡例',
         settings: '表示の設定',
+        /** 今の値を出したボタンの読み上げ（「チャンネル：和」）。 */
+        valueLabel: (name: string, value: string) => `${name}：${value}`,
         fall: '落ちる速さ',
         fallValue: (v: number) => `${v} dB/s`,
         tilt: '傾きの補正',

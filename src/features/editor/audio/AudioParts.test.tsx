@@ -5,6 +5,7 @@ import { ja } from '../../../i18n/ja';
 import type { EditNodeDto } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
 import { Editor } from '../Editor';
+import { useMenuStore } from '../../../components/Menu/menuStore';
 import { useEditorStore } from '../editorStore';
 import { OpsPanel } from '../OpsPanel';
 import { summarizeAudioView, useAudioStore } from './audioStore';
@@ -354,11 +355,39 @@ describe('スペクトルの面（M17 段 5）', () => {
     expect(screen.getByText(a.spectrum.freqRange('20 Hz', '24 kHz'))).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: a.zoomIn })).toBeNull();
     expect(screen.getByText(a.spectrum.analyzerCursor)).toBeInTheDocument();
-    // 凡例と表示の設定（押すと欄が出る）
-    expect(screen.getByText(a.spectrum.legend.output)).toBeInTheDocument();
+    // 左上に凡例（押せない文字）、右上に今の値を出したボタン（押すと下にメニュー）と［…］
+    const legend = screen.getByRole('list', { name: a.spectrum.legendLabel });
+    expect(within(legend).getByText(a.spectrum.legend.output)).toBeInTheDocument();
+    expect(within(legend).queryByRole('button')).toBeNull();
+    fireEvent.click(
+      screen.getByRole('button', { name: a.spectrum.valueLabel(a.spectrum.channel, '和') }),
+    );
+    expect(useMenuStore.getState().menu?.label).toBe(a.spectrum.channel);
+    useMenuStore.getState().close();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: a.spectrum.valueLabel(a.spectrum.eqScale, a.spectrum.eqScaleValue(12)),
+      }),
+    );
+    const scale = useMenuStore
+      .getState()
+      .menu?.entries.find((e) => e !== 'separator' && e.label === a.spectrum.eqScaleValue(6));
+    if (!scale || scale === 'separator' || !('onSelect' in scale)) {
+      throw new Error('目盛りの項目がない');
+    }
+    scale.onSelect();
+    expect(useAudioStore.getState().spectrum.eqScale).toBe(6);
+    useMenuStore.getState().close();
     fireEvent.click(screen.getByRole('button', { name: a.spectrum.settings }));
-    expect(screen.getByLabelText(a.spectrum.fall)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: a.spectrum.resetHold })).toBeInTheDocument();
+    const more = useMenuStore.getState().menu?.entries ?? [];
+    expect(more.map((e) => (e === 'separator' ? '-' : e.label))).toEqual([
+      a.spectrum.fall,
+      a.spectrum.tilt,
+      a.spectrum.range,
+      '-',
+      a.spectrum.resetHold,
+    ]);
+    useMenuStore.getState().close();
   });
 });
 
