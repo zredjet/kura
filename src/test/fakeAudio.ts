@@ -35,6 +35,8 @@ export interface FakeBuffer extends BufferLike {
 export interface FakeParam extends AudioParamLike {
   /** `setValueAtTime(value, when)` の記録。 */
   sets: [number, number][];
+  /** `cancelScheduledValues(when)` の記録。 */
+  cancels: number[];
   /** `linearRampToValueAtTime(value, when)` の記録。 */
   ramps: [number, number][];
 }
@@ -139,6 +141,10 @@ export function fakeFactory(log: string[] = [], honor = true) {
         const param: FakeParam = {
           value: 1,
           sets: [],
+          cancels: [],
+          cancelScheduledValues: (t: number) => {
+            param.cancels.push(t);
+          },
           ramps,
           setValueAtTime: (v: number, t: number) => {
             param.value = v;
@@ -168,6 +174,10 @@ export function fakeFactory(log: string[] = [], honor = true) {
           const p: FakeParam = {
             value,
             sets: [],
+            cancels: [],
+            cancelScheduledValues: (t: number) => {
+              p.cancels.push(t);
+            },
             ramps: [],
             setValueAtTime: (v: number, t: number) => {
               p.value = v;

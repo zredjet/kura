@@ -347,11 +347,22 @@ impl Editor {
         let ViewOutcome::Shown(ViewInfo::Audio(mut info)) = outcome else {
             return Ok(outcome);
         };
-        if self
-            .attach_audition(st, &mut info, prep, &avp, &full, ticket)
-            .is_err()
+        if let Err(audition::Interrupted(node)) =
+            self.attach_audition(st, &mut info, prep, &avp, &full, ticket)
         {
-            return self.interrupted();
+            // 表示はもう公開した（前回の表示も進めた）：取って代わられても表示は返す（捨てると、この表示の `changed` を
+            // フロントが知らないままになる）。試聴は用意している途中として返し、次の頼みで描き直す
+            if self.cancel.canceled() {
+                return Err(EditorError::Canceled);
+            }
+            info.audition_id = info.samples_id.clone();
+            info.audition = Some(audition::AuditionInfo {
+                node,
+                phase: audition::AuditionPhase::Solving(0.0),
+                valid: Vec::new(),
+                loudness: measure::LoudnessState::Idle,
+            });
+            info.work = true;
         }
         Ok(ViewOutcome::Shown(ViewInfo::Audio(info)))
     }

@@ -307,7 +307,6 @@ fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
     })
 }
 
-/// `{start}-{end}`（10 進、`start < end`。等しい・逆なら None）。
 /// 試聴の id（`auditionId`：出力の指紋の先頭 8 バイトの小文字の 16 進）。
 fn is_audition_id(text: &str) -> bool {
     text.len() == 16
@@ -316,6 +315,7 @@ fn is_audition_id(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// `{start}-{end}`（10 進、`start < end`。等しい・逆なら None）。
 fn parse_span(span: &str) -> Option<(u64, u64)> {
     let (start, end) = span.split_once('-')?;
     let (start, end) = (parse_decimal(start)?, parse_decimal(end)?);

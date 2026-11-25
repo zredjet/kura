@@ -238,7 +238,15 @@ export interface AudioEditorState {
   /**
    * 合わせている様子（押してある間だけ）：鳴らす音ごとの下げる量（dB）と、比べる音を計っているか。
    */
-  matchInfo: { source: number; edited: number; bypassing: boolean; pending: boolean } | null;
+  matchInfo: {
+    source: number;
+    edited: number;
+    bypassing: boolean;
+    /** 比べる音をまだ計っている（分からない）。 */
+    pending: boolean;
+    /** 計れない音（無音など）があって、比べる音が 2 つそろわない。 */
+    unmeasured: boolean;
+  } | null;
 }
 
 const IDLE_PLAY: AudioPlayState = { status: 'idle', mode: 'cursor' };
@@ -399,7 +407,8 @@ interface AudioRuntime {
 
 /** 音量を合わせて聞くの手元の状態。 */
 interface MatchState {
-  levels: MatchLevels;
+  /** 役ごとの最後に分かったラウドネス（undefined はまだ分からない、null は計れない）。 */
+  levels: { input?: number | null; output?: number | null; audition?: number | null };
   /** `audition` の値を計った外したノード（替わったら捨てる）。 */
   auditionNode: number | null;
   /** 元の計りを頼んだ。 */
@@ -852,12 +861,11 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     const targetNow = spectrumTarget();
     if (targetNow !== lastTarget) {
       lastTarget = targetNow;
-      if (s.bypass !== null && s.bypass !== targetNow) {
-        useAudioStore.setState({ bypass: null });
-        return;
-      }
-      if (s.eqBand !== null) {
-        useAudioStore.setState({ eqBand: null });
+      const patch: Partial<AudioEditorState> = {};
+      if (s.bypass !== null && s.bypass !== targetNow) patch.bypass = null;
+      if (s.eqBand !== null) patch.eqBand = null;
+      if (Object.keys(patch).length > 0) {
+        useAudioStore.setState(patch);
         return;
       }
     }
@@ -1015,7 +1023,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     measuringFor: null,
     measuringAfter: 0,
     match: {
-      levels: { input: null, output: null, audition: null },
+      levels: {},
       auditionNode: null,
       inputAsked: false,
       auditionAsked: null,
@@ -1083,7 +1091,6 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       const s = useAudioStore.getState();
       // ラウドネス（計っている間の裏の仕事を、波形の面が頼み直しを決める前に決める）
       applyLoudness(rt, view, s.loudness, info);
-      noteMatchLevels(rt, view);
       controller.applyView(view, isWorkRequest(info.viewport));
       spectrum.applyView(view);
       if (useAudioStore.getState().face === 'spectrum') {
@@ -1114,6 +1121,9 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
           if (change) player.refresh(change);
         }
       }
+      // 音量を合わせて聞く（M17 段 6）：鳴らす音の PCM と替えを決めたあとで利得を替える（先に替えると、前の音を新しい音の
+      // 利得で置いてしまう）
+      noteMatchLevels(rt, view);
       // カーソル・選択を新しい長さに収める
       if (s.cursor > view.frames) rt.patch.cursor = view.frames;
       if (s.selection && s.selection.end > view.frames) {
@@ -1276,7 +1286,7 @@ function noteMatchLevels(rt: AudioRuntime, view: EditAudioView): void {
   if ((a?.node ?? null) !== m.auditionNode) {
     // 外すノードが替わった・やめた：外した音の値は捨てる
     m.auditionNode = a?.node ?? null;
-    m.levels.audition = null;
+    m.levels.audition = undefined;
     m.auditionAsked = null;
   }
   if (a?.phase.type === 'ready') {
@@ -1345,17 +1355,28 @@ function syncMatch(rt: AudioRuntime): void {
     }
   }
   const playingBypass = bypassing(view);
-  const db = on ? matchGains(m.levels, playingBypass) : { source: 0, edited: 0 };
+  const levels: MatchLevels = {
+    input: m.levels.input ?? null,
+    output: m.levels.output ?? null,
+    audition: m.levels.audition ?? null,
+  };
+  const db = on ? matchGains(levels, playingBypass) : { source: 0, edited: 0 };
   const gains = { source: dbToGain(db.source), edited: dbToGain(db.edited) };
   const changed = gains.source !== m.gains.source || gains.edited !== m.gains.edited;
   m.gains = gains;
   if (changed) rt.player.relevel();
-  // 比べる音が 2 つそろっていない（計っている・計りを待っている）
-  const known = [m.levels.input, m.levels.output, playingBypass ? m.levels.audition : null].filter(
-    (v) => v !== null,
-  ).length;
+  // 比べる音：まだ分からない（計っている・計りを待っている）か、計れない音があって 2 つそろわないか
+  const needed = [m.levels.input, m.levels.output, ...(playingBypass ? [m.levels.audition] : [])];
+  const pending = needed.some((v) => v === undefined);
+  const measurable = needed.filter((v) => typeof v === 'number').length;
   const info = on
-    ? { source: db.source, edited: db.edited, bypassing: playingBypass, pending: known < 2 }
+    ? {
+        source: db.source,
+        edited: db.edited,
+        bypassing: playingBypass,
+        pending,
+        unmeasured: !pending && measurable < 2,
+      }
     : null;
   const prev = s.matchInfo;
   if (JSON.stringify(prev) !== JSON.stringify(info)) useAudioStore.setState({ matchInfo: info });

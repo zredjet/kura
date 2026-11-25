@@ -519,6 +519,11 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     expect(useAudioStore.getState().soloHeld).toBe(false);
     fireEvent.keyDown(face, { key: 'q', repeat: true, bubbles: true });
     expect(useAudioStore.getState().soloHeld).toBe(false);
+    // ⌘ を押したらやめる（⌘ を押している間に離した Q の keyup は届かない）
+    fireEvent.keyDown(face, { key: 'q', bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(true);
+    fireEvent.keyDown(face, { key: 'Meta', metaKey: true, bubbles: true });
+    expect(useAudioStore.getState().soloHeld).toBe(false);
     // 右パネルの［ソロで聞く］
     const solo = screen.getByRole('button', { name: a.spectrum.solo });
     expect(solo).toHaveAttribute('aria-pressed', 'false');
@@ -544,7 +549,7 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     expect(useAudioStore.getState().matchOn).toBe(true);
     act(() =>
       useAudioStore.setState({
-        matchInfo: { source: 0, edited: -6, bypassing: false, pending: false },
+        matchInfo: { source: 0, edited: -6, bypassing: false, pending: false, unmeasured: false },
       }),
     );
     const lowered = a.matchLowered(a.matchWho.edited, '6.0 dB');
@@ -552,16 +557,23 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     expect(button).toHaveAttribute('title', `${a.match}：${lowered}`);
     act(() =>
       useAudioStore.setState({
-        matchInfo: { source: 0, edited: -2.5, bypassing: true, pending: false },
+        matchInfo: { source: 0, edited: -2.5, bypassing: true, pending: false, unmeasured: false },
       }),
     );
     expect(button).toHaveAccessibleDescription(a.matchLowered(a.matchWho.audition, '2.5 dB'));
     act(() =>
       useAudioStore.setState({
-        matchInfo: { source: 0, edited: 0, bypassing: false, pending: true },
+        matchInfo: { source: 0, edited: 0, bypassing: false, pending: true, unmeasured: false },
       }),
     );
     expect(button).toHaveAccessibleDescription(a.matchMeasuring);
+    // 計れない音（無音など）があって合わせられない：計っているとは言わない
+    act(() =>
+      useAudioStore.setState({
+        matchInfo: { source: 0, edited: 0, bypassing: false, pending: false, unmeasured: true },
+      }),
+    );
+    expect(button).toHaveAccessibleDescription(a.matchUnmeasured);
     fireEvent.click(button);
     expect(useAudioStore.getState().matchOn).toBe(false);
   });

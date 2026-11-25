@@ -110,7 +110,13 @@ function makeChunk(index: number, total: number, channels = 2, shift = 0): PcmCh
 }
 
 function setup(
-  opts: { total?: number; rate?: number; channels?: number; missing?: number[] } = {},
+  opts: {
+    total?: number;
+    rate?: number;
+    channels?: number;
+    missing?: number[];
+    level?: (source: PlaySource) => number;
+  } = {},
 ) {
   const total = opts.total ?? CHUNK * 8;
   const rate = opts.rate ?? R;
@@ -137,6 +143,7 @@ function setup(
     want: (source, i) => void wanted.push([source, i]),
     need: (source, spans) => void needs.push([source, spans]),
     volume: () => 0.7,
+    level: opts.level,
     hold,
     timer: { every: () => 1, clear: () => undefined },
     now: () => ms,
@@ -383,6 +390,29 @@ describe('ソロ（M17 段 6）', () => {
     expect(t.ctx().biquads[0]?.frequency.value).toBe(500);
     t.player.stop();
     expect(t.player.soloing).toEqual({ freq: 500, q: 1.414 });
+  });
+});
+
+describe('音ごとの利得（M17 段 6 の音量を合わせて聞く）', () => {
+  it('区間はその音の利得で置き、利得が替わったら今 + 60 ms から前の利得 → 0・新しい利得へ 10 ms で替える', () => {
+    let level = 0.5;
+    const t = setup({ level: () => level });
+    t.player.play({ from: 0, source: 'edited', info: t.info });
+    const ctx = t.ctx();
+    const placed = ctx.gains.slice(1);
+    expect(placed.length).toBeGreaterThan(0);
+    expect(placed.every((g) => g.gain.value === 0.5)).toBe(true);
+    // 同じ利得なら置き直さない
+    t.player.relevel();
+    expect(ctx.gains.length).toBe(placed.length + 1);
+    level = 0.25;
+    t.player.relevel();
+    const fading = placed.filter((g) => g.gain.sets.some(([v]) => v === 0.5));
+    expect(fading.length).toBeGreaterThan(0);
+    expect(fading.every((g) => g.ramps.at(-1)?.[0] === 0)).toBe(true);
+    const fresh = ctx.gains.slice(placed.length + 1);
+    expect(fresh[0]?.ramps.at(-1)?.[0]).toBe(0.25);
+    expect(fresh.slice(1).every((g) => g.gain.value === 0.25)).toBe(true);
   });
 });
 

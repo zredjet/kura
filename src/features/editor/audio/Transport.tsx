@@ -54,10 +54,17 @@ function Position() {
 
 /** 音量を合わせて聞くの様子の読み（押してある間）。 */
 function matchStatus(
-  info: { source: number; edited: number; bypassing: boolean; pending: boolean } | null,
+  info: {
+    source: number;
+    edited: number;
+    bypassing: boolean;
+    pending: boolean;
+    unmeasured: boolean;
+  } | null,
 ): string | null {
   if (!info) return null;
   if (info.pending) return t.matchMeasuring;
+  if (info.unmeasured) return t.matchUnmeasured;
   const lowered = (who: string, db: number) => t.matchLowered(who, `${(-db).toFixed(1)} dB`);
   if (info.edited < 0) {
     return lowered(info.bypassing ? t.matchWho.audition : t.matchWho.edited, info.edited);

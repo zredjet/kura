@@ -46,6 +46,8 @@ const TOOL_KEYS: Record<string, AudioTool> = { s: 'select', t: 'trim', f: 'fade'
 
 /** ⌘ の組み合わせ（表示・すべてを選択）。 */
 function meta(e: KeyboardEvent, key: string): boolean {
+  // ⌘ を押したら Q のソロをやめる（macOS の WebKit は ⌘ を押している間に離したキーの keyup を送らない。M17 段 6）
+  if (useAudioStore.getState().soloHeld) setSoloHeld(false);
   if (key === '1' || e.code === 'Digit1') {
     setAudioFace('wave');
     return true;

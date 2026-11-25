@@ -204,6 +204,11 @@ impl MeasureJob {
         self.runs.retain(|r| r.role != role || r.samples_id == id);
     }
 
+    /// 役 `role` の計りかけを捨てる（外して聞くのをやめた。M17 段 6）。
+    pub(crate) fn drop_role(&mut self, role: MeasureTarget) {
+        self.runs.retain(|r| r.role != role);
+    }
+
     fn remember(&mut self, id: &str, state: LoudnessState) {
         self.results.retain(|(k, _)| k != id);
         self.results.push((id.to_string(), state));

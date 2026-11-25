@@ -110,8 +110,9 @@ pub(crate) enum Prep {
     Background(NodeId, Plan),
 }
 
-/// 描けなかったわけ（呼び手が `Superseded`・`Canceled` にする）。
-pub(crate) struct Interrupted;
+/// 試聴を描いている途中で取って代わられた・閉じた（外すノード。表示はもう公開したので、呼び手は閉じたなら Canceled、
+/// ほかは試聴を用意している途中として表示を返す）。
+pub(crate) struct Interrupted(pub(crate) NodeId);
 
 impl Editor {
     /// 頼みに合わせて試聴の計画を用意し、描き方を決める（頼みに試聴がなければ片付けて None）。
@@ -386,7 +387,8 @@ impl Editor {
                 self.runtime
                     .admit_preview(&plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
             {
-                // 予算が空いていない：次の裏の仕事の頼みで描き直す（それまで外していない音）
+                // 予算が空いていない：次の裏の仕事の頼みで描き直す（それまで外していない音）。裏の仕事の頼みなら進まなかった
+                // 印を立てる（フロントは連鎖をやめて待つ。0 ms で頼み続けない）
                 tracing::debug!(%err, "試聴の描画の確保が空いていないので、あとにします");
                 settle(st);
                 info.audition = Some(AuditionInfo {
@@ -396,6 +398,9 @@ impl Editor {
                     loudness: LoudnessState::Idle,
                 });
                 info.work = true;
+                if avp.work {
+                    info.work_stalled = true;
+                }
                 return Ok(());
             }
             let req = ViewRequest {
@@ -411,7 +416,9 @@ impl Editor {
             settle(st);
             let vr = match r {
                 Ok(vr) => vr,
-                Err(e) if matches!(e.root(), EngineError::Canceled) => return Err(Interrupted),
+                Err(e) if matches!(e.root(), EngineError::Canceled) => {
+                    return Err(Interrupted(node));
+                }
                 Err(err) => {
                     tracing::warn!(%err, "外した音を描けません");
                     info.audition = Some(AuditionInfo {
@@ -428,8 +435,10 @@ impl Editor {
             if let Some(a) = st.audio.as_mut() {
                 a.audition.view = Some(vr.view);
             }
-            self.pin_audition(st, &plan);
         }
+        // 試聴の計画が要る解析を握る（描く区間がない間も：止まっている長い音声で、解いた表が表示の描画に追い出されて再生を
+        // 始めたときに解き直さない）
+        self.pin_audition(st, &plan);
         // 外して聞く音が替わった（操作中でない確定の表示）：前の外して聞く音の計りかけを捨てる。表示の work には計りかけも数える
         let settled = !avp.interacting && !st.session.is_provisional();
         let loudness = match st.audio.as_mut() {
@@ -521,7 +530,8 @@ impl Editor {
         }
     }
 
-    /// 試聴の流し解き・握った結果・土台の表示を捨てる（外せない・もう外してあるとき）。
+    /// 試聴の流し解き・握った結果・土台の表示・公開した値・外して聞く音の計りかけを捨てる（外せない・もう外してあるとき・
+    /// やめたとき）。
     fn drop_audition_work(&self, st: &mut State) {
         let old = st
             .audio
@@ -529,10 +539,12 @@ impl Editor {
             .map(|a| {
                 a.audition.solve = None;
                 a.audition.view = None;
+                a.measure.drop_role(MeasureTarget::Audition);
                 std::mem::take(&mut a.audition.tables)
             })
             .unwrap_or_default();
         self.release_audition_tables(st, old);
+        self.clear_audition();
     }
 
     /// 頼みに試聴がなくなった：試聴の状態と公開した値を片付ける。
@@ -548,7 +560,6 @@ impl Editor {
         if let Some(a) = st.audio.as_mut() {
             a.audition = AuditionState::default();
         }
-        self.clear_audition();
         settle(st);
     }
 

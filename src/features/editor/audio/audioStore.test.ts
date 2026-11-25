@@ -473,6 +473,7 @@ describe('音声のアダプタ', () => {
       edited: -6,
       bypassing: false,
       pending: false,
+      unmeasured: false,
     });
     // 次の表示が届いても元を頼み直さない
     vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 2 })));
@@ -1196,8 +1197,11 @@ describe('スペクトルの面の点の手（M17 段 5）', () => {
     vi.mocked(viewEdit).mockImplementation(async () => result(view(), keep));
     toggleBypass();
     expect(useAudioStore.getState().bypass).toBe(5);
+    useAudioStore.setState({ eqBand: 0 });
     selectNode(6);
+    // 外すのをやめ、選んだバンドも外す（ほかのイコライザのバンドを動かさない）
     expect(useAudioStore.getState().bypass).toBeNull();
+    expect(useAudioStore.getState().eqBand).toBeNull();
     vi.mocked(viewEdit).mockImplementation(async () =>
       result(
         view({

@@ -284,10 +284,14 @@ function SpectrumFields() {
         </button>
       )}
       {node !== null && (
-        <span className={styles.specUsage} aria-live="polite">
+        <span className={styles.specUsage}>
           {preparing !== null ? ts.bypassPreparing(`${Math.floor(preparing * 100)}%`) : ts.usage}
         </span>
       )}
+      {/* 読み上げは用意している間かどうかだけ（進みの % が変わるたびに読まない） */}
+      <span className={styles.srOnly} aria-live="polite">
+        {preparing !== null ? ts.bypassPreparingSpoken : ''}
+      </span>
     </div>
   );
 }

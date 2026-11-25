@@ -600,6 +600,11 @@ export class EditorPlayer {
   private master: GainLike | null = null;
   /** ソロ（M17 段 6）：鳴らしている音をその帯だけにする（null なら全体）。 */
   private solo: SoloBand | null = null;
+  /**
+   * 続けて置く区間の利得（M17 段 6）。替えを待っている間（`refreshWanted`）は前の利得のまま置き、替える時刻 T からの交差
+   * フェードで新しい利得にする（区間の境で利得が跳ばない）。
+   */
+  private placingLevel: number | null = null;
   /** ソロの道（全体の音量のあと：素通しとバンドパスを 10 ms で替える。初めてソロにしたときに作る）。 */
   private soloNodes: { dry: GainLike; filter: BiquadLike; wet: GainLike } | null = null;
   private plan: Plan | null = null;
@@ -653,7 +658,9 @@ export class EditorPlayer {
     const nodes = this.soloNodes ?? this.buildSolo(ctx, master, band);
     const t = ctx.currentTime;
     const end = t + CROSSFADE_SECONDS;
+    // 前の替えの途中でも、予定を消して今の値から替える（古い目標へ寄らない）
     const ramp = (p: AudioParamLike, v: number) => {
+      p.cancelScheduledValues(t);
       p.setValueAtTime(p.value, t);
       p.linearRampToValueAtTime(v, end);
     };
@@ -736,6 +743,7 @@ export class EditorPlayer {
     master.connect(ctx.destination);
     this.master = master;
     this.soloNodes = null;
+    this.placingLevel = null;
     if (this.solo) this.applySolo();
     this.plan = {
       source: req.source,
@@ -1101,7 +1109,9 @@ export class EditorPlayer {
     src.buffer = buffer;
     const gain = ctx.createGain();
     const when = abs / rate;
-    const level = this.deps.level?.(plan.source) ?? 1;
+    const wanted = this.deps.level?.(plan.source) ?? 1;
+    const level = this.refreshWanted && this.placingLevel !== null ? this.placingLevel : wanted;
+    this.placingLevel = level;
     if (fadeIn) {
       gain.gain.setValueAtTime(0, when);
       gain.gain.linearRampToValueAtTime(level, when + CROSSFADE_SECONDS);

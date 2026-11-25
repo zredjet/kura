@@ -28,6 +28,7 @@ export interface AudioParamLike {
   value: number;
   setValueAtTime(value: number, when: number): unknown;
   linearRampToValueAtTime(value: number, when: number): unknown;
+  cancelScheduledValues(when: number): unknown;
 }
 
 /** つなぐ先（AudioNode のうち使う所）。 */

@@ -101,6 +101,8 @@ export function EqBandsField({ node }: { node: number }) {
   const selected = useAudioStore((s) => s.eqBand);
   const { rate } = useEqPort();
   const soloOn = useAudioStore((s) => s.soloOn);
+  // ソロはスペクトルの面のとき（波形のときは押せない：押しても面がないので切れる）
+  const onSpectrum = useAudioStore((s) => s.face === 'spectrum');
   const enabledCount = bands.filter((b) => b.enabled).length;
   const full = bands.length >= EQ_LIMITS.maxBands;
   const band = selected === null ? undefined : bands[selected];
@@ -216,8 +218,8 @@ export function EqBandsField({ node }: { node: number }) {
             type="button"
             className={editorStyles.pill}
             aria-pressed={soloOn}
-            disabled={band.type === 'tilt'}
-            title={ts.soloHint}
+            disabled={band.type === 'tilt' || !onSpectrum}
+            title={onSpectrum ? ts.soloHint : ts.soloSpectrumOnly}
             onClick={toggleSolo}
           >
             {ts.solo}

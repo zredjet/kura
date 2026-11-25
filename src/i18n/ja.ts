@@ -1303,6 +1303,7 @@ export const ja = {
       match: '音量を合わせて聞く',
       matchMeasuring: 'ラウドネスを計っています…',
       matchEven: '音量はそろっています',
+      matchUnmeasured: '計れない音（無音など）があるので合わせていません',
       matchLowered: (who: string, db: string) => `${who}を ${db} 下げています`,
       matchWho: { source: '元', edited: '編集後', audition: '外した音' },
       playFailed: (reason: string) => `再生できませんでした：${reason}`,
@@ -1445,8 +1446,11 @@ export const ja = {
         /** 試聴だけの重ね（M17 段 6）。 */
         bypass: '一時的に外して聞く',
         bypassPreparing: (percent: string) => `外した音を用意しています… ${percent}`,
+        bypassPreparingSpoken:
+          '外した音を用意しています。用意できるまでは外していない音を鳴らします',
         solo: 'ソロで聞く',
         soloHint: 'このバンドの帯だけを鳴らします（面で Q を押している間も）',
+        soloSpectrumOnly: 'スペクトルの面で使えます（⌘2）',
       },
     },
   },

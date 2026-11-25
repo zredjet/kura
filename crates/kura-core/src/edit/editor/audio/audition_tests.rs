@@ -459,3 +459,134 @@ fn long_input_loudness_runs_beside_the_output() {
     let got = got.expect("元を計り終えない");
     assert_eq!(ready(&got), whole_loudness(&bytes, &Graph::new_single()));
 }
+
+/// 外して聞いている間にそのノードを文書で外すと表示と同じ音になり、前に公開した試聴の値は片付ける（数え続けない）。
+#[test]
+fn bypassing_a_node_disabled_in_the_doc_clears_the_audition_values() {
+    let env = Env::new();
+    let frames = 6 * C;
+    let bytes = noise_wav(8_000, 2, frames, 68);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session.clone();
+    env.step(
+        &s,
+        vec![
+            add(0, "audio.gain", json!({ "db": -2.0 })),
+            add(1, "audio.eq", eq(4.0)),
+        ],
+        &spans(&[]),
+    );
+    let out = env.step(&s, Vec::new(), &bypass(2, &[], false));
+    let shown = shown_audio(&out.view).clone();
+    assert_ne!(shown.audition_id, shown.samples_id);
+    let off = Step::Commit {
+        edit: Edit::SetEnabled {
+            node: NodeId(2),
+            enabled: false,
+        },
+        mode: CommitMode::Step,
+    };
+    let out = env.step(&s, vec![off], &bypass(2, &[], false));
+    let info = shown_audio(&out.view);
+    assert_eq!(phase(info), AuditionPhase::Ready);
+    assert_eq!(info.audition_id, info.samples_id);
+    assert!(matches!(
+        serve_audition_pcm(&env.engine, &s, &shown.audition_id, 0, 1),
+        Err(PcmError::NotFound)
+    ));
+}
+
+/// 長い音声：止まっていて描く区間がない間も、解き終えた試聴の計画の解析は握る（表示の描画に追い出されない）。外して聞く
+/// のをやめたら、握ったものを戻し、外して聞く音の計りかけも捨てる（裏の仕事を残さない）。
+#[test]
+fn long_audition_pins_its_tables_and_cleans_up_when_it_ends() {
+    use super::measure::{LoudnessState, MeasureTarget, measure_target};
+    let env = Env::new();
+    let frames = 150 * C;
+    let bytes = noise_wav(8_000, 1, frames, 69);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let plain = Viewport::Audio(AudioViewport {
+        work: false,
+        ..AudioViewport::idle()
+    });
+    let s = env.open_with(id, plain.clone()).session.clone();
+    env.step(
+        &s,
+        vec![
+            add(0, "audio.gain", json!({ "db": -2.0 })),
+            add(1, "audio.eq", eq(4.0)),
+        ],
+        &plain,
+    );
+    // 表示の EQ の表を解き終える
+    let work = Viewport::Audio(AudioViewport {
+        work: true,
+        ..AudioViewport::idle()
+    });
+    for _ in 0..200 {
+        script(&env, &s, 60);
+        if shown_audio(&env.step(&s, Vec::new(), &work).view)
+            .solving
+            .is_none()
+        {
+            break;
+        }
+    }
+    // gain を外す（試聴は gain なしの入力で EQ の表を解く）。区間は頼まない（止まっている）
+    let mut ready = None;
+    for _ in 0..200 {
+        script(&env, &s, 60);
+        let out = env.step(&s, Vec::new(), &bypass(1, &[], true));
+        let info = shown_audio(&out.view).clone();
+        if phase(&info) == AuditionPhase::Ready {
+            ready = Some(info);
+            break;
+        }
+    }
+    let ready = ready.expect("試聴が解き終わらない");
+    assert_ne!(ready.audition_id, ready.samples_id);
+    let editor = env.editor(&s);
+    let pinned: Vec<_> = {
+        let guard = editor.lock_state();
+        let st = guard.as_ref().unwrap();
+        let tables: Vec<_> = st
+            .audio
+            .as_ref()
+            .unwrap()
+            .audition
+            .tables
+            .iter()
+            .map(|(k, _, _)| *k)
+            .collect();
+        let external = st.cache.external_analysis_keys();
+        assert!(!tables.is_empty(), "試聴の表を握る");
+        assert!(tables.iter().all(|k| external.contains(k)));
+        tables
+    };
+    // 外して聞く音の計りを予約してから、外して聞くのをやめる
+    assert!(matches!(
+        measure_target(&env.env(), &s, MeasureTarget::Audition).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    env.step(&s, Vec::new(), &plain);
+    let guard = editor.lock_state();
+    let st = guard.as_ref().unwrap();
+    let a = st.audio.as_ref().unwrap();
+    assert!(a.audition.tables.is_empty());
+    assert!(
+        !a.measure.has_work(&ready.samples_id),
+        "外して聞く音の計りかけは捨てる"
+    );
+    let external = st.cache.external_analysis_keys();
+    let held: Vec<_> = a
+        .held
+        .as_ref()
+        .map(|h| h.tables.iter().map(|(k, _, _)| *k).collect())
+        .unwrap_or_default();
+    assert!(
+        pinned
+            .iter()
+            .all(|k| !external.contains(k) || held.contains(k)),
+        "表示が握っていないものは戻す"
+    );
+}
