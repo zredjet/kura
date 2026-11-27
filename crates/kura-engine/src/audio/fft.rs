@@ -113,8 +113,8 @@ impl RealFft {
     }
 
     /// 半分のスペクトル X_0〜X_{N/2}（`in_re`・`in_im`。どちらも長さ N/2 + 1。実数の列のスペクトル）の逆変換
-    /// x_n = (1/N) Σ_{k<N} X_k e^{2πikn/N} を `out`（長さ N）に書く（[`Self::forward`] の逆。X_0・X_{N/2} の虚部は 0 として
-    /// 扱う形の式）。
+    /// x_n = (1/N) Σ_{k<N} X_k e^{2πikn/N} を `out`（長さ N）に書く（[`Self::forward`] の逆。実数の列のスペクトルなら
+    /// X_0・X_{N/2} の虚部は 0。0 でない値が渡っても式にはそのまま入る）。
     pub fn inverse(&self, in_re: &[f64], in_im: &[f64], out: &mut [f64], work: &mut FftWork) {
         let (n, m) = (self.n, self.m);
         debug_assert!(in_re.len() == m + 1 && in_im.len() == m + 1 && out.len() == n);

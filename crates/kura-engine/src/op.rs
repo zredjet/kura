@@ -570,6 +570,11 @@ pub trait Op: Send + Sync + 'static {
     fn kernel_ns_per_frame(_p: &Self::Params, _inputs: &[Shape]) -> f64 {
         0.0
     }
+    /// 音声の核を作る固定の時間の見込み（ns。描くフレームによらない前計算。M17 段 7）。前計算を覚えていて今は掛からないなら 0。
+    /// 値に効かない。既定は 0。
+    fn kernel_setup_ns(_p: &Self::Params, _inputs: &[Shape]) -> f64 {
+        0.0
+    }
     /// 実装を消した古い版 `from` の引数を、結果を変えずにこの版へ移す。移せなければ理由を返す。
     /// 呼ばれるのは、`from` より新しい実装のある版のうち、この版がいちばん古いとき（すぐ上の版）。
     fn migrate(from: u16, _raw: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -728,6 +733,8 @@ pub trait DynOp: Send + Sync {
     -> Result<Work, EngineError>;
     /// 音声の核の描く重さの見込み（`Op::kernel_ns_per_frame`）。
     fn kernel_ns_per_frame(&self, p: &AnyParams, inputs: &[Shape]) -> Result<f64, EngineError>;
+    /// 音声の核を作る固定の時間の見込み（`Op::kernel_setup_ns`）。
+    fn kernel_setup_ns(&self, p: &AnyParams, inputs: &[Shape]) -> Result<f64, EngineError>;
     /// 引数を読み、範囲を確かめる。
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues>;
     /// 読んだ引数を JSON に戻す（往復のテスト用）。
@@ -867,6 +874,10 @@ impl<O: Op> DynOp for OpEntry<O> {
 
     fn kernel_ns_per_frame(&self, p: &AnyParams, inputs: &[Shape]) -> Result<f64, EngineError> {
         Ok(O::kernel_ns_per_frame(self.params(p)?, inputs))
+    }
+
+    fn kernel_setup_ns(&self, p: &AnyParams, inputs: &[Shape]) -> Result<f64, EngineError> {
+        Ok(O::kernel_setup_ns(self.params(p)?, inputs))
     }
 
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues> {

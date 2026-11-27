@@ -702,8 +702,9 @@ impl Eq {
             });
         }
         if p.phase == Phase::Linear {
-            // 直線位相：表を申告しない。FIR を設計して重なり保存で当てる（有限でない標本の警告は出さない。ADR-239）
-            let eq = super::eq_linear::LinearEq::new(
+            // 直線位相：表を申告しない。FIR を設計して（覚えにあればそれを）重なり保存で当てる（有限でない標本の警告は出さない。
+            // ADR-239）
+            let eq = super::eq_linear::designed(
                 &r,
                 audio.channels(),
                 crate::math::db_to_gain(p.gain_db),
@@ -711,7 +712,7 @@ impl Eq {
             )?;
             return Ok(Box::new(super::eq_linear::LinearKernel::new(
                 audio.clone(),
-                Arc::new(eq),
+                eq,
             )));
         }
         let table = cx.analysis::<EqState>(0, input, &EqStateParams::of(p))?;
@@ -833,21 +834,35 @@ impl Op for Eq {
         }
     }
 
-    /// 直線位相（M17 段 7）：48 kHz ステレオ 20 秒の 1 手の実測（`tests/stateful.rs` の `eq_linear_step_timings`。設計の時間を
-    /// 含む）で、チャンネルあたり 7.3〜8.5 ns（k ≤ 12、FIR を分け合う）・13.2〜14.2 ns（M/S の組）、k = 14・16 で 13.4・21.2 ns と
-    /// 26・31 ns。式はチャンネル × 8 ns（組は 14 ns）× (1 + 0.4 × max(0, k − 12))。最小位相・段なしは 0（軽い）。
+    /// 直線位相（M17 段 7）：48 kHz ステレオ 20 秒の 1 手の実測（`tests/stateful.rs` の `eq_linear_step_timings` から設計の時間
+    /// （`eq_linear_design_timings`）を引いたもの。M4 Max・release・3 スレッド）で、チャンネルあたり 7.1〜7.7 ns（k ≤ 12。FIR を
+    /// 分け合う「すべて」も M/S の組も）、k = 14 で 12.6・13.8 ns、k = 16 で 17.8・23 ns。式はチャンネル × 8 ns ×
+    /// (1 + 0.4 × max(0, k − 12))。最小位相・段なしは 0（軽い）。
     fn kernel_ns_per_frame(p: &EqParams, inputs: &[Shape]) -> f64 {
         match Self::path(p, inputs) {
             Path::Linear {
-                ladder,
-                width,
-                channels,
+                ladder, channels, ..
             } => {
-                let per = if width == 2 { 14.0 } else { 8.0 };
                 let order = f64::from(ladder.order.saturating_sub(12));
-                channels as f64 * per * (1.0 + 0.4 * order)
+                channels as f64 * 8.0 * (1.0 + 0.4 * order)
             }
             Path::Plain | Path::Stateful => 0.0,
+        }
+    }
+
+    /// 直線位相（M17 段 7）：FIR の設計（覚えになければ。`eq_linear::setup_ns`）。最小位相・段なしは 0。
+    fn kernel_setup_ns(p: &EqParams, inputs: &[Shape]) -> f64 {
+        let Path::Linear { channels, .. } = Self::path(p, inputs) else {
+            return 0.0;
+        };
+        let Some((rate, _, _)) = inputs.first().and_then(audio_shape) else {
+            return 0.0;
+        };
+        match resolve(p, rate, channels) {
+            Ok(r) => {
+                super::eq_linear::setup_ns(&r, channels, crate::math::db_to_gain(p.gain_db), rate)
+            }
+            Err(_) => 0.0,
         }
     }
 
@@ -1110,7 +1125,8 @@ fn examples() -> Vec<Example<EqParams>> {
             ),
             inputs: vec![noise(48_000, 2, 9_000, 102)],
         },
-        // 3 チャンネル：L・R は 1・2 チャンネル目、M は外して警告（チャンネルごとの FIR。3 チャンネル目は利得だけ）
+        // 3 チャンネル：L・R は 1・2 チャンネル目、M は外して警告（チャンネルごとの FIR。1・3 チャンネル目はハイカットだけの
+        // FIR を分け合う）
         Example {
             name: "linear-three-channels",
             params: linear(
@@ -1147,6 +1163,33 @@ fn examples() -> Vec<Example<EqParams>> {
                 at: vec![
                     (0, 10, NonFiniteSample::Nan),
                     (1, 1_000, NonFiniteSample::Inf),
+                ],
+            }],
+        },
+        // L だけのバンド：R はどのバンドも当たらないので FIR を作らず出力の利得だけ（最小位相と同じ値）
+        Example {
+            name: "linear-left-only",
+            params: linear(
+                vec![on(band(Bell, 2_000.0, 5.0, 1.5), BandChannel::Left)],
+                -2.0,
+            ),
+            inputs: vec![noise(16_000, 2, 5_000, 108)],
+        },
+        // M/S の組と有限でない標本（片方のチャンネルだけ。もう片方へ広げない）
+        Example {
+            name: "linear-mid-side-non-finite",
+            params: linear(
+                vec![
+                    on(band(Bell, 1_000.0, 6.0, 1.0), BandChannel::Mid),
+                    on(band(HighShelf, 3_000.0, -4.0, 0.707), BandChannel::Side),
+                ],
+                0.0,
+            ),
+            inputs: vec![InputGen::NonFinite {
+                base: Box::new(noise(8_000, 2, 3_000, 109)),
+                at: vec![
+                    (1, 300, NonFiniteSample::Nan),
+                    (0, 2_000, NonFiniteSample::Inf),
                 ],
             }],
         },

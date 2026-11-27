@@ -708,9 +708,10 @@ fn eq_step_timings() {
     }
 }
 
-/// M17 段 7：核の重さの見込み（`Engine::kernel_render_ns`）。直線位相の EQ はチャンネル × 8 ns（M/S の組は 14 ns）× 描く
-/// フレーム（範囲はチャンクに揃える）、最小位相・利得は 0。キャッシュに当たるノード（全体で描いた EQ）は数えないので、下流の
-/// 利得だけを変えた計画は重くない。
+/// M17 段 7：核の重さの見込み（`Engine::kernel_render_ns`）。直線位相の EQ はチャンネル × 8 ns（M/S の組も）× 描く
+/// フレーム（範囲はチャンクに揃える）に、設計の覚えになければ設計の時間（100 ns × 2^k × (1 + FIR の本数)）を足し、最小位相・
+/// 利得・外したノードは 0（空の範囲は設計の時間だけ）。キャッシュに当たるノード（全体で描いた EQ）は数えないので、下流の利得だけを変えた計画は
+/// 重くない。設計の覚えはプロセスで分け合う（並んで回るテストが替える）ので、設計の時間は「足した・足さない」のどちらかで見る。
 #[test]
 fn kernel_render_estimates_follow_the_declaration() {
     use kura_engine::ops::audio::eq::{Band, BandChannel, BandType, EqParams, Phase, band};
@@ -724,6 +725,7 @@ fn kernel_render_estimates_follow_the_declaration() {
     }
     .generate()
     .unwrap();
+    // 400 Hz・Q 2（帯域 200 Hz）は k = 12：設計は FIR 1 本で 100 × 4,096 × 2、M/S の 4 本で 100 × 4,096 × 5
     let eq = |phase: Phase, channel: BandChannel| EqParams {
         bands: vec![Band {
             channel,
@@ -732,12 +734,15 @@ fn kernel_render_estimates_follow_the_declaration() {
         phase,
         gain_db: 0.0,
     };
-    let doc = |p: &EqParams, gain: f64| {
+    let doc = |p: &EqParams, gain: f64, enabled: bool| {
         let mut g = Graph::new_single();
         g.push_linear("audio.eq", 1, serde_json::to_value(p).unwrap(), 1)
             .unwrap();
         g.push_linear("audio.gain", 1, json!({ "db": gain }), 2)
             .unwrap();
+        if !enabled {
+            g.nodes[0].enabled = false;
+        }
         g
     };
     let ns = |g: &Graph, cache: &NodeCache, area: Area| {
@@ -746,29 +751,52 @@ fn kernel_render_estimates_follow_the_declaration() {
             .kernel_render_ns(&plan, &fin(&input), cache, OutputId(0), area)
             .unwrap()
     };
+    let either = |got: f64, frames_ns: f64, setup: f64| {
+        assert!(
+            got == frames_ns || got == frames_ns + setup,
+            "{got} は {frames_ns} か {}",
+            frames_ns + setup
+        );
+    };
     let empty = NodeCache::new(512 << 20);
     let lin = eq(Phase::Linear, BandChannel::All);
-    assert_eq!(ns(&doc(&lin, 0.0), &empty, Area::All), 16.0 * frames as f64);
+    either(
+        ns(&doc(&lin, 0.0, true), &empty, Area::All),
+        16.0 * frames as f64,
+        819_200.0,
+    );
     let ms = eq(Phase::Linear, BandChannel::Mid);
-    assert_eq!(ns(&doc(&ms, 0.0), &empty, Area::All), 28.0 * frames as f64);
+    either(
+        ns(&doc(&ms, 0.0, true), &empty, Area::All),
+        16.0 * frames as f64,
+        2_048_000.0,
+    );
     assert_eq!(
         ns(
-            &doc(&eq(Phase::Minimum, BandChannel::All), 0.0),
+            &doc(&eq(Phase::Minimum, BandChannel::All), 0.0, true),
             &empty,
             Area::All
         ),
         0.0
     );
+    assert_eq!(ns(&doc(&lin, 0.0, false), &empty, Area::All), 0.0);
+    // 空の範囲：描くフレームはないが、核は作る（設計の覚えになければ設計の時間）
+    either(
+        ns(&doc(&lin, 0.0, true), &empty, Area::Empty),
+        0.0,
+        819_200.0,
+    );
     // 範囲はチャンクに揃える（[10, 20) は 1 チャンク）
     let mut spans = kura_engine::render::region::Spans::new();
     spans.push(10, 20);
-    assert_eq!(
-        ns(&doc(&lin, 0.0), &empty, Area::Samples(spans)),
-        16.0 * C as f64
+    either(
+        ns(&doc(&lin, 0.0, true), &empty, Area::Samples(spans)),
+        16.0 * C as f64,
+        819_200.0,
     );
     // 全体で描いて EQ がキャッシュに入れば、下流の利得だけを変えた計画は重くない
     let mut cache = NodeCache::new(512 << 20);
-    let plan = compile(&engine, &doc(&lin, 0.0), &input);
+    let plan = compile(&engine, &doc(&lin, 0.0, true), &input);
     let req = ViewRequest {
         output: OutputId(0),
         area: Area::All,
@@ -777,13 +805,14 @@ fn kernel_render_estimates_follow_the_declaration() {
     engine
         .render_view(&plan, &fin(&input), &mut cache, &req, None, &NoMonitor)
         .unwrap();
-    assert_eq!(ns(&doc(&lin, -3.0), &cache, Area::All), 0.0);
+    assert_eq!(ns(&doc(&lin, -3.0, true), &cache, Area::All), 0.0);
     // EQ の手は重い
     let mut moved = lin.clone();
     moved.bands[0].gain_db = 5.0;
-    assert_eq!(
-        ns(&doc(&moved, 0.0), &cache, Area::All),
-        16.0 * frames as f64
+    either(
+        ns(&doc(&moved, 0.0, true), &cache, Area::All),
+        16.0 * frames as f64,
+        819_200.0,
     );
 }
 
@@ -864,6 +893,43 @@ fn eq_linear_step_timings() {
                 times[0],
                 times[4],
                 times[2] * 1e6 / frames as f64
+            );
+        }
+    }
+}
+
+/// 測り（M17 段 7）：直線位相の設計（`LinearEq::new`。核を作るたびに 1 回）の時間。48 kHz、k = 12・14・16、「すべて」（FIR 1 本）と
+/// M（組の幅 2。FIR 4 本）。中央値（5 回）。
+#[test]
+#[ignore = "測り（--release -- --ignored --nocapture）"]
+fn eq_linear_design_timings() {
+    #![allow(clippy::disallowed_methods)]
+    use kura_engine::ops::audio::eq::{
+        Band, BandChannel, BandType, EqParams, Phase, band, resolve,
+    };
+    use kura_engine::ops::audio::eq_linear::LinearEq;
+    for (k, freq, q) in [(12u32, 400.0, 2.0), (14, 100.0, 2.0), (16, 30.0, 2.0)] {
+        for channel in [BandChannel::All, BandChannel::Mid] {
+            let p = EqParams {
+                bands: vec![Band {
+                    channel,
+                    ..band(BandType::Bell, freq, 3.0, q)
+                }],
+                phase: Phase::Linear,
+                gain_db: 0.0,
+            };
+            let r = resolve(&p, 48_000, 2).unwrap();
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let eq = LinearEq::new(&r, 2, 1.0, 48_000).unwrap();
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(eq.ladder.order, k);
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "設計 k {k}・{channel:?}：{:.2} ms（中央値。最小 {:.2}・最大 {:.2}）",
+                times[2], times[0], times[4]
             );
         }
     }

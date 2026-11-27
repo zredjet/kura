@@ -220,6 +220,35 @@ mod tests {
                 format_out: "ogg",
                 opts: || json!({ "quality": 5 }),
             },
+            // WAV の読み・直線位相のイコライザ（M/S の組・65,537 タップ：FFT の作業列・H・設計の一時の領域。M17 段 7）・WAV の書き
+            Case {
+                name: "wav-eq-linear-wav",
+                input: Input::Encoded {
+                    value: || {
+                        InputGen::AudioNoise {
+                            rate: 48_000,
+                            channels: 2,
+                            frames: 48_000 * 4,
+                            seed: 4,
+                        }
+                        .generate()
+                        .unwrap()
+                    },
+                    write_opts: || json!({}),
+                },
+                format_in: "wav",
+                graph: || {
+                    single_node_graph(
+                        "audio.eq",
+                        1,
+                        json!({ "bands": [{ "type": "bell", "freq": 30.0, "gainDb": 4.0, "q": 2.0, "channel": "mid" }],
+                            "phase": "linear", "gainDb": 0.0 }),
+                    )
+                    .unwrap()
+                },
+                format_out: "wav",
+                opts: || json!({}),
+            },
             // 層の多いアニメの aseprite の読み（ファイル全体 ＋ リンクが指すセル ＋ キャンバス）・反転・APNG の書き
             Case {
                 name: "aseprite-flip-apng",

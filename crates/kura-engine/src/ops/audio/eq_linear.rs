@@ -1,14 +1,18 @@
 //! `audio.eq` v1 の直線位相（M17 段 7。docs/editing.md §18.6、ADR-239）。式は v1 の直線位相として凍結する。
 //!
-//! - **設計**（[`LinearEq`]。核を作るときに 1 度だけ）：推論を通したバンドの列（`eq::resolve`）の最も狭い帯域から長さの梯子の
-//!   段を決め（`audio::fir::Ladder`）、設計の格子のビンごとに目標の振幅を求めて FIR を作る（`audio::fir::design`）。目標は
-//!   各バンドの段の振幅（零位相）を列の順に掛けたもの。M/S のバンドがあるステレオは、領域を替える T = [[½,½],[½,−½]] と
-//!   T⁻¹ = [[1,1],[1,−1]] も含めてビンごとの 2×2 の実の行列の積にし、4 本の FIR（出力 c = Σ_i h_ci ∗ 入力 i）を作る。ほかは
-//!   チャンネルごとに、当てるバンドの並びが同じなら同じ FIR を分け合う。出力の利得は目標に掛ける。
+//! - **設計**（[`LinearEq`]。核を作るときに、覚えになければ 1 度だけ）：推論を通したバンドの列（`eq::resolve`）の最も狭い帯域
+//!   から長さの梯子の段を決め（`audio::fir::Ladder`）、設計の格子のビンごとに目標の振幅を求めて FIR を作る
+//!   （`audio::fir::design`）。目標は各バンドの段の振幅（零位相）を列の順に掛けたもの。M/S のバンドがあるステレオは、領域を
+//!   替える T = [[½,½],[½,−½]] と T⁻¹ = [[1,1],[1,−1]] も含めてビンごとの 2×2 の実の行列の積にし、4 本の FIR（出力 c =
+//!   Σ_i h_ci ∗ 入力 i）を作る。ほかはチャンネルごとに、当てるバンドの並びが同じなら同じ FIR を分け合い、どのバンドも当たらない
+//!   チャンネルは FIR を作らず出力の利得だけを掛ける（最小位相と同じ値）。出力の利得は目標に掛ける。
+//! - **設計の覚え**（[`designed`]）：設計は引数・レート・チャンネルだけで決まる純粋な関数なので、新しいものから 4 つ・合わせて
+//!   16 MiB までをプロセスで覚える（値に効かない。予算の外）。範囲の描画の値はキャッシュに残らないので、表示・先読み・
+//!   スペクトル・試聴・握る計画の頼みのたびに核を作り直す（k = 16 の M/S の設計は 34 ms。release）。
 //! - **核**（[`LinearKernel`]）：重なり保存。出力のブロック j（[jB, (j+1)B)。絶対位置 0 に結ぶ）は、入力の窓
 //!   [jB − D, (j+1)B + D)（長さ N。0 より前と長さの外は 0）を順変換して H を掛け、逆変換した [D, D + B) を取る。ブロックの値は
-//!   j だけで決まるので、区間の切り方によらず同じ値。組ごとに最後に描いたブロックを覚える（値に効かない。錠は計算の間は
-//!   持たない）。
+//!   j だけで決まるので、区間の切り方によらず同じ値。組ごとに最後に描いたブロックを覚え（値に効かない。錠は計算の間は
+//!   持たない）、組を一度に描く口はブロックごとに組の全チャンネルへ写す（M/S の組で FFT を 2 回回さない）。
 //! - 有限でない標本は窓の中で 0 として通し、その位置の出力は元の値（最小位相と同じ見え方）。状態の表がなく範囲の描画で入力の
 //!   全体を知れないので、`NonFiniteSamples` の警告は出さない（核と `apply` の警告をそろえる）。
 
@@ -39,6 +43,35 @@ pub fn width_of(r: &Resolved, channels: usize) -> usize {
     if r.has_ms() && channels == 2 { 2 } else { 1 }
 }
 
+/// 組の幅 1 のとき、チャンネル `c` に当てるバンドの番号の並び（列の順）。
+fn channel_key(r: &Resolved, c: usize) -> Vec<usize> {
+    r.bands
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| match b.target {
+            Target::All => true,
+            Target::Channel(x) => x == c,
+            Target::Mid | Target::Side => false,
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 作る FIR の本数（組の幅 2 は 4 本、幅 1 は当てるバンドの並びの違うチャンネルの数。どのバンドも当たらないチャンネルは数えない）。
+fn fir_count(r: &Resolved, channels: usize) -> usize {
+    if width_of(r, channels) == 2 {
+        return 4;
+    }
+    let mut keys: Vec<Vec<usize>> = Vec::new();
+    for c in 0..channels {
+        let key = channel_key(r, c);
+        if !key.is_empty() && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys.len()
+}
+
 /// 組ごとの列の束（H か FIR。幅 1 は 1 本、幅 2 は 4 本）。
 type Lanes = Arc<Vec<Vec<f64>>>;
 
@@ -49,11 +82,15 @@ pub struct LinearEq {
     pub capped: bool,
     channels: usize,
     width: usize,
-    /// 組ごとの H（幅 1 は [H]、幅 2 は [H00, H01, H10, H11]）。
-    lanes: Vec<Lanes>,
+    /// 出力の利得の倍率（どのバンドも当たらないチャンネルに掛ける）。
+    gain: f64,
+    /// 組ごとの H（幅 1 は [H]、幅 2 は [H00, H01, H10, H11]）。None はどのバンドも当たらない組（利得だけ）。
+    lanes: Vec<Option<Lanes>>,
     /// 組ごとの FIR（h[0]〜h[D]。H と同じ並び。テストと曲線）。
-    taps: Vec<Lanes>,
+    taps: Vec<Option<Lanes>>,
     fft: RealFft,
+    /// 持っている量（H・FIR・FFT の表。分け合う列は 1 回だけ数える。設計の覚えの上限に使う）。
+    bytes: u64,
 }
 
 /// バンド 1 つの、設計の格子のビン `k` の振幅（段の振幅の積）。
@@ -65,25 +102,34 @@ fn magnitude(grid: &DesignGrid, sections: &[crate::audio::biquad::Section], k: u
         .product()
 }
 
+/// FIR 1 本の持つ量（H と h）。
+fn fir_bytes(fir: &Fir) -> u64 {
+    (fir.spectrum.len() as u64 + fir.taps.len() as u64).saturating_mul(8)
+}
+
 impl LinearEq {
-    /// 推論を通したバンドの列 `r`（段のあるもの）・チャンネル数・出力の利得の倍率 `gain`・レートから設計する。
+    /// 推論を通したバンドの列 `r`（段のあるもの）・チャンネル数・出力の利得の倍率 `gain`・レートから設計する（覚えを通すなら
+    /// [`designed`]）。
     pub fn new(r: &Resolved, channels: usize, gain: f64, rate: u32) -> Result<Self, EngineError> {
         let (ladder, capped) = ladder_of(r, rate);
         let width = width_of(r, channels);
         let ffts = DesignFfts::new(ladder)?;
         let grid = DesignGrid::new(ladder)?;
         let bins = grid.bins();
-        let design_one = |target: &[f64]| -> Result<Fir, EngineError> {
-            if target.iter().all(|v| *v == 0.0) {
+        let mut bytes = 0u64;
+        let mut design_one = |target: &[f64]| -> Result<Fir, EngineError> {
+            let fir = if target.iter().all(|v| *v == 0.0) {
                 // 0 の成分（行列の対角の外が 0 のとき）：設計しない
-                Ok(Fir {
+                Fir {
                     ladder,
                     taps: try_vec(ladder.delay() + 1, 0f64)?,
                     spectrum: try_vec(ladder.fft_len() / 2 + 1, 0f64)?,
-                })
+                }
             } else {
-                design(target, &ffts)
-            }
+                design(target, &ffts)?
+            };
+            bytes = bytes.saturating_add(fir_bytes(&fir));
+            Ok(fir)
         };
         let mut lanes = Vec::new();
         let mut taps = Vec::new();
@@ -130,24 +176,19 @@ impl LinearEq {
                 spectra.push(fir.spectrum);
                 hs.push(fir.taps);
             }
-            lanes.push(Arc::new(spectra));
-            taps.push(Arc::new(hs));
+            lanes.push(Some(Arc::new(spectra)));
+            taps.push(Some(Arc::new(hs)));
         } else {
-            // チャンネルごと：当てるバンドの並びが同じなら分け合う
+            // チャンネルごと：当てるバンドの並びが同じなら分け合う。どのバンドも当たらなければ利得だけ
             let mut keys: Vec<Vec<usize>> = Vec::new();
             let mut made: Vec<(Lanes, Lanes)> = Vec::new();
             for c in 0..channels {
-                let key: Vec<usize> = r
-                    .bands
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| match b.target {
-                        Target::All => true,
-                        Target::Channel(x) => x == c,
-                        Target::Mid | Target::Side => false,
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
+                let key = channel_key(r, c);
+                if key.is_empty() {
+                    lanes.push(None);
+                    taps.push(None);
+                    continue;
+                }
                 let at = keys.iter().position(|k| *k == key);
                 let pair = match at {
                     Some(i) => made[i].clone(),
@@ -167,18 +208,22 @@ impl LinearEq {
                         pair
                     }
                 };
-                lanes.push(pair.0);
-                taps.push(pair.1);
+                lanes.push(Some(pair.0));
+                taps.push(Some(pair.1));
             }
         }
+        let fft = ffts.block;
+        let bytes = bytes.saturating_add(fft.resident_bytes());
         Ok(Self {
             ladder,
             capped,
             channels,
             width,
+            gain,
             lanes,
             taps,
-            fft: ffts.block,
+            fft,
+            bytes,
         })
     }
 
@@ -187,10 +232,146 @@ impl LinearEq {
         self.width
     }
 
-    /// 組 `lane` の FIR（h[0]〜h[D]。幅 2 は [h00, h01, h10, h11]）。
+    /// 組 `lane` の FIR（h[0]〜h[D]。幅 2 は [h00, h01, h10, h11]）。どのバンドも当たらない組（利得だけ）・ない組は None。
     pub fn taps(&self, lane: usize) -> Option<&[Vec<f64>]> {
-        self.taps.get(lane).map(|t| t.as_slice())
+        self.taps
+            .get(lane)
+            .and_then(|t| t.as_ref())
+            .map(|t| t.as_slice())
     }
+
+    /// 持っている量（バイト）。
+    pub fn resident_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// 設計の覚えの数の上限。
+const MEMO_COUNT: usize = 4;
+/// 設計の覚えの量の上限（新しい 1 つはこれを超えても持つ）。
+const MEMO_BYTES: u64 = 16 << 20;
+
+/// 設計の覚え（モジュールの説明。新しいものほど後ろ。数・量の上限を持つ）。
+struct DesignMemo {
+    entries: Vec<(Vec<u64>, Arc<LinearEq>)>,
+    count: usize,
+    bytes: u64,
+}
+
+impl DesignMemo {
+    const fn new(count: usize, bytes: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            count,
+            bytes,
+        }
+    }
+
+    /// 鍵 `key` の設計（当たれば新しい側へ移す）。
+    fn get(&mut self, key: &[u64]) -> Option<Arc<LinearEq>> {
+        let at = self.entries.iter().position(|(k, _)| k.as_slice() == key)?;
+        let hit = self.entries.remove(at);
+        let eq = hit.1.clone();
+        self.entries.push(hit);
+        Some(eq)
+    }
+
+    /// 鍵 `key` を持っているか（使った順は変えない）。
+    fn contains(&self, key: &[u64]) -> bool {
+        self.entries.iter().any(|(k, _)| k.as_slice() == key)
+    }
+
+    /// 設計を足し、古いものから数・量の上限まで落とす（足したものは残す）。
+    fn put(&mut self, key: Vec<u64>, eq: Arc<LinearEq>) {
+        if self.contains(&key) {
+            return;
+        }
+        self.entries.push((key, eq));
+        while self.entries.len() > 1
+            && (self.entries.len() > self.count
+                || self
+                    .entries
+                    .iter()
+                    .map(|(_, e)| e.resident_bytes())
+                    .fold(0u64, u64::saturating_add)
+                    > self.bytes)
+        {
+            self.entries.remove(0);
+        }
+    }
+}
+
+/// プロセスの設計の覚え（値に効かない）。
+static DESIGNS: Mutex<DesignMemo> = Mutex::new(DesignMemo::new(MEMO_COUNT, MEMO_BYTES));
+
+/// 設計の鍵：設計を決めるものすべて（レート・チャンネル数・利得・バンドごとの当てる信号・帯域・段の係数のビット）。
+fn design_key(r: &Resolved, channels: usize, gain: f64, rate: u32) -> Vec<u64> {
+    let mut k = Vec::with_capacity(4 + r.bands.len() * 8);
+    k.extend([
+        u64::from(rate),
+        channels as u64,
+        gain.to_bits(),
+        r.bands.len() as u64,
+    ]);
+    for b in &r.bands {
+        let (tag, at) = match b.target {
+            Target::All => (0, 0),
+            Target::Channel(c) => (1, c as u64),
+            Target::Mid => (2, 0),
+            Target::Side => (3, 0),
+        };
+        k.extend([tag, at, b.bandwidth.to_bits(), b.sections.len() as u64]);
+        for s in &b.sections {
+            k.extend([
+                s.b0.to_bits(),
+                s.b1.to_bits(),
+                s.b2.to_bits(),
+                s.a1.to_bits(),
+                s.a2.to_bits(),
+            ]);
+        }
+    }
+    k
+}
+
+/// 覚えを通した設計（モジュールの説明。値は [`LinearEq::new`] と同じ）。
+pub fn designed(
+    r: &Resolved,
+    channels: usize,
+    gain: f64,
+    rate: u32,
+) -> Result<Arc<LinearEq>, EngineError> {
+    let key = design_key(r, channels, gain, rate);
+    if let Some(eq) = DESIGNS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(eq);
+    }
+    // 設計の間は錠を持たない（同じ鍵を 2 つの仕事が同時に設計しても、同じ値で先のものが残る）
+    let eq = Arc::new(LinearEq::new(r, channels, gain, rate)?);
+    DESIGNS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .put(key, eq.clone());
+    Ok(eq)
+}
+
+/// 核を作る固定の時間の見込み（ns。`Op::kernel_setup_ns`）：覚えにあれば 0、なければ 100 ns × 2^k × (1 + FIR の本数)
+/// （`tests/stateful.rs` の `eq_linear_design_timings`：48 kHz、release で k = 12・14・16 の FIR 1 本が 0.69・2.87・13.1 ms、
+/// M/S の 4 本が 1.56・7.29・33.7 ms）。
+pub fn setup_ns(r: &Resolved, channels: usize, gain: f64, rate: u32) -> f64 {
+    let key = design_key(r, channels, gain, rate);
+    if DESIGNS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&key)
+    {
+        return 0.0;
+    }
+    let (ladder, _) = ladder_of(r, rate);
+    100.0 * ladder.block() as f64 * (1 + fir_count(r, channels)) as f64
 }
 
 /// 曲線の合成（`eq::curve`）：全バンドの目標（チャンネルは分けない）に出力の利得 `gain` を掛けた FIR の、周波数 `freqs`（Hz）
@@ -223,8 +404,8 @@ pub fn total_response(
     Ok((db, ladder, capped))
 }
 
-/// 直線位相の作業領域の見積もり（`Op::work_bytes`）：仕事ごとに入力の窓（f32 と f64）・スペクトル・逆変換・FFT の作業列・
-/// ブロックの出力、共有に H・FFT の表・覚え・設計の一時の領域。
+/// 直線位相の作業領域の見積もり（`Op::work_bytes`）：仕事ごとに入力の窓（組のチャンネルごとの f32 と、f64 1 本）・スペクトル・
+/// 逆変換・FFT の作業列・ブロックの出力、共有に H・FFT の表・覚え・設計の一時の領域。
 pub fn linear_work(ladder: Ladder, channels: usize, width: usize) -> Work {
     let n = ladder.fft_len() as u64;
     let half = n / 2 + 1;
@@ -269,7 +450,12 @@ impl LinearKernel {
     }
 
     /// 組 `lane` のブロック `j`（覚えていればそれ、なければ描いて覚える）。
-    fn block(&self, lane: usize, j: u64) -> Result<Arc<Vec<Vec<f32>>>, EngineError> {
+    fn block(
+        &self,
+        lane: usize,
+        h: &[Vec<f64>],
+        j: u64,
+    ) -> Result<Arc<Vec<Vec<f32>>>, EngineError> {
         let slot = self
             .memo
             .get(lane)
@@ -282,21 +468,17 @@ impl LinearKernel {
                 return Ok(out.clone());
             }
         }
-        let out = Arc::new(self.compute(lane, j)?);
+        let out = Arc::new(self.compute(lane, h, j)?);
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((j, out.clone()));
         Ok(out)
     }
 
-    /// 組 `lane` のブロック `j` を描く（重なり保存）。
-    fn compute(&self, lane: usize, j: u64) -> Result<Vec<Vec<f32>>, EngineError> {
+    /// 組 `lane`（H は `h`）のブロック `j` を描く（重なり保存）。
+    fn compute(&self, lane: usize, h: &[Vec<f64>], j: u64) -> Result<Vec<Vec<f32>>, EngineError> {
         let ladder = self.eq.ladder;
         let (n, b, d) = (ladder.fft_len(), ladder.block(), ladder.delay());
         let w = self.eq.width;
         let half = n / 2 + 1;
-        let h =
-            self.eq.lanes.get(lane).ok_or_else(|| {
-                EngineError::Internal(format!("直線位相の組 {lane} はありません"))
-            })?;
         // 窓の始まり（jB − D。0 より前は 0 で埋める）
         let start = j
             .checked_mul(b as u64)
@@ -308,36 +490,29 @@ impl LinearKernel {
         };
         let mut work = FftWork::default();
         let mut spectra: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(w);
-        // 出力の位置ごとの、有限でない元の値（組のチャンネルごと。ブロックの中の位置）
-        let mut originals: Vec<Vec<(usize, f32)>> = vec![Vec::new(); w];
-        let mut raw = try_vec(n, 0f32)?;
+        // 組のチャンネルごとの読んだ窓（有限でない標本の位置に元の値を戻すのに使う）
+        let mut raws: Vec<Vec<f32>> = Vec::with_capacity(w);
         let mut x = try_vec(n, 0f64)?;
-        for (i, orig) in originals.iter_mut().enumerate() {
+        for i in 0..w {
             let ch = lane * w + i;
-            raw.fill(0.0);
+            let mut raw = try_vec(n, 0f32)?;
             if skip < n {
                 self.audio.read(ch, from, &mut raw[skip..])?;
             }
-            for (t, (xv, rv)) in x.iter_mut().zip(&raw).enumerate() {
-                if rv.is_finite() {
-                    *xv = f64::from(*rv);
-                } else {
-                    *xv = 0.0;
-                    if (d..d + b).contains(&t) {
-                        orig.push((t - d, *rv));
-                    }
-                }
+            for (xv, rv) in x.iter_mut().zip(&raw) {
+                *xv = if rv.is_finite() { f64::from(*rv) } else { 0.0 };
             }
             let mut re = try_vec(half, 0f64)?;
             let mut im = try_vec(half, 0f64)?;
             self.eq.fft.forward(&x, &mut re, &mut im, &mut work);
             spectra.push((re, im));
+            raws.push(raw);
         }
         let mut out = Vec::with_capacity(w);
         let mut yr = try_vec(half, 0f64)?;
         let mut yi = try_vec(half, 0f64)?;
         let mut y = try_vec(n, 0f64)?;
-        for (c, orig) in originals.iter().enumerate() {
+        for (c, raw) in raws.iter().enumerate() {
             yr.fill(0.0);
             yi.fill(0.0);
             for (i, (re, im)) in spectra.iter().enumerate() {
@@ -349,31 +524,60 @@ impl LinearKernel {
             }
             self.eq.fft.inverse(&yr, &yi, &mut y, &mut work);
             let mut o = try_vec(b, 0f32)?;
-            for (t, v) in o.iter_mut().enumerate() {
-                *v = y[d + t] as f32;
-            }
-            for &(t, v) in orig {
-                o[t] = v;
+            for (t, (v, r)) in o.iter_mut().zip(&raw[d..d + b]).enumerate() {
+                *v = if r.is_finite() { y[d + t] as f32 } else { *r };
             }
             out.push(o);
         }
         Ok(out)
     }
 
-    /// 組 `lane` のチャンネル `c` の [start, start + out.len()) を書く。
-    fn fill(&self, lane: usize, c: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+    /// 組 `lane` の [start, start + len) を、組のチャンネルごとの `outs`（`only` なら組のそのチャンネルだけ）に書く。ブロックは
+    /// 1 回ずつ描いて全チャンネルへ写す。どのバンドも当たらない組は入力に利得だけを掛ける（有限でない標本は元の値）。
+    fn fill(
+        &self,
+        lane: usize,
+        only: Option<usize>,
+        start: u64,
+        outs: &mut [&mut [f32]],
+    ) -> Result<(), EngineError> {
+        let len = outs.first().map_or(0, |o| o.len());
+        if outs.iter().any(|o| o.len() != len) {
+            return Err(EngineError::Internal(
+                "直線位相の組の出力の長さがそろっていません".into(),
+            ));
+        }
+        let lanes =
+            self.eq.lanes.get(lane).ok_or_else(|| {
+                EngineError::Internal(format!("直線位相の組 {lane} はありません"))
+            })?;
+        let Some(h) = lanes else {
+            // 利得だけ（組の幅 1）
+            for out in outs.iter_mut() {
+                self.audio.read(lane, start, out)?;
+                for v in out.iter_mut() {
+                    if v.is_finite() {
+                        *v = (f64::from(*v) * self.eq.gain) as f32;
+                    }
+                }
+            }
+            return Ok(());
+        };
         let b = self.eq.ladder.block() as u64;
         let mut done = 0usize;
-        while done < out.len() {
+        while done < len {
             let pos = start + done as u64;
             let j = pos / b;
-            let block = self.block(lane, j)?;
+            let block = self.block(lane, h, j)?;
             let at = (pos - j * b) as usize;
-            let take = (out.len() - done).min(b as usize - at);
-            let src = block
-                .get(c)
-                .ok_or_else(|| EngineError::Internal("直線位相のチャンネルが足りません".into()))?;
-            out[done..done + take].copy_from_slice(&src[at..at + take]);
+            let take = (len - done).min(b as usize - at);
+            for (i, out) in outs.iter_mut().enumerate() {
+                let c = only.unwrap_or(i);
+                let src = block.get(c).ok_or_else(|| {
+                    EngineError::Internal("直線位相のチャンネルが足りません".into())
+                })?;
+                out[done..done + take].copy_from_slice(&src[at..at + take]);
+            }
             done += take;
         }
         Ok(())
@@ -399,7 +603,7 @@ impl AudioKernel for LinearKernel {
 
     fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
         let w = self.eq.width.max(1);
-        self.fill(ch / w, ch % w, start, out)
+        self.fill(ch / w, Some(ch % w), start, &mut [out])
     }
 
     fn render_lane(
@@ -408,10 +612,7 @@ impl AudioKernel for LinearKernel {
         start: u64,
         outs: &mut [&mut [f32]],
     ) -> Result<(), EngineError> {
-        for (c, out) in outs.iter_mut().enumerate() {
-            self.fill(lane, c, start, out)?;
-        }
-        Ok(())
+        self.fill(lane, None, start, outs)
     }
 }
 
@@ -529,7 +730,17 @@ mod tests {
                         continue;
                     }
                     let (lane, ci) = (c / w, c % w);
-                    let taps = eq.taps(lane).unwrap();
+                    let Some(taps) = eq.taps(lane) else {
+                        // どのバンドも当たらない組：利得だけ（最小位相と同じ値）
+                        let gain = crate::math::db_to_gain(ex.params.gain_db);
+                        assert_eq!(
+                            got[c][t].to_bits(),
+                            ((f64::from(x[c][t]) * gain) as f32).to_bits(),
+                            "{}：位置 {t}・チャンネル {c}",
+                            ex.name
+                        );
+                        continue;
+                    };
                     let (mut want, mut bound) = (0.0f64, 0.0f64);
                     for i in 0..w {
                         let h = &taps[ci * w + i];
@@ -551,7 +762,45 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked >= 6, "{checked}");
+        assert!(checked >= 8, "{checked}");
+    }
+
+    /// 設計の覚え：当たれば新しい側へ移し、数・量の上限を超えたら古いものから落とす（足したものは量の上限を超えても残す）。
+    /// 覚えを通した設計は、通さない設計とビットまで同じ。
+    #[test]
+    fn the_design_memo_keeps_the_newest() {
+        let p = |freq: f64| linear(vec![band(BandType::Bell, freq, 3.0, 1.0)], 0.0);
+        let make = |freq: f64| {
+            let r = resolve(&p(freq), 8_000, 1).unwrap();
+            (
+                design_key(&r, 1, 1.0, 8_000),
+                Arc::new(LinearEq::new(&r, 1, 1.0, 8_000).unwrap()),
+            )
+        };
+        let (k1, e1) = make(1_000.0);
+        let (k2, e2) = make(1_200.0);
+        let (k3, e3) = make(1_400.0);
+        assert_ne!(k1, k2);
+        let mut m = DesignMemo::new(2, u64::MAX);
+        m.put(k1.clone(), e1.clone());
+        m.put(k2.clone(), e2);
+        assert!(Arc::ptr_eq(&m.get(&k1).unwrap(), &e1));
+        // k1 を使ったので、k3 を足すと k2 が落ちる
+        m.put(k3.clone(), e3);
+        assert!(m.contains(&k1) && !m.contains(&k2) && m.contains(&k3));
+        // 量の上限：新しいものだけが残る
+        let mut small = DesignMemo::new(4, e1.resident_bytes());
+        small.put(k1.clone(), e1.clone());
+        let (k4, e4) = make(1_600.0);
+        small.put(k4.clone(), e4);
+        assert!(!small.contains(&k1) && small.contains(&k4));
+        // 覚えを通した設計は同じ値
+        let r = resolve(&p(1_000.0), 8_000, 1).unwrap();
+        let via = designed(&r, 1, 1.0, 8_000).unwrap();
+        assert_eq!(via.taps(0), e1.taps(0));
+        // 段の係数・利得が違えば鍵も違う
+        assert_ne!(design_key(&r, 1, 0.5, 8_000), k1);
+        assert_ne!(design_key(&r, 2, 1.0, 8_000), k1);
     }
 
     /// M/S のバンド：中央（L = R）だけ・横（L = −R）だけの入力で、M のバンドは中央にだけ、S のバンドは横にだけ当たる

@@ -165,8 +165,9 @@ pub(super) struct AudioRun {
 
 impl Engine {
     /// 出力 `output` の範囲 `area` を描く核の重さの見込み（ns。M17 段 7）：範囲の描画と同じ後ろからの走査
-    /// （`region_needs`。キャッシュに当たるノードで止める）で描くノードと要る範囲を集め、重い核（`Op::kernel_ns_per_frame` が
-    /// 正）のノードごとに、ns / フレーム × 描くフレーム（要る区間をチャンクに揃えた長さ。範囲を持たないノードは全体）を足す。
+    /// （`region_needs`。キャッシュに当たるノードで止める）で描くノードと要る範囲を集め、重い核（`Op::kernel_ns_per_frame`・
+    /// `Op::kernel_setup_ns` が正）のノードごとに、核を作る固定の時間 ＋ ns / フレーム × 描くフレーム（要る区間をチャンクに
+    /// 揃えた長さ。範囲を持たないノードは全体）を足す。
     /// 呼び手（エディタ）が、操作中の手を握る計画で描くかを決めるのに使う（値に効かない。キャッシュの使った順は変えない）。
     pub fn kernel_render_ns(
         &self,
@@ -194,12 +195,15 @@ impl Engine {
                 continue;
             }
             let ins = shapes.inputs_of(node)?;
+            let shapes_in = op_shapes(node, &ins);
             let per = node
                 .op
-                .kernel_ns_per_frame(node.params.as_ref(), &op_shapes(node, &ins))?;
-            if per <= 0.0 {
+                .kernel_ns_per_frame(node.params.as_ref(), &shapes_in)?;
+            let setup = node.op.kernel_setup_ns(node.params.as_ref(), &shapes_in)?;
+            if per <= 0.0 && setup <= 0.0 {
                 continue;
             }
+            ns += setup;
             let Shape::Audio { frames, .. } = node.inferred.shape else {
                 continue;
             };

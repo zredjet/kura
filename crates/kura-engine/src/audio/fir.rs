@@ -353,6 +353,33 @@ mod tests {
         );
     }
 
+    /// 応答の端：0 Hz・NaN の周波数は直流の値、ナイキストより上はナイキストの値、`floor` で止める（どれも有限）。
+    #[test]
+    fn the_response_handles_the_edges() {
+        let ladder = Ladder::new(MIN_ORDER);
+        let ffts = DesignFfts::new(ladder).unwrap();
+        let grid = DesignGrid::new(ladder).unwrap();
+        let target = vec![0.5; grid.bins()];
+        let fir = design(&target, &ffts).unwrap();
+        let fs = 48_000.0;
+        let got = fir
+            .response_db(
+                fs,
+                &[0.0, f64::NAN, 24_000.0, 30_000.0, -5.0],
+                &ffts,
+                -120.0,
+            )
+            .unwrap();
+        assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
+        let half = 20.0 * crate::math::log10(0.5);
+        for v in &got {
+            assert!((v - half).abs() < 1e-9, "{got:?}");
+        }
+        let zero = design(&vec![0.0; grid.bins()], &ffts).unwrap();
+        let got = zero.response_db(fs, &[1_000.0], &ffts, -120.0).unwrap();
+        assert_eq!(got, vec![-120.0]);
+    }
+
     /// 測り（段 7 の P3。`cargo test -p kura-engine --release --lib audio::fir::tests::measure -- --ignored --nocapture`）：
     /// 代表のバンド（48 kHz）ごとに、β と C の組で、段・タップ数・目標との差の最大（20 Hz〜20 kHz の対数の 300 点。目標が
     /// −40 dB より深い所は見ない）。設計の時間は devtools で測る（エンジンの中では時刻を読まない）。

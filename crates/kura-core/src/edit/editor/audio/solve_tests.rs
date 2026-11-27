@@ -565,7 +565,7 @@ fn solved_tables_survive_a_cleared_cache() {
     );
 }
 
-/// 直線位相のベル 1 つ（8 kHz で 20 Hz・Q 10 は帯域 2 Hz・65,537 タップ。核の重さはモノラルで 20.8 ns / フレーム）。
+/// 直線位相のベル 1 つ（8 kHz で 20 Hz・Q 10 は帯域 2 Hz・65,537 タップ。核の重さはモノラルで 20.8 ns / フレーム、設計は 13 ms）。
 fn linear_eq(gain: f64) -> serde_json::Value {
     json!({ "bands": [{ "type": "bell", "freq": 20.0, "gainDb": gain, "q": 10.0 }], "phase": "linear", "gainDb": 0.0 })
 }
@@ -610,7 +610,7 @@ fn heavy_kernels_hold_only_while_interacting() {
     let out = env.step(&s, Vec::new(), &vp(&view, false, false));
     let info = shown_audio(&out.view);
     assert_eq!((info.rev, info.solving), (out.status.rev, None));
-    // 推定の小さい範囲（2 チャンク ≈ 2.7 ms）は、操作中でもその場で描く
+    // 推定の小さい範囲（2 チャンク ≈ 2.7 ms ＋ 設計 13 ms）は、操作中でもその場で描く
     let small = [(10 * C, 12 * C)];
     let out = env.step(&s, vec![set(1, linear_eq(7.0))], &vp(&small, false, true));
     let info = shown_audio(&out.view);

@@ -570,6 +570,18 @@ const EMPTY_PLAN: &[(&str, u16, &str, &str)] = &[
     (
         "audio.eq",
         1,
+        "linear-left-only",
+        "直線位相（L だけのバンド。R は利得だけ）は状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-mid-side-non-finite",
+        "直線位相（M/S の組と有限でない標本）は状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
         "linear-identity",
         "段が残らず出力の利得 0 dB なので、位相によらず入力のまま（Identity）",
     ),
