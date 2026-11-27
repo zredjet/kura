@@ -57,7 +57,8 @@ export function EqPhaseNote({ node, op, param }: { node: number; op: string; par
       clearTimeout(timer);
     };
   }, [key]);
-  if (!linear || !fir?.fir) return null;
+  // レート・チャンネルがまだ分からない（表示の前）間は、前のノードの値を出さない
+  if (key === null || !fir?.fir) return null;
   return (
     <>
       <p className={editorStyles.note}>{t.ringing(ringingTime(fir.fir.delayFrames, fir.rate))}</p>

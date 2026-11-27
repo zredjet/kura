@@ -849,9 +849,11 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       controller.setSpec(spectrum.specRequests());
     }
   };
-  // イコライザの重ね：頭の文書 ＋ 手元の値の曲線を、引数が変わるたびに 1 つずつ求める（新しいものが勝つ）
+  // イコライザの重ね：頭の文書 ＋ 手元の値の曲線を、引数が変わるたびに求める。頼みは 1 本ずつ（届くまで次を出さず、届いたら
+  // そのときの引数で頼み直す。直線位相は 1 回ごとに FIR を設計するので、ドラッグの間に頼みを積まない。M17 段 7）
   let curveSeq = 0;
   let curveKey = '';
+  let curveBusy = false;
   let curve: import('./spectrumController').EqCurve | null = null;
   let lastTarget: number | null = null;
   const refreshEq = () => {
@@ -896,16 +898,19 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     const points = Math.max(64, Math.min(2_048, Math.round(spectrum.inner().w / 2) || 512));
     const key = JSON.stringify([eqJson(params), rate, channels, points]);
     const model = () => ({ bands: params.bands, curve, selected: s.eqBand, hovered: s.eqHover });
-    if (key !== curveKey) {
+    if (key !== curveKey && !curveBusy) {
       curveKey = key;
       const seq = ++curveSeq;
+      curveBusy = true;
       eqCurve(eqJson(params), rate, channels, points)
         .then((c) => {
+          curveBusy = false;
           if (seq !== curveSeq || live() !== rt) return;
           curve = { freqs: c.freqs, total: c.total, bands: c.bands };
           refreshEq();
         })
         .catch(() => {
+          curveBusy = false;
           // 求められない（引数が断られた）：古い曲線を残さない（点と食い違う）
           if (seq !== curveSeq || live() !== rt) return;
           curve = null;

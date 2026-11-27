@@ -9,12 +9,20 @@ import { EQ_PHASE_NOTE_WAIT_MS, EqPhaseNote, ringingTime } from './EqPhaseNote';
 
 const curves: { params: unknown; points: number }[] = [];
 let fir: EditEqCurveDto['fir'] = { taps: 32_769, delayFrames: 16_384, capped: false };
+/** 真なら頼みを断る。 */
+let refuse = false;
+/** 頼みの応えを返すまでの待ち（ms。偽の時計）。 */
+let delay = 0;
 
 vi.mock('../../../ipc/edit', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../ipc/edit')>()),
   eqCurve: vi.fn(async (params: unknown, _rate: number, _channels: number, points: number) => {
     curves.push({ params, points });
-    return { freqs: [20, 24_000], total: [0, 0], bands: [], fir } satisfies EditEqCurveDto;
+    const answer = fir;
+    const rejected = refuse;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    if (rejected) throw new Error('断った');
+    return { freqs: [20, 24_000], total: [0, 0], bands: [], fir: answer } satisfies EditEqCurveDto;
   }),
 }));
 
@@ -49,6 +57,8 @@ describe('位相の欄の下の一言（M17 段 7）', () => {
     vi.useFakeTimers();
     curves.length = 0;
     fir = { taps: 32_769, delayFrames: 16_384, capped: false };
+    refuse = false;
+    delay = 0;
     useAudioStore.setState({
       view: { nodes: [{ id: 5, inRate: 48_000, inChannels: 2 }] } as never,
     });
@@ -82,6 +92,40 @@ describe('位相の欄の下の一言（M17 段 7）', () => {
     });
     expect(screen.getByText(t.ringing(t.seconds('0.68')))).toBeInTheDocument();
     expect(screen.getByText(t.capped)).toBeInTheDocument();
+  });
+
+  it('断られたら一言を消す。引数が替わったあとに届いた古い応えは使わない。レートが分からない間は出さない', async () => {
+    setEq('linear');
+    render(<EqPhaseNote node={5} op="audio.eq" param="phase" />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(EQ_PHASE_NOTE_WAIT_MS);
+    });
+    expect(screen.getByText(t.ringing(t.seconds('0.34')))).toBeInTheDocument();
+    refuse = true;
+    act(() => setEq('linear', 3));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(EQ_PHASE_NOTE_WAIT_MS);
+    });
+    expect(screen.queryByText(/前のリンギング/)).toBeNull();
+    // 遅い応え（0.68 秒）が届く前に引数が替わる：その応えは使わず、次の応え（0.17 秒）を出す
+    refuse = false;
+    delay = 1_000;
+    fir = { taps: 65_537, delayFrames: 32_768, capped: false };
+    act(() => setEq('linear', 4));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(EQ_PHASE_NOTE_WAIT_MS);
+    });
+    delay = 0;
+    fir = { taps: 16_385, delayFrames: 8_192, capped: false };
+    act(() => setEq('linear', 5));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000 + EQ_PHASE_NOTE_WAIT_MS);
+    });
+    expect(screen.getByText(t.ringing(t.seconds('0.17')))).toBeInTheDocument();
+    expect(screen.queryByText(t.ringing(t.seconds('0.68')))).toBeNull();
+    // 表示の前（レートが分からない）
+    act(() => useAudioStore.setState({ view: null }));
+    expect(screen.queryByText(/前のリンギング/)).toBeNull();
   });
 
   it('最小位相・ほかの欄・ほかの操作では出さず、頼まない', async () => {
