@@ -1758,9 +1758,23 @@ pub struct EditEqBandCurveDto {
 pub struct EditEqCurveDto {
     /// 周波数（Hz。20 Hz〜ナイキストの対数の格子）。
     pub freqs: Vec<f64>,
-    /// 合成（全バンドの和 ＋ 出力の利得。dB）。
+    /// 合成（全バンドの和 ＋ 出力の利得。dB。直線位相は全バンドの目標を掛けた FIR の実際の応答）。
     pub total: Vec<f64>,
     pub bands: Vec<EditEqBandCurveDto>,
+    /// 直線位相の FIR（M17 段 7。最小位相・段がないときは null）。
+    pub fir: Option<EditEqFirDto>,
+}
+
+/// 直線位相の FIR の長さ・遅れ（M17 段 7。前のリンギングと上限の一言に使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditEqFirDto {
+    /// タップの数。
+    pub taps: u32,
+    /// 遅れ（フレーム。音の前の揺れ（前のリンギング）の最大の長さ。出力では補ってある）。
+    pub delay_frames: u32,
+    /// 長さの上限に届いた（低い帯の形が目標から少しずれる）。
+    pub capped: bool,
 }
 
 /// イコライザの曲線の頼み（M17 段 2）。
@@ -1779,7 +1793,8 @@ pub struct EditEqCurveRequestDto {
 
 /// イコライザの曲線（M17 段 2。docs/editing.md §18.5）：`audio.eq` の引数とレート・チャンネルの数で、`points` 点（2〜2,048）の
 /// 対数の格子のバンドごと・合成の利得と係数を返す。描かず、セッションも描画の錠も待たない（ドラッグの間に点・曲線を毎回の
-/// 描画で追う）。引数が読めない・範囲の外・推論で断るなら `Invalid`。
+/// 描画で追う）。直線位相（M17 段 7）は合成を実際の FIR の応答にし、`fir` に長さ・遅れ・上限を添える。引数が読めない・範囲の
+/// 外・推論で断るなら `Invalid`。
 #[tauri::command]
 #[specta::specta]
 pub async fn edit_eq_curve(request: EditEqCurveRequestDto) -> Result<EditEqCurveDto, AppError> {
@@ -1794,6 +1809,11 @@ pub async fn edit_eq_curve(request: EditEqCurveRequestDto) -> Result<EditEqCurve
         Ok(EditEqCurveDto {
             freqs: c.freqs,
             total: c.total,
+            fir: c.fir.map(|f| EditEqFirDto {
+                taps: f.taps,
+                delay_frames: f.delay_frames,
+                capped: f.capped,
+            }),
             bands: c
                 .bands
                 .into_iter()

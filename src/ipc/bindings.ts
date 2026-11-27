@@ -107,7 +107,8 @@ export const commands = {
 	/**
 	 *  イコライザの曲線（M17 段 2。docs/editing.md §18.5）：`audio.eq` の引数とレート・チャンネルの数で、`points` 点（2〜2,048）の
 	 *  対数の格子のバンドごと・合成の利得と係数を返す。描かず、セッションも描画の錠も待たない（ドラッグの間に点・曲線を毎回の
-	 *  描画で追う）。引数が読めない・範囲の外・推論で断るなら `Invalid`。
+	 *  描画で追う）。直線位相（M17 段 7）は合成を実際の FIR の応答にし、`fir` に長さ・遅れ・上限を添える。引数が読めない・範囲の
+	 *  外・推論で断るなら `Invalid`。
 	 */
 	editEqCurve: (request: EditEqCurveRequestDto) => typedError<EditEqCurveDto, AppError>(__TAURI_INVOKE("edit_eq_curve", { request })),
 	/**
@@ -1527,9 +1528,11 @@ export type EditEqBandCurveDto = {
 export type EditEqCurveDto = {
 	/**  周波数（Hz。20 Hz〜ナイキストの対数の格子）。 */
 	freqs: (number | null)[],
-	/**  合成（全バンドの和 ＋ 出力の利得。dB）。 */
+	/**  合成（全バンドの和 ＋ 出力の利得。dB。直線位相は全バンドの目標を掛けた FIR の実際の応答）。 */
 	total: (number | null)[],
 	bands: EditEqBandCurveDto[],
+	/**  直線位相の FIR（M17 段 7。最小位相・段がないときは null）。 */
+	fir: EditEqFirDto | null,
 };
 
 /**  イコライザの曲線の頼み（M17 段 2）。 */
@@ -1541,6 +1544,16 @@ export type EditEqCurveRequestDto = {
 	channels: number,
 	/**  点の数（2〜2,048）。 */
 	points: number,
+};
+
+/**  直線位相の FIR の長さ・遅れ（M17 段 7。前のリンギングと上限の一言に使う）。 */
+export type EditEqFirDto = {
+	/**  タップの数。 */
+	taps: number,
+	/**  遅れ（フレーム。音の前の揺れ（前のリンギング）の最大の長さ。出力では補ってある）。 */
+	delayFrames: number,
+	/**  長さの上限に届いた（低い帯の形が目標から少しずれる）。 */
+	capped: boolean,
 };
 
 /**  イコライザ（`audio.eq` v1）の範囲と既定（M17 段 5。フロントのスペクトルの面・バンドの表は手で写さずにこれを読む）。 */

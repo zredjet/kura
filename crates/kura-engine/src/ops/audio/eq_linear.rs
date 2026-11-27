@@ -193,6 +193,36 @@ impl LinearEq {
     }
 }
 
+/// 曲線の合成（`eq::curve`）：全バンドの目標（チャンネルは分けない）に出力の利得 `gain` を掛けた FIR の、周波数 `freqs`（Hz）
+/// ごとの実際の応答（dB。`biquad::MIN_DB` で止める）と、長さの梯子の段・上限に届いたか。
+pub fn total_response(
+    r: &Resolved,
+    rate: u32,
+    gain: f64,
+    freqs: &[f64],
+) -> Result<(Vec<f64>, Ladder, bool), EngineError> {
+    let (ladder, capped) = ladder_of(r, rate);
+    let ffts = DesignFfts::new(ladder)?;
+    let grid = DesignGrid::new(ladder)?;
+    let mut target = try_vec(grid.bins(), 0f64)?;
+    for (k, v) in target.iter_mut().enumerate() {
+        *v = r
+            .bands
+            .iter()
+            .map(|b| magnitude(&grid, &b.sections, k))
+            .product::<f64>()
+            * gain;
+    }
+    let fir = design(&target, &ffts)?;
+    let db = fir.response_db(
+        f64::from(rate.max(1)),
+        freqs,
+        &ffts,
+        crate::audio::biquad::MIN_DB,
+    )?;
+    Ok((db, ladder, capped))
+}
+
 /// 直線位相の作業領域の見積もり（`Op::work_bytes`）：仕事ごとに入力の窓（f32 と f64）・スペクトル・逆変換・FFT の作業列・
 /// ブロックの出力、共有に H・FFT の表・覚え・設計の一時の領域。
 pub fn linear_work(ladder: Ladder, channels: usize, width: usize) -> Work {
@@ -631,6 +661,77 @@ mod tests {
                 assert!((got - want).abs() < 0.1, "{b:?} {f} Hz：{got} と {want}");
             }
         }
+    }
+
+    /// 曲線の合成（直線位相）は、インパルスの応答（描いた出力）の DTFT と ±0.02 dB（−30 dB より上。上限に届くものも）。
+    /// `fir` は長さ・遅れ・上限を添え、最小位相・段がないときはない。
+    #[test]
+    fn curve_is_the_actual_response() {
+        use crate::ops::audio::eq::curve;
+        use BandType::*;
+        let engine = crate::Engine::new().unwrap();
+        let rate = 48_000u32;
+        let freqs: Vec<f64> = (0..160)
+            .map(|k| 20.0 * crate::math::pow(1_200.0, f64::from(k) / 159.0))
+            .collect();
+        for (bands, capped) in [
+            (
+                vec![
+                    band(Bell, 1_000.0, 6.0, 1.0),
+                    Band {
+                        slope: 24,
+                        ..band(LowCut, 200.0, 0.0, 0.707)
+                    },
+                    band(HighShelf, 8_000.0, -4.0, 0.707),
+                ],
+                false,
+            ),
+            // 100 Hz・Q 10 のノッチ（帯域 10 Hz）は上限に届く
+            (vec![band(Notch, 100.0, 0.0, 10.0)], true),
+        ] {
+            let p = linear(bands.clone(), -1.0);
+            let c = curve(&p, rate, 1, &freqs).unwrap();
+            let fir = c.fir.unwrap();
+            assert_eq!(fir.capped, capped);
+            assert_eq!(fir.taps, 2 * fir.delay_frames + 1);
+            let d = fir.delay_frames;
+            let (n, t0) = (4 * d + 10, 2 * d);
+            let mut x = vec![0f32; n];
+            x[t0] = 1.0;
+            let y = run(&engine, &p, &audio(rate, vec![x])).remove(0);
+            for (k, f) in freqs.iter().enumerate() {
+                if c.total[k] < -30.0 {
+                    continue;
+                }
+                let w = 2.0 * std::f64::consts::PI * f / f64::from(rate);
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for m in -(d as i64)..=(d as i64) {
+                    let v = f64::from(y[(t0 as i64 + m) as usize]);
+                    re += v * crate::math::cos(w * m as f64);
+                    im -= v * crate::math::sin(w * m as f64);
+                }
+                let db = 10.0 * crate::math::log10(re * re + im * im);
+                assert!(
+                    (db - c.total[k]).abs() < 0.02,
+                    "{bands:?} {f} Hz：{db} と {}",
+                    c.total[k]
+                );
+            }
+            // 最小位相は段の和で、fir はない
+            let m = curve(
+                &EqParams {
+                    phase: Phase::Minimum,
+                    ..p.clone()
+                },
+                rate,
+                1,
+                &freqs,
+            )
+            .unwrap();
+            assert!(m.fir.is_none());
+        }
+        let empty = curve(&linear(Vec::new(), -3.0), rate, 2, &freqs).unwrap();
+        assert!(empty.fir.is_none() && empty.total.iter().all(|t| *t == -3.0));
     }
 
     /// 申告：状態の表を申告せず、届く範囲は Window（D・D・B）、作業領域は FFT の長さに比例。設計は 2 回でビット一致。

@@ -9,8 +9,9 @@
 //!   ビン 0〜len/2 で標本化して受け、偶の実の列の逆変換で零位相のインパルス h0 を作り、|m| ≤ D に Kaiser の窓
 //!   （β = [`KAISER_BETA`]）を掛けて切る。h[m] と h[−m] は同じ値（ビットまで）。重なり保存に使うスペクトル H は、h を円周の
 //!   0 を中心に長さ N に置いて順変換した実部（虚部は対称なので 0。捨てる）。
-//! - **応答**（[`Fir::response_db`]）：h を円周の 0 を中心に長さ 2N に置いて順変換し、ビンの間を周波数で直線に補う（曲線は
-//!   目標ではなく実際の FIR の応答。§18.6）。
+//! - **応答**（[`Fir::response_db`]）：h を円周の 0 を中心に設計の格子の長さ（N × [`OVERSAMPLE`]）に置いて順変換し、ビンの
+//!   間を周波数で直線に補う（曲線は目標ではなく実際の FIR の応答。§18.6。2N の格子では上限に届いたノッチの裾で補いの差が
+//!   0.03 dB を超えた）。
 
 use crate::audio::fft::{FftWork, RealFft};
 use crate::audio::resample::i0;
@@ -155,13 +156,12 @@ pub struct Fir {
     pub spectrum: Vec<f64>,
 }
 
-/// 設計に使う FFT（設計の格子・重なり保存・応答の長さ。作るのに時間が掛かるので、同じ段なら使い回す）。
+/// 設計に使う FFT（設計の格子と応答・重なり保存の長さ。作るのに時間が掛かるので、同じ段なら使い回す）。
 #[derive(Debug, Clone)]
 pub struct DesignFfts {
     pub ladder: Ladder,
     pub design: RealFft,
     pub block: RealFft,
-    pub response: RealFft,
 }
 
 impl DesignFfts {
@@ -170,7 +170,6 @@ impl DesignFfts {
             ladder,
             design: RealFft::new(ladder.design_len())?,
             block: RealFft::new(ladder.fft_len())?,
-            response: RealFft::new(ladder.fft_len() * 2)?,
         })
     }
 
@@ -179,7 +178,6 @@ impl DesignFfts {
         self.design
             .resident_bytes()
             .saturating_add(self.block.resident_bytes())
-            .saturating_add(self.response.resident_bytes())
     }
 }
 
@@ -254,8 +252,8 @@ fn centered_spectrum(
 }
 
 impl Fir {
-    /// 実際の応答（dB。`floor` で止める）を周波数 `freqs`（Hz）ごとに：長さ 2N に置いた順変換の振幅を、ビンの間で周波数に
-    /// 直線に補う（ナイキストを超える周波数はナイキストの値）。
+    /// 実際の応答（dB。`floor` で止める）を周波数 `freqs`（Hz）ごとに：設計の格子の長さに置いた順変換の振幅を、ビンの間で
+    /// 周波数に直線に補う（ナイキストを超える周波数はナイキストの値）。
     pub fn response_db(
         &self,
         fs: f64,
@@ -264,8 +262,8 @@ impl Fir {
         floor: f64,
     ) -> Result<Vec<f64>, EngineError> {
         let mut work = FftWork::default();
-        let spec = centered_spectrum(&self.taps, &ffts.response, &mut work)?;
-        let n = ffts.response.len();
+        let spec = centered_spectrum(&self.taps, &ffts.design, &mut work)?;
+        let n = ffts.design.len();
         let last = spec.len() - 1;
         let step = fs / n as f64;
         Ok(freqs

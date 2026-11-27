@@ -18,9 +18,22 @@ pub const LOW_HZ: f64 = 20.0;
 pub struct EqCurve {
     /// 周波数（Hz。20 Hz〜ナイキストの対数の格子）。
     pub freqs: Vec<f64>,
-    /// 合成（全バンドの和 ＋ 出力の利得。dB）。
+    /// 合成（全バンドの和 ＋ 出力の利得。dB。直線位相は全バンドの目標を掛けた FIR の実際の応答）。
     pub total: Vec<f64>,
     pub bands: Vec<EqBandCurve>,
+    /// 直線位相の FIR（M17 段 7。最小位相・段がないときは None）。
+    pub fir: Option<EqFir>,
+}
+
+/// 直線位相の FIR の長さ・遅れ（前のリンギングと上限の一言に使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EqFir {
+    /// タップの数。
+    pub taps: u32,
+    /// 遅れ（フレーム。音の前の揺れ（前のリンギング）の最大の長さ。出力では補ってある）。
+    pub delay_frames: u32,
+    /// 長さの上限に届いた（低い帯の形が目標から少しずれる）。
+    pub capped: bool,
 }
 
 /// バンド 1 つの曲線。
@@ -68,6 +81,11 @@ pub fn eq_curve(
     Ok(EqCurve {
         freqs,
         total: c.total,
+        fir: c.fir.map(|f| EqFir {
+            taps: u32::try_from(f.taps).unwrap_or(u32::MAX),
+            delay_frames: u32::try_from(f.delay_frames).unwrap_or(u32::MAX),
+            capped: f.capped,
+        }),
         bands: c
             .bands
             .into_iter()
@@ -130,5 +148,38 @@ mod tests {
             Err(EditorError::Invalid { .. })
         ));
         assert!(eq_curve(&p, 0, 2, 64).is_err());
+        assert!(c.fir.is_none());
+    }
+
+    /// 直線位相（M17 段 7）：合成は FIR の応答で、長さ・遅れ・上限を添える（48 kHz・200 Hz の 24 dB/oct のローカットは
+    /// 帯域 143 Hz で 8,193 タップ、30 Hz の 48 dB/oct は上限に届く）。
+    #[test]
+    fn linear_phase_reports_the_fir() {
+        let p = json!({
+            "bands": [
+                { "type": "bell", "freq": 1000.0, "gainDb": 6.0, "q": 1.0 },
+                { "type": "lowCut", "freq": 200.0, "slope": 24 }
+            ],
+            "phase": "linear",
+            "gainDb": 0.0
+        });
+        let c = eq_curve(&p, 48_000, 2, 256).unwrap();
+        assert_eq!(
+            c.fir,
+            Some(EqFir {
+                taps: 8_193,
+                delay_frames: 4_096,
+                capped: false
+            })
+        );
+        let k = c.freqs.iter().position(|f| *f >= 1_000.0).unwrap();
+        assert!((c.total[k] - 6.0).abs() < 0.3, "{}", c.total[k]);
+        let deep = json!({
+            "bands": [{ "type": "lowCut", "freq": 30.0, "slope": 48 }],
+            "phase": "linear",
+            "gainDb": 0.0
+        });
+        let c = eq_curve(&deep, 48_000, 2, 64).unwrap();
+        assert_eq!(c.fir.map(|f| (f.taps, f.capped)), Some((65_537, true)));
     }
 }

@@ -553,11 +553,25 @@ impl Stateful for EqMachine {
 }
 
 /// 曲線（`edit_eq_curve`。描かずに求める）：周波数 `freqs`（Hz）ごとの、バンドごとの利得（dB）と合成（全バンドの和 ＋ 出力の
-/// 利得。チャンネルは分けない）、バンドの段の係数。推論の扱いは操作と同じ。
+/// 利得。チャンネルは分けない）、バンドの段の係数。推論の扱いは操作と同じ。直線位相の合成は、全バンドの目標を掛けた FIR の
+/// 実際の応答（長さの上限に届くと目標からずれるため。M17 段 7）で、`fir` にその長さ・遅れを添える。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Curve {
     pub total: Vec<f64>,
     pub bands: Vec<BandCurve>,
+    /// 直線位相の FIR（最小位相・段がないときは None）。
+    pub fir: Option<FirCurve>,
+}
+
+/// 直線位相の FIR の長さ・遅れ（曲線に添える）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FirCurve {
+    /// タップの数 L。
+    pub taps: usize,
+    /// 遅れ D（フレーム。前のリンギングの最大の長さ。出力では補ってある）。
+    pub delay_frames: usize,
+    /// 長さの上限に届いた（低い帯の形が目標から少しずれる）。
+    pub capped: bool,
 }
 
 /// バンド 1 つの曲線。
@@ -594,7 +608,24 @@ pub fn curve(p: &EqParams, rate: u32, channels: usize, freqs: &[f64]) -> Result<
             sections: b.sections.clone(),
         });
     }
-    Ok(Curve { total, bands })
+    let mut fir = None;
+    if p.phase == Phase::Linear && !r.bands.is_empty() {
+        let (db, ladder, capped) =
+            super::eq_linear::total_response(&r, rate, crate::math::db_to_gain(p.gain_db), freqs)
+                .map_err(|e| {
+                Issues::one(Issue::error(
+                    IssueCode::TooLarge,
+                    format!("直線位相の曲線を求められません：{e}"),
+                ))
+            })?;
+        total = db;
+        fir = Some(FirCurve {
+            taps: ladder.taps(),
+            delay_frames: ladder.delay(),
+            capped,
+        });
+    }
+    Ok(Curve { total, bands, fir })
 }
 
 /// 描き方（`Eq::path`）。
