@@ -708,6 +708,167 @@ fn eq_step_timings() {
     }
 }
 
+/// M17 段 7：核の重さの見込み（`Engine::kernel_render_ns`）。直線位相の EQ はチャンネル × 8 ns（M/S の組は 14 ns）× 描く
+/// フレーム（範囲はチャンクに揃える）、最小位相・利得は 0。キャッシュに当たるノード（全体で描いた EQ）は数えないので、下流の
+/// 利得だけを変えた計画は重くない。
+#[test]
+fn kernel_render_estimates_follow_the_declaration() {
+    use kura_engine::ops::audio::eq::{Band, BandChannel, BandType, EqParams, Phase, band};
+    let engine = kura_engine::Engine::new().unwrap();
+    let frames = 4 * 48_000u64;
+    let input = InputGen::AudioNoise {
+        rate: 48_000,
+        channels: 2,
+        frames,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let eq = |phase: Phase, channel: BandChannel| EqParams {
+        bands: vec![Band {
+            channel,
+            ..band(BandType::Bell, 400.0, 4.0, 2.0)
+        }],
+        phase,
+        gain_db: 0.0,
+    };
+    let doc = |p: &EqParams, gain: f64| {
+        let mut g = Graph::new_single();
+        g.push_linear("audio.eq", 1, serde_json::to_value(p).unwrap(), 1)
+            .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": gain }), 2)
+            .unwrap();
+        g
+    };
+    let ns = |g: &Graph, cache: &NodeCache, area: Area| {
+        let plan = compile(&engine, g, &input);
+        engine
+            .kernel_render_ns(&plan, &fin(&input), cache, OutputId(0), area)
+            .unwrap()
+    };
+    let empty = NodeCache::new(512 << 20);
+    let lin = eq(Phase::Linear, BandChannel::All);
+    assert_eq!(ns(&doc(&lin, 0.0), &empty, Area::All), 16.0 * frames as f64);
+    let ms = eq(Phase::Linear, BandChannel::Mid);
+    assert_eq!(ns(&doc(&ms, 0.0), &empty, Area::All), 28.0 * frames as f64);
+    assert_eq!(
+        ns(
+            &doc(&eq(Phase::Minimum, BandChannel::All), 0.0),
+            &empty,
+            Area::All
+        ),
+        0.0
+    );
+    // 範囲はチャンクに揃える（[10, 20) は 1 チャンク）
+    let mut spans = kura_engine::render::region::Spans::new();
+    spans.push(10, 20);
+    assert_eq!(
+        ns(&doc(&lin, 0.0), &empty, Area::Samples(spans)),
+        16.0 * C as f64
+    );
+    // 全体で描いて EQ がキャッシュに入れば、下流の利得だけを変えた計画は重くない
+    let mut cache = NodeCache::new(512 << 20);
+    let plan = compile(&engine, &doc(&lin, 0.0), &input);
+    let req = ViewRequest {
+        output: OutputId(0),
+        area: Area::All,
+        focus: None,
+    };
+    engine
+        .render_view(&plan, &fin(&input), &mut cache, &req, None, &NoMonitor)
+        .unwrap();
+    assert_eq!(ns(&doc(&lin, -3.0), &cache, Area::All), 0.0);
+    // EQ の手は重い
+    let mut moved = lin.clone();
+    moved.bands[0].gain_db = 5.0;
+    assert_eq!(
+        ns(&doc(&moved, 0.0), &cache, Area::All),
+        16.0 * frames as f64
+    );
+}
+
+/// 測り（M17 段 7。`RAYON_NUM_THREADS=3 cargo test --release -p kura-engine --test stateful eq_linear_step_timings -- --ignored
+/// --nocapture`）：48 kHz ステレオ 20 秒に直線位相の `audio.eq`（長さの梯子の段 k = 8〜16。「すべて」と M（組の幅 2））をかけ、
+/// バンドの利得を 1 手変えたときの表示（全体）の時間と、フレームあたりの ns。中央値（5 回）。重い核の門
+/// （`Op::kernel_ns_per_frame`）の式の元。
+#[test]
+#[ignore = "測り（--release -- --ignored --nocapture）"]
+fn eq_linear_step_timings() {
+    #![allow(clippy::disallowed_methods)]
+    use kura_engine::ops::audio::eq::{Band, BandChannel, BandType, EqParams, Phase, band};
+    let engine = engine();
+    let frames = 20 * 48_000u64;
+    let input = InputGen::AudioNoise {
+        rate: 48_000,
+        channels: 2,
+        frames,
+        seed: 7,
+    }
+    .generate()
+    .unwrap();
+    // 帯域から k が 8・10・12・14・16 になるベル（L ≥ 16 × 48,000 ÷ 帯域）
+    for (k, freq, q) in [
+        (8u32, 3_000.0, 1.0),
+        (10, 1_000.0, 1.3),
+        (12, 400.0, 2.0),
+        (14, 100.0, 2.0),
+        (16, 30.0, 2.0),
+    ] {
+        for channel in [BandChannel::All, BandChannel::Mid] {
+            let doc = |gain: f64| {
+                let p = EqParams {
+                    bands: vec![Band {
+                        channel,
+                        ..band(BandType::Bell, freq, gain, q)
+                    }],
+                    phase: Phase::Linear,
+                    gain_db: 0.0,
+                };
+                let mut g = Graph::new_single();
+                g.push_linear("audio.eq", 1, serde_json::to_value(&p).unwrap(), 1)
+                    .unwrap();
+                g
+            };
+            let req = ViewRequest {
+                output: OutputId(0),
+                area: Area::All,
+                focus: None,
+            };
+            let mut cache = NodeCache::new(512 << 20);
+            let plan = compile(&engine, &doc(3.0), &input);
+            let mut prev = engine
+                .render_view(&plan, &fin(&input), &mut cache, &req, None, &NoMonitor)
+                .unwrap()
+                .view;
+            let mut times = Vec::new();
+            for i in 0..5 {
+                let plan = compile(&engine, &doc(3.5 + i as f64 * 0.5), &input);
+                let t = std::time::Instant::now();
+                let got = engine
+                    .render_view(
+                        &plan,
+                        &fin(&input),
+                        &mut cache,
+                        &req,
+                        Some(&prev),
+                        &NoMonitor,
+                    )
+                    .unwrap();
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                prev = got.view;
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "k {k}・{channel:?}：1 手 {:.1} ms（中央値。最小 {:.1}・最大 {:.1}）・{:.1} ns / フレーム",
+                times[2],
+                times[0],
+                times[4],
+                times[2] * 1e6 / frames as f64
+            );
+        }
+    }
+}
+
 /// 測り（M17 段 2 の F5。`--release -- --ignored --nocapture`、長さは `KURA_SUBNORMAL_SECS`（既定 600 秒））：`audio.eq` の状態
 /// 機械（`EqMachine`。表の流しと核の中身）を 48 kHz モノラルで、「信号 2 秒のあと無音」「ずっと信号（雑音）」「ずっと無音」に
 /// 通し、標本あたりの時間と、格子（`STATE_GRID`）の境で状態にサブノーマル（と 2⁻¹⁰⁰⁰ 未満の 0 でない値）があった格子の数を

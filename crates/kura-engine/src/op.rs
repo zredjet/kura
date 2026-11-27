@@ -564,6 +564,12 @@ pub trait Op: Send + Sync + 'static {
     fn work_bytes(_p: &Self::Params, _inputs: &[Shape], _out: &Shape) -> Work {
         Work::ZERO
     }
+    /// 音声の核の描く重さの見込み（出力の 1 フレーム（全チャンネル）あたりの ns。M4 Max・release・プール 3 スレッドの実測から。
+    /// M17 段 7）。呼び手（エディタ）が、操作中の手を握る計画で描くかを決めるのに使う（[`crate::render::Engine::kernel_render_ns`]）。
+    /// 値に効かない。既定は 0（軽い）。区間ごとに FFT を回すような重い核だけが上書きする。
+    fn kernel_ns_per_frame(_p: &Self::Params, _inputs: &[Shape]) -> f64 {
+        0.0
+    }
     /// 実装を消した古い版 `from` の引数を、結果を変えずにこの版へ移す。移せなければ理由を返す。
     /// 呼ばれるのは、`from` より新しい実装のある版のうち、この版がいちばん古いとき（すぐ上の版）。
     fn migrate(from: u16, _raw: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -720,6 +726,8 @@ pub trait DynOp: Send + Sync {
     /// 描く間の作業領域の見積もり（`Op::work_bytes`）。
     fn work_bytes(&self, p: &AnyParams, inputs: &[Shape], out: &Shape)
     -> Result<Work, EngineError>;
+    /// 音声の核の描く重さの見込み（`Op::kernel_ns_per_frame`）。
+    fn kernel_ns_per_frame(&self, p: &AnyParams, inputs: &[Shape]) -> Result<f64, EngineError>;
     /// 引数を読み、範囲を確かめる。
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues>;
     /// 読んだ引数を JSON に戻す（往復のテスト用）。
@@ -855,6 +863,10 @@ impl<O: Op> DynOp for OpEntry<O> {
         out: &Shape,
     ) -> Result<Work, EngineError> {
         Ok(O::work_bytes(self.params(p)?, inputs, out))
+    }
+
+    fn kernel_ns_per_frame(&self, p: &AnyParams, inputs: &[Shape]) -> Result<f64, EngineError> {
+        Ok(O::kernel_ns_per_frame(self.params(p)?, inputs))
     }
 
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues> {

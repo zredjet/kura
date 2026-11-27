@@ -833,6 +833,24 @@ impl Op for Eq {
         }
     }
 
+    /// 直線位相（M17 段 7）：48 kHz ステレオ 20 秒の 1 手の実測（`tests/stateful.rs` の `eq_linear_step_timings`。設計の時間を
+    /// 含む）で、チャンネルあたり 7.3〜8.5 ns（k ≤ 12、FIR を分け合う）・13.2〜14.2 ns（M/S の組）、k = 14・16 で 13.4・21.2 ns と
+    /// 26・31 ns。式はチャンネル × 8 ns（組は 14 ns）× (1 + 0.4 × max(0, k − 12))。最小位相・段なしは 0（軽い）。
+    fn kernel_ns_per_frame(p: &EqParams, inputs: &[Shape]) -> f64 {
+        match Self::path(p, inputs) {
+            Path::Linear {
+                ladder,
+                width,
+                channels,
+            } => {
+                let per = if width == 2 { 14.0 } else { 8.0 };
+                let order = f64::from(ladder.order.saturating_sub(12));
+                channels as f64 * per * (1.0 + 0.4 * order)
+            }
+            Path::Plain | Path::Stateful => 0.0,
+        }
+    }
+
     fn reach(p: &EqParams, inputs: &[Shape]) -> Reach {
         match (inputs.first().and_then(audio_shape), Self::path(p, inputs)) {
             (Some(_), Path::Plain) => Reach::SameTime,

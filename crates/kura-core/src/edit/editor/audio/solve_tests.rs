@@ -564,3 +564,55 @@ fn solved_tables_survive_a_cleared_cache() {
         &rendered(&bytes, "wav", &g),
     );
 }
+
+/// 直線位相のベル 1 つ（8 kHz で 20 Hz・Q 10 は帯域 2 Hz・65,537 タップ。核の重さはモノラルで 20.8 ns / フレーム）。
+fn linear_eq(gain: f64) -> serde_json::Value {
+    json!({ "bands": [{ "type": "bell", "freq": 20.0, "gainDb": gain, "q": 10.0 }], "phase": "linear", "gainDb": 0.0 })
+}
+
+/// A26（M17 段 7）：重い核（直線位相）の手は、表示の範囲を描く推定が 25 ms を超えると、操作中の手の頼みだけ握る計画で描く
+/// （古い rev・`solving`）。裏の仕事の頼み（操作中でも）と手が止まった頼みは今の計画で描き、操作中でない手・推定の小さい
+/// 範囲はその場で描く。
+#[test]
+fn heavy_kernels_hold_only_while_interacting() {
+    let env = Env::new();
+    let frames = 150 * C + 9;
+    let bytes = noise_wav(8_000, 1, frames, 36);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    // 20 チャンク × 20.8 ns ≈ 27 ms（境を超える）
+    let view = [(10 * C, 30 * C)];
+    let s = env.open_with(id, vp(&view, false, false)).session.clone();
+    // 操作中でない手：その場で描く
+    let out = env.step(
+        &s,
+        vec![add(0, "audio.eq", linear_eq(4.0))],
+        &vp(&view, false, false),
+    );
+    let info = shown_audio(&out.view);
+    assert_eq!((info.rev, info.solving), (out.status.rev, None));
+    let first = info.rev;
+    // 操作中の手：握る計画（前の rev）
+    let out = env.step(&s, vec![set(1, linear_eq(5.0))], &vp(&view, false, true));
+    let info = shown_audio(&out.view);
+    assert_eq!(info.rev, first);
+    assert!(out.status.rev > first);
+    assert_eq!(info.solving, Some(0.0));
+    assert!(info.work);
+    assert_eq!(info.valid, view.to_vec());
+    // 操作中の裏の仕事の頼み（止まって 150 ms）：今の計画
+    let out = env.step(&s, Vec::new(), &vp(&view, true, true));
+    let info = shown_audio(&out.view);
+    assert_eq!((info.rev, info.solving), (out.status.rev, None));
+    let second = info.rev;
+    // もう 1 手（操作中）は握る計画、手が止まった頼みは今の計画
+    let out = env.step(&s, vec![set(1, linear_eq(6.0))], &vp(&view, false, true));
+    assert_eq!(shown_audio(&out.view).rev, second);
+    let out = env.step(&s, Vec::new(), &vp(&view, false, false));
+    let info = shown_audio(&out.view);
+    assert_eq!((info.rev, info.solving), (out.status.rev, None));
+    // 推定の小さい範囲（2 チャンク ≈ 2.7 ms）は、操作中でもその場で描く
+    let small = [(10 * C, 12 * C)];
+    let out = env.step(&s, vec![set(1, linear_eq(7.0))], &vp(&small, false, true));
+    let info = shown_audio(&out.view);
+    assert_eq!((info.rev, info.solving), (out.status.rev, None));
+}

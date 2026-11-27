@@ -421,6 +421,11 @@ impl Editor {
             }
         }
         let area = view_area(full, &avp);
+        // M17 段 7：重い核（直線位相）の手は、操作中の手の頼みだけ握る計画で描く（solve の説明。裏の仕事の頼み・手が止まった
+        // 頼みは今の計画で）
+        if avp.interacting && limit.is_none() && self.kernel_gate(st, &area) {
+            return self.render_held(st, &avp, ticket, started, false, progress);
+        }
         let plan = st.plan.clone();
         let spec = EstimateSpec::new(0)
             .all_inputs(&plan, Source::Held)

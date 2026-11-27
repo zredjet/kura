@@ -164,6 +164,61 @@ pub(super) struct AudioRun {
 }
 
 impl Engine {
+    /// 出力 `output` の範囲 `area` を描く核の重さの見込み（ns。M17 段 7）：範囲の描画と同じ後ろからの走査
+    /// （`region_needs`。キャッシュに当たるノードで止める）で描くノードと要る範囲を集め、重い核（`Op::kernel_ns_per_frame` が
+    /// 正）のノードごとに、ns / フレーム × 描くフレーム（要る区間をチャンクに揃えた長さ。範囲を持たないノードは全体）を足す。
+    /// 呼び手（エディタ）が、操作中の手を握る計画で描くかを決めるのに使う（値に効かない。キャッシュの使った順は変えない）。
+    pub fn kernel_render_ns(
+        &self,
+        plan: &Plan,
+        inputs: &BTreeMap<InputId, FingerprintedInput>,
+        cache: &NodeCache,
+        output: OutputId,
+        area: Area,
+    ) -> Result<f64, EngineError> {
+        let Some((_, from, _, _)) = plan.outputs.iter().find(|o| o.0 == output) else {
+            return Err(bad_input(format!("出力 {} はありません", output.0)));
+        };
+        let PortRef::Node { id } = *from else {
+            return Ok(0.0);
+        };
+        let fps = self.fingerprints(plan, inputs)?;
+        let shapes = super::area::Shapes::of(plan);
+        let audio_ok = |n: &PlannedNode, s: &[Shape]| self.audio_regional(n, s);
+        let walk = self.region_needs(plan, &shapes, id, area, false, false, &audio_ok, &|n| {
+            fps.nodes.get(&n.id).is_some_and(|fp| cache.contains(fp))
+        })?;
+        let mut ns = 0.0;
+        for node in &plan.nodes {
+            if !node.enabled || !walk.need.contains_key(&node.id) || walk.hits.contains(&node.id) {
+                continue;
+            }
+            let ins = shapes.inputs_of(node)?;
+            let per = node
+                .op
+                .kernel_ns_per_frame(node.params.as_ref(), &op_shapes(node, &ins))?;
+            if per <= 0.0 {
+                continue;
+            }
+            let Shape::Audio { frames, .. } = node.inferred.shape else {
+                continue;
+            };
+            let whole = frames.max();
+            let drawn = match walk.regional.get(&node.id) {
+                Some(Area::Samples(spans)) => spans
+                    .spans()
+                    .iter()
+                    .map(|(a, b)| b.saturating_sub(*a))
+                    .fold(0u64, u64::saturating_add)
+                    .min(whole),
+                Some(Area::Empty) => 0,
+                _ => whole,
+            };
+            ns += per * drawn as f64;
+        }
+        Ok(ns)
+    }
+
     /// 音声の範囲を持つノードか（有効・持ち上げない・出力と入力 0 が音声・`audio_reach` が `Global` でない）。申告した解析が
     /// あってもよい（描く前に解く）。
     pub(super) fn audio_regional(

@@ -645,6 +645,72 @@ fn sixty_minutes_eq_solves_in_the_background() {
     }
 }
 
+/// M17 段 7 の手測り：60 分の WAV（48 kHz ステレオ）の 48 チャンクの区間の表示に直線位相の EQ（30 Hz・Q 2 のベル。65,537
+/// タップ）を足す手、ドラッグ中の手（握る計画）、止まって 150 ms の裏の仕事の頼み（今の計画で 48 チャンク）、離した手の応えの
+/// 時間を出す（プール 2 スレッド・予算 2 GiB）。
+///
+/// `cargo test --release -p kura-core --lib sixty_minutes_linear_eq -- --ignored --nocapture`
+#[test]
+#[ignore = "60 分の WAV を書く（約 660 MB）。--release で回す"]
+fn sixty_minutes_linear_eq() {
+    let env = Env::with(Arc::new(Budgeted(2 << 30)));
+    let frames = 60 * 60 * RATE;
+    let tmp = env.lib.layout().staging_dir().join("long.wav");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    let hash = write_wav(&tmp, frames);
+    let path = env.lib.layout().content_path(&hash, "wav");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as i64;
+    let id = insert(&env, hash, "wav", size);
+    let c = kura_engine::value::AUDIO_CHUNK as u64;
+    let at = 10 * 60 * RATE / c * c;
+    let view = |work: bool, interacting: bool| {
+        Viewport::Audio(AudioViewport {
+            spans: vec![(at, at + 48 * c)],
+            work,
+            interacting,
+            ..AudioViewport::idle()
+        })
+    };
+    let s = env.open_with(id, view(false, false)).session.clone();
+    let eq = |g: f64| json!({ "bands": [{ "type": "bell", "freq": 30.0, "gainDb": g, "q": 2.0 }], "phase": "linear", "gainDb": 0.0 });
+    let timed = |what: &str, steps: Vec<Step>, vp: Viewport| {
+        let t = Instant::now();
+        let out = env.step(&s, steps, &vp);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let info = shown_audio(&out.view);
+        println!(
+            "{what}：{ms:.1} ms（表示の rev {}・頭 {}・solving {:?}）",
+            info.rev, out.status.rev, info.solving
+        );
+        (info.rev, out.status.rev)
+    };
+    let (shown, head) = timed(
+        "直線位相の EQ を足す（操作中でない）",
+        vec![add(0, "audio.eq", eq(3.0))],
+        view(false, false),
+    );
+    assert_eq!(shown, head);
+    for (round, g) in [4.0, 4.5, 5.0].into_iter().enumerate() {
+        let (shown, head) = timed(
+            &format!("ドラッグ中の手 {round}"),
+            vec![set(1, eq(g))],
+            view(false, true),
+        );
+        assert!(shown < head, "握る計画で描かない");
+    }
+    let (shown, head) = timed(
+        "止まって 150 ms の裏の仕事の頼み（操作中）",
+        Vec::new(),
+        view(true, true),
+    );
+    assert_eq!(shown, head);
+    timed("ドラッグ中の手", vec![set(1, eq(5.5))], view(false, true));
+    let (shown, head) = timed("離した頼み", Vec::new(), view(false, false));
+    assert_eq!(shown, head);
+}
+
 /// 手測り（M17 段 4）：60 分・48 kHz ステレオの WAV に gain を足した文書で、スペクトルのタイル（和）を表示の頼みに添えた
 /// 1 手の応え、裏の仕事で 48 チャンクのタイルを作り終えるまで、全体（⌘A）の区間の平均を裏の仕事で求め終えるまでを出す
 /// （プール 2 スレッド・予算 2 GiB）。

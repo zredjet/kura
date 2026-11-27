@@ -12,6 +12,12 @@
 //!
 //! 前に公開した表示がない（開いた直後）・握る計画の結果がそろっていない・流して解けない解析があるときは、今までどおり錠の
 //! 中で解く。
+//!
+//! 重い核（M17 段 7。直線位相のイコライザ）：申告した解析はないが、描くこと自体が重い核（`Op::kernel_ns_per_frame`）の手は、
+//! 表示の範囲を描く推定（`Engine::kernel_render_ns`。キャッシュに当たるノードは数えない）が [`SYNC_SOLVE_NS`] を超え、握る
+//! 計画が使えるとき、**操作中（ドラッグの途中）の手の頼みだけ**握る計画で描く（[`Editor::kernel_gate`]。流し解きの間と同じ
+//! 応え：古い rev・`solving`）。手が止まった頼み（操作中でない）と裏の仕事の頼み（`work`。フロントは `solving` の間、止まって
+//! 150 ms で出す）は、今の計画を錠の中で描く。
 
 use std::time::Instant;
 
@@ -158,6 +164,29 @@ impl Editor {
             });
         }
         Gate::Background
+    }
+
+    /// 重い核の門（モジュールの説明）：表示の範囲 `area` を今の計画で描く推定が [`SYNC_SOLVE_NS`] を超え、握る計画（結果が
+    /// そろい、今の rev でない）があれば true。操作中の手の頼みでだけ呼ぶ。見込めなければ false（今の計画で描いて誤りを
+    /// 知らせる）。
+    pub(in crate::edit::editor) fn kernel_gate(&self, st: &State, area: &Area) -> bool {
+        let usable = st
+            .audio
+            .as_ref()
+            .and_then(|a| a.held.as_ref())
+            .is_some_and(|h| h.complete && h.rev != st.session.rev().0);
+        if !usable {
+            return false;
+        }
+        match self.runtime.preview(|e| {
+            e.kernel_render_ns(&st.plan, &st.inputs, &st.cache, st.output, area.clone())
+        }) {
+            Ok(ns) => ns > SYNC_SOLVE_NS,
+            Err(err) => {
+                tracing::debug!(%err, "核の重さを見込めません");
+                false
+            }
+        }
     }
 
     /// 流し解きの仕事を捨てる。
