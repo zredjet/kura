@@ -6,6 +6,9 @@
 //!   奇数なら最後の 1 段は基数 2）。まとめても演算の式と順は基数 2 の 2 段と同じ。
 //! - f64。回転の値は作るときに 1 度だけ `math::cos`・`sin` で求める（OS の libm を呼ばない）。同じ入力には同じビット列。
 //! - Vorbis・AAC の FFT はコーデックの値と一致させるためのものなので共有しない（§18.4）。
+//! - 逆変換（[`RealFft::inverse`]。M17 段 7 の直線位相の重なり保存）は、N/2 + 1 本のビンを同じ式の逆で長さ N/2 の複素の列に
+//!   まとめ、共役をとって同じ複素 FFT にかけ（IDFT(Z) = conj(DFT(conj Z))/M）、偶数番・奇数番の標本に戻す。順変換と複素 FFT
+//!   の式は変えない（`kura-spec/1` の値を保つ）。
 
 use crate::error::EngineError;
 use crate::math;
@@ -106,6 +109,37 @@ impl RealFft {
             let (wr, wi) = self.half[k];
             out_re[k] = er + (wr * or - wi * oi);
             out_im[k] = ei + (wr * oi + wi * or);
+        }
+    }
+
+    /// 半分のスペクトル X_0〜X_{N/2}（`in_re`・`in_im`。どちらも長さ N/2 + 1。実数の列のスペクトル）の逆変換
+    /// x_n = (1/N) Σ_{k<N} X_k e^{2πikn/N} を `out`（長さ N）に書く（[`Self::forward`] の逆。X_0・X_{N/2} の虚部は 0 として
+    /// 扱う形の式）。
+    pub fn inverse(&self, in_re: &[f64], in_im: &[f64], out: &mut [f64], work: &mut FftWork) {
+        let (n, m) = (self.n, self.m);
+        debug_assert!(in_re.len() == m + 1 && in_im.len() == m + 1 && out.len() == n);
+        work.re.resize(m, 0.0);
+        work.im.resize(m, 0.0);
+        let (re, im) = (&mut work.re, &mut work.im);
+        // まとめる：E_k = (X_k + conj X_{M−k})/2、O_k = (X_k − conj X_{M−k})/2 · conj W_N^k、Z_k = E_k + i O_k。共役をとって
+        // ビット逆順に置く
+        for k in 0..m {
+            let (xr, xi) = (in_re[k], in_im[k]);
+            let (cr, ci) = (in_re[m - k], -in_im[m - k]);
+            let (er, ei) = (0.5 * (xr + cr), 0.5 * (xi + ci));
+            let (dr, di) = (0.5 * (xr - cr), 0.5 * (xi - ci));
+            let (wr, wi) = self.half[k];
+            let (or, oi) = (dr * wr + di * wi, di * wr - dr * wi);
+            let j = self.rev[k] as usize;
+            re[j] = er - oi;
+            im[j] = -(ei + or);
+        }
+        self.complex(re, im);
+        // 共役をとって 1/M を掛け、偶数番 ← 実部・奇数番 ← 虚部
+        let s = 1.0 / m as f64;
+        for i in 0..m {
+            out[2 * i] = re[i] * s;
+            out[2 * i + 1] = -im[i] * s;
         }
     }
 
@@ -260,6 +294,58 @@ mod tests {
                 let want = if k == bin { n as f64 / 2.0 } else { 0.0 };
                 assert!((p - want).abs() < 1e-6 * n as f64, "N {n} k {k}: {p}");
             }
+        }
+    }
+
+    /// 逆変換（M17 段 7）：順変換の逆で戻り（長さ 4〜2^17、相対 1e-12）、定義どおりの逆 DFT と合い（長さ 4〜4,096）、2 回で
+    /// ビット単位で同じ。
+    #[test]
+    fn inverse_undoes_forward_and_matches_the_definition() {
+        for bits in 2..=17 {
+            let n = 1usize << bits;
+            let fft = RealFft::new(n).unwrap();
+            let x = noise(n, 300 + bits as u64);
+            let (mut re, mut im) = (vec![0.0; n / 2 + 1], vec![0.0; n / 2 + 1]);
+            let mut work = FftWork::default();
+            fft.forward(&x, &mut re, &mut im, &mut work);
+            let mut back = vec![0.0; n];
+            fft.inverse(&re, &im, &mut back, &mut work);
+            let scale = x.iter().map(|v| v.abs()).fold(0.0, math::max);
+            for (t, (a, b)) in back.iter().zip(&x).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-12 * scale * (bits as f64),
+                    "N {n} t {t}: {a} と {b}"
+                );
+            }
+            if bits <= 12 {
+                // 定義どおりの逆 DFT（実数の列のスペクトルなので、残りのビンは共役）
+                for (t, got) in back.iter().enumerate() {
+                    let mut v = 0.0;
+                    for k in 0..n {
+                        let (xr, xi) = if k <= n / 2 {
+                            (re[k], im[k])
+                        } else {
+                            (re[n - k], -im[n - k])
+                        };
+                        let (c, s) = twiddle((k * t) % n, n);
+                        // e^{+iθ} = c − i s（twiddle は e^{−iθ}）
+                        v += xr * c + xi * s;
+                    }
+                    v /= n as f64;
+                    assert!(
+                        (got - v).abs() <= 1e-12 * scale * (bits as f64),
+                        "N {n} t {t}: {got} と {v}"
+                    );
+                }
+            }
+            let mut again = vec![0.0; n];
+            fft.inverse(&re, &im, &mut again, &mut FftWork::default());
+            assert!(
+                again
+                    .iter()
+                    .zip(&back)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
         }
     }
 
