@@ -158,13 +158,17 @@ fn flip_non_finite(out: &AnyOutput) -> Option<AnyOutput> {
 }
 
 /// イコライザ（M17 段 2）：どの例でも、出力は 1 標本ずつ順に流した参照とビット一致する（表の解析で解いた状態から区間を
-/// 描いた値が、順に流した値と同じ）。参照は推論を通したバンドの係数で、領域が替わる所だけ M/S に変換する。
+/// 描いた値が、順に流した値と同じ）。参照は推論を通したバンドの係数で、領域が替わる所だけ M/S に変換する。直線位相の例
+/// （状態の表を申告しない。M17 段 7）は除く。
 fn eq_matches_the_sequential_reference(engine: &Engine, p: &Pair) -> Result<(), String> {
-    use kura_engine::ops::audio::eq::{EqParams, Target, resolve};
+    use kura_engine::ops::audio::eq::{EqParams, Phase, Target, resolve};
     for ex in p.examples(engine)? {
+        let params: EqParams = serde_json::from_value(ex.params.clone()).map_err(err)?;
+        if params.phase == Phase::Linear {
+            continue;
+        }
         let input = ex.inputs[0].generate().map_err(err)?;
         let out = p.apply(engine, ex.params.clone(), &input)?;
-        let params: EqParams = serde_json::from_value(ex.params.clone()).map_err(err)?;
         let (Value::Audio(a), Value::Audio(got)) = (&input, &out) else {
             return Err(format!("{}：音声ではない", ex.name));
         };

@@ -1354,6 +1354,31 @@ pub fn random_eq_bands(r: &mut ChaCha8Rng) -> serde_json::Value {
     serde_json::Value::Array(bands)
 }
 
+/// 直線位相のランダムな鎖のバンド（M17 段 7）：帯域を広げる（周波数 400 Hz 以上・Q 2 まで・傾き 24 dB/oct まで）。FIR の
+/// 長さを 48 kHz でも 2^14 + 1 までに抑え、デバッグのビルドで重くしない。乱数は使わない。
+fn widen_eq_bands(bands: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(list) = bands else {
+        return bands;
+    };
+    let num = |x: f64| {
+        let i = x as i64;
+        if i as f64 == x { json!(i) } else { json!(x) }
+    };
+    serde_json::Value::Array(
+        list.into_iter()
+            .map(|mut b| {
+                let f = b["freq"].as_f64().unwrap_or(1_000.0);
+                let q = b["q"].as_f64().unwrap_or(0.7);
+                let slope = b["slope"].as_u64().unwrap_or(12);
+                b["freq"] = num(crate::math::max(f, 400.0));
+                b["q"] = num(crate::math::min(q, 2.0));
+                b["slope"] = json!(slope.min(24));
+                b
+            })
+            .collect(),
+    )
+}
+
 /// [`random_audio_op`] の、`stateful` なら 4 回に 1 回は試験の状態を運ぶ操作（[`random_stateful_op`]）を選ぶ版（M17 段 1。
 /// 試験用のエンジン `testing::stateful::engine` で使う）。`stateful` が偽なら [`random_audio_op`] と同じ乱数の列。
 pub fn random_audio_op_in(
@@ -1364,12 +1389,16 @@ pub fn random_audio_op_in(
     if stateful && below(r, 4) == 0 {
         // 試験の操作とイコライザ（M17 段 2）を半々に
         if below(r, 2) == 0 {
+            // 3 回に 1 回は直線位相（M17 段 7）。乱数の列を変えないよう、利得の引きから決め、バンドは乱数を使わずに広げる
+            let bands = random_eq_bands(r);
+            let g = below(r, 120);
+            let linear = g.is_multiple_of(3);
             return (
                 "audio.eq",
                 json!({
-                    "bands": random_eq_bands(r),
-                    "phase": "minimum",
-                    "gainDb": (below(r, 120) as f64 - 60.0) / 10.0 + 0.05,
+                    "bands": if linear { widen_eq_bands(bands) } else { bands },
+                    "phase": if linear { "linear" } else { "minimum" },
+                    "gainDb": (g as f64 - 60.0) / 10.0 + 0.05,
                 }),
             );
         }

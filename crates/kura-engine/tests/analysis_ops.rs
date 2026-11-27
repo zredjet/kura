@@ -530,6 +530,49 @@ const EMPTY_PLAN: &[(&str, u16, &str, &str)] = &[
         "gain-only",
         "バンドがなく出力の利得だけなので、利得の核で描き、状態の表を申告しない",
     ),
+    // M17 段 7：直線位相のイコライザは状態の表を申告しない（FIR を核を作るときに設計し、重なり保存で描く。ADR-239）
+    (
+        "audio.eq",
+        1,
+        "linear-bells-and-cut",
+        "直線位相は FIR を設計して重なり保存で描くので、状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-mid-side",
+        "直線位相（M/S の行列）は FIR で描くので、状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-three-channels",
+        "直線位相（チャンネルごとの FIR）は状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-shorter-than-delay",
+        "直線位相（遅れより短い入力）は FIR で描くので、状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-capped-crosses-chunks",
+        "直線位相（長さの上限）は FIR で描くので、状態の表を申告しない",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-non-finite",
+        "直線位相は有限でない標本を窓の中で 0 にして通し、状態の表を申告しない（警告もしない）",
+    ),
+    (
+        "audio.eq",
+        1,
+        "linear-identity",
+        "段が残らず出力の利得 0 dB なので、位相によらず入力のまま（Identity）",
+    ),
     // M17 段 1：試験の状態を運ぶ操作（試験用のエンジンだけ）。何も変えない引数は入力のまま（Identity）で表を申告しない
     // （docs/editing.md §18.1 の「何も変えない設定は核を Identity に」の形）
     (

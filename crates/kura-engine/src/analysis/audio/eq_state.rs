@@ -92,7 +92,10 @@ impl Analysis for EqState {
         use crate::op::Op;
         crate::ops::audio::eq::Eq::examples()
             .into_iter()
-            .filter(|e| e.name != "identity" && e.name != "gain-only")
+            // 段のない例と、表を申告しない直線位相の例（M17 段 7）は除く
+            .filter(|e| {
+                e.name != "identity" && e.name != "gain-only" && e.params.phase == Phase::Minimum
+            })
             .map(|e| AnalysisExample {
                 name: e.name,
                 params: EqStateParams::of(&e.params),

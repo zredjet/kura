@@ -458,6 +458,18 @@ fn audio_region_declarations_match() {
             );
             assert_eq!(reach, Reach::SameTime);
         }
+        // 直線位相のイコライザ（M17 段 7）：変わった範囲も核の読みも、ブロックを絶対位置 0 に揃えた Window（前後に遅れ D）
+        if op.id() == "audio.eq" && params["phase"] == "linear" {
+            if reach != Reach::SameTime {
+                assert!(
+                    matches!(reach, Reach::Window { before, after, align, .. }
+                        if before == after && align == 2 * before),
+                    "{name}：{reach:?}"
+                );
+                assert_eq!(op.reach(p.as_ref(), &[input.shape()]).unwrap(), reach);
+            }
+            continue;
+        }
         // 状態を運ぶ操作（M17 段 1）：変わった範囲は Prefix、核の読みは表の格子に揃えた Aligned（何も変えない引数は SameTime）
         if (op.id() == kura_engine::testing::stateful::OP_ID || op.id() == "audio.eq")
             && reach != Reach::SameTime

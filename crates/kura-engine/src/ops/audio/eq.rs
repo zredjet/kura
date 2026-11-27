@@ -1,6 +1,7 @@
-//! `audio.eq` v1：イコライザ（最小位相。M17 段 2。docs/editing.md §18.5、ADR-231 (5)(6)・ADR-234）。
+//! `audio.eq` v1：イコライザ（最小位相：M17 段 2、直線位相：M17 段 7。docs/editing.md §18.5・§18.6、ADR-231 (5)(6)・
+//! ADR-234・ADR-239）。直線位相の設計と核は [`super::eq_linear`]。
 //!
-//! - 引数はバンドの列（24 個まで）・位相（`minimum`。`linear` は段 7）・出力の利得。バンドは型（ベル・ローシェルフ・
+//! - 引数はバンドの列（24 個まで）・位相（`minimum`・`linear`）・出力の利得。バンドは型（ベル・ローシェルフ・
 //!   ハイシェルフ・ローカット・ハイカット・ノッチ・バンドパス・チルト）・周波数・利得・Q・傾き・チャンネル（すべて・L・R・
 //!   M・S）・オン／オフ。2 次の段の数（カットは傾き ÷ 12 段、6 dB/oct の奇数倍は 1 次の段を 1 段と数える）は 48 まで。
 //! - 推論の扱い（凍結）：周波数がナイキスト以上なら、ローカット・バンドパスは断り、ハイカット・ノッチは外して警告、ベル・
@@ -260,12 +261,14 @@ impl Target {
     }
 }
 
-/// 推論を通したバンド：引数の番号・当てる信号・段の係数。
+/// 推論を通したバンド：引数の番号・当てる信号・段の係数・帯域（Hz。直線位相の長さを決める。M17 段 7）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedBand {
     pub index: usize,
     pub target: Target,
     pub sections: Vec<Section>,
+    /// 帯域（ベル・ノッチ・バンドパス・シェルフは f/Q、カットは f/(傾き/12 × 0.7)、チルトは 2f。止めた周波数で）。
+    pub bandwidth: f64,
 }
 
 /// 推論を通したイコライザ。
@@ -283,17 +286,8 @@ impl Resolved {
 }
 
 /// 推論の扱い（凍結）でバンドを解く：レート `rate`・チャンネル `channels`。断るもの（ナイキスト以上のローカット・
-/// バンドパス、直線位相）は Issues。
+/// バンドパス）は Issues。位相によらず同じ（段 6 までは直線位相を断っていた。ADR-239）。
 pub fn resolve(p: &EqParams, rate: u32, channels: usize) -> Result<Resolved, Issues> {
-    if p.phase == Phase::Linear {
-        return Err(Issues::one(
-            Issue::error(
-                IssueCode::BadParams,
-                "直線位相のイコライザはまだ使えません（M17 段 7）",
-            )
-            .param("phase"),
-        ));
-    }
     let fs = f64::from(rate.max(1));
     let nyquist = 0.5 * fs;
     let guard = NYQUIST_GUARD * fs;
@@ -374,10 +368,20 @@ pub fn resolve(p: &EqParams, rate: u32, channels: usize) -> Result<Resolved, Iss
             BandType::BandPass => vec![biquad::bandpass(w0, b.q)],
             BandType::Tilt => vec![biquad::tilt(w0, b.gain_db)],
         };
+        let bandwidth = match b.kind {
+            BandType::Bell
+            | BandType::Notch
+            | BandType::BandPass
+            | BandType::LowShelf
+            | BandType::HighShelf => f / b.q,
+            BandType::LowCut | BandType::HighCut => f / (f64::from(b.slope) / 12.0 * 0.7),
+            BandType::Tilt => 2.0 * f,
+        };
         out.bands.push(ResolvedBand {
             index,
             target,
             sections,
+            bandwidth,
         });
     }
     if errors.is_empty() {
@@ -593,6 +597,30 @@ pub fn curve(p: &EqParams, rate: u32, channels: usize, freqs: &[f64]) -> Result<
     Ok(Curve { total, bands })
 }
 
+/// 描き方（`Eq::path`）。
+enum Path {
+    /// 段がない（Identity か出力の利得だけ）・入力が音声でない・推論で断る。
+    Plain,
+    /// 最小位相（状態の表）。
+    Stateful,
+    /// 直線位相（FIR の長さの梯子の段・組の幅・チャンネル数）。
+    Linear {
+        ladder: crate::audio::fir::Ladder,
+        width: usize,
+        channels: usize,
+    },
+}
+
+/// 直線位相の届く範囲：出力のブロック [jB, (j+1)B) は入力の [jB − D, (j+1)B + D) の全体に依る（§18.2・§18.6）。
+fn linear_reach(ladder: crate::audio::fir::Ladder, frames: u64) -> Reach {
+    Reach::Window {
+        before: ladder.delay() as u64,
+        after: ladder.delay() as u64,
+        align: ladder.block() as u64,
+        frames,
+    }
+}
+
 /// イコライザ。
 pub struct Eq;
 
@@ -605,11 +633,24 @@ impl Eq {
             .map(|(rate, ch, _)| (rate, usize::from(ch)))
     }
 
-    /// 段が残るか（なければ申告しない）。
-    fn has_sections(p: &EqParams, inputs: &[Shape]) -> bool {
-        Self::rate_channels(inputs)
-            .and_then(|(rate, ch)| resolve(p, rate, ch).ok())
-            .is_some_and(|r| !r.bands.is_empty())
+    /// 描き方（段がない・状態の表（最小位相）・直線位相。申告・届く範囲・作業領域で分け合う）。
+    fn path(p: &EqParams, inputs: &[Shape]) -> Path {
+        let Some((rate, ch)) = Self::rate_channels(inputs) else {
+            return Path::Plain;
+        };
+        match resolve(p, rate, ch) {
+            Ok(r) if r.bands.is_empty() => Path::Plain,
+            Ok(r) if p.phase == Phase::Linear => {
+                let (ladder, _) = super::eq_linear::ladder_of(&r, rate);
+                Path::Linear {
+                    ladder,
+                    width: super::eq_linear::width_of(&r, ch),
+                    channels: ch,
+                }
+            }
+            Ok(_) => Path::Stateful,
+            Err(_) => Path::Plain,
+        }
     }
 
     fn kernel(
@@ -628,6 +669,19 @@ impl Eq {
             } else {
                 Box::new(GainKernel::new(audio.clone(), p.gain_db))
             });
+        }
+        if p.phase == Phase::Linear {
+            // 直線位相：表を申告しない。FIR を設計して重なり保存で当てる（有限でない標本の警告は出さない。ADR-239）
+            let eq = super::eq_linear::LinearEq::new(
+                &r,
+                audio.channels(),
+                crate::math::db_to_gain(p.gain_db),
+                audio.rate(),
+            )?;
+            return Ok(Box::new(super::eq_linear::LinearKernel::new(
+                audio.clone(),
+                Arc::new(eq),
+            )));
         }
         let table = cx.analysis::<EqState>(0, input, &EqStateParams::of(p))?;
         if table.non_finite() {
@@ -653,7 +707,7 @@ impl Op for Eq {
     const NEEDS: &'static [(&'static str, u16)] = &[("audio.eq_state", 1)];
 
     fn needs(p: &EqParams, inputs: &[Shape]) -> Result<Vec<Need>, Issues> {
-        if !Self::has_sections(p, inputs) {
+        if !matches!(Self::path(p, inputs), Path::Stateful) {
             return Ok(Vec::new());
         }
         Ok(vec![Need::of::<EqState>(0, &EqStateParams::of(p))?])
@@ -678,6 +732,13 @@ impl Op for Eq {
         };
         let r = resolve(p, rate, usize::from(channels))?;
         let sections: usize = r.bands.iter().map(|b| b.sections.len()).sum();
+        // 直線位相は 1 標本あたり順変換と逆変換（段の数 log2 N に比例）
+        let per = if p.phase == Phase::Linear && !r.bands.is_empty() {
+            let (ladder, _) = super::eq_linear::ladder_of(&r, rate);
+            u64::from(ladder.order + 1) * 4
+        } else {
+            sections.max(1) as u64 * 2
+        };
         Ok(Inferred {
             shape: inputs[0],
             space: SpaceMap::Identity,
@@ -685,7 +746,7 @@ impl Op for Eq {
             cost: frames
                 .max()
                 .saturating_mul(u64::from(channels))
-                .saturating_mul(sections.max(1) as u64 * 2),
+                .saturating_mul(per),
         })
     }
 
@@ -719,6 +780,14 @@ impl Op for Eq {
         let Some((rate, channels)) = Self::rate_channels(inputs) else {
             return crate::audio::render_all_work(out);
         };
+        if let Path::Linear {
+            ladder,
+            width,
+            channels,
+        } = Self::path(p, inputs)
+        {
+            return super::eq_linear::linear_work(ladder, channels, width);
+        }
         match resolve(p, rate, channels) {
             Ok(r) if !r.bands.is_empty() => {
                 let m = EqMachine::new(&r, channels, 1.0);
@@ -734,25 +803,27 @@ impl Op for Eq {
     }
 
     fn reach(p: &EqParams, inputs: &[Shape]) -> Reach {
-        match inputs.first().and_then(audio_shape) {
-            Some((_, _, Dim::Exact(n))) if Self::has_sections(p, inputs) => Reach::Prefix {
+        match (inputs.first().and_then(audio_shape), Self::path(p, inputs)) {
+            (Some(_), Path::Plain) => Reach::SameTime,
+            (Some((_, _, Dim::Exact(n))), Path::Stateful) => Reach::Prefix {
                 after: 0,
                 frames: n,
             },
-            Some(_) if !Self::has_sections(p, inputs) => Reach::SameTime,
+            (Some((_, _, Dim::Exact(n))), Path::Linear { ladder, .. }) => linear_reach(ladder, n),
             _ => Reach::Global,
         }
     }
 
     fn audio_reach(p: &EqParams, inputs: &[Shape]) -> Reach {
-        match inputs.first().and_then(audio_shape) {
-            Some((_, _, Dim::Exact(n))) if Self::has_sections(p, inputs) => Reach::Aligned {
+        match (inputs.first().and_then(audio_shape), Self::path(p, inputs)) {
+            (Some(_), Path::Plain) => Reach::SameTime,
+            (Some((_, _, Dim::Exact(n))), Path::Stateful) => Reach::Aligned {
                 grid: STATE_GRID,
                 before: 0,
                 after: 0,
                 frames: n,
             },
-            Some(_) if !Self::has_sections(p, inputs) => Reach::SameTime,
+            (Some((_, _, Dim::Exact(n))), Path::Linear { ladder, .. }) => linear_reach(ladder, n),
             _ => Reach::Global,
         }
     }
@@ -959,7 +1030,92 @@ fn examples() -> Vec<Example<EqParams>> {
             params: params(Vec::new(), -6.0),
             inputs: vec![noise(8_000, 1, 5_000, 100)],
         },
+        // ---- 直線位相（M17 段 7。状態の表を申告しない） ----
+        // ベル・カット・シェルフと出力の利得（ローカットの帯域で L = 8,193・ブロック 8,192。ブロックを 3 つまたぐ）
+        Example {
+            name: "linear-bells-and-cut",
+            params: linear(
+                vec![
+                    Band {
+                        slope: 24,
+                        ..band(LowCut, 200.0, 0.0, 0.707)
+                    },
+                    band(Bell, 1_000.0, 6.0, 1.0),
+                    band(HighShelf, 8_000.0, -3.0, 0.707),
+                ],
+                -1.5,
+            ),
+            inputs: vec![noise(48_000, 2, 20_000, 101)],
+        },
+        // M/S と L・R・すべてのバンド（ビンごとの 2×2 の行列。FIR 4 本で 2 チャンネルを 1 組に）
+        Example {
+            name: "linear-mid-side",
+            params: linear(
+                vec![
+                    on(band(Bell, 500.0, 5.0, 1.0), BandChannel::Mid),
+                    on(band(HighShelf, 6_000.0, -4.0, 0.707), BandChannel::Side),
+                    on(band(Bell, 2_500.0, 3.0, 4.0), BandChannel::Left),
+                    band(Bell, 3_000.0, -2.0, 1.4),
+                ],
+                0.0,
+            ),
+            inputs: vec![noise(48_000, 2, 9_000, 102)],
+        },
+        // 3 チャンネル：L・R は 1・2 チャンネル目、M は外して警告（チャンネルごとの FIR。3 チャンネル目は利得だけ）
+        Example {
+            name: "linear-three-channels",
+            params: linear(
+                vec![
+                    on(band(Bell, 1_000.0, 6.0, 1.0), BandChannel::Right),
+                    on(band(Bell, 3_000.0, 6.0, 1.0), BandChannel::Mid),
+                    band(HighCut, 6_000.0, 0.0, 0.707),
+                ],
+                1.0,
+            ),
+            inputs: vec![noise(16_000, 3, 6_000, 103)],
+        },
+        // 遅れ（D = 2,048）より短い入力（窓は 0 で埋まる）
+        Example {
+            name: "linear-shorter-than-delay",
+            params: linear(vec![cut(LowCut, 40.0, 12)], 0.0),
+            inputs: vec![noise(8_000, 1, 1_500, 104)],
+        },
+        // 長さの上限に届く（20 Hz の Q 40。L = 65,537・ブロック = チャンク）。チャンクとブロックの境をまたぐ
+        Example {
+            name: "linear-capped-crosses-chunks",
+            params: linear(
+                vec![band(Bell, 20.0, 6.0, 40.0), band(Bell, 1_500.0, -6.0, 2.0)],
+                0.0,
+            ),
+            inputs: vec![noise(8_000, 2, AUDIO_CHUNK as u64 + 4_321, 105)],
+        },
+        // NaN・∞：窓の中で 0 として通し、その位置は元の値（直線位相は警告しない）
+        Example {
+            name: "linear-non-finite",
+            params: linear(vec![band(Bell, 1_000.0, 6.0, 1.0)], 0.0),
+            inputs: vec![InputGen::NonFinite {
+                base: Box::new(noise(8_000, 2, 3_000, 106)),
+                at: vec![
+                    (0, 10, NonFiniteSample::Nan),
+                    (1, 1_000, NonFiniteSample::Inf),
+                ],
+            }],
+        },
+        // 何も変えない（位相によらず Identity）
+        Example {
+            name: "linear-identity",
+            params: linear(vec![band(Bell, 1_000.0, 0.0, 1.0)], 0.0),
+            inputs: vec![noise(8_000, 2, 3_000, 107)],
+        },
     ]
+}
+
+/// 直線位相の引数（例とテストの補助）。
+fn linear(bands: Vec<Band>, gain_db: f64) -> EqParams {
+    EqParams {
+        phase: Phase::Linear,
+        ..params(bands, gain_db)
+    }
 }
 
 #[cfg(test)]
@@ -1010,7 +1166,7 @@ mod tests {
     }
 
     /// 推論の扱い：ナイキスト以上のローカット・バンドパスは断り、ハイカット・ノッチは外し、ベル・シェルフ・チルトは止める。
-    /// 直線位相は断る。
+    /// 直線位相も同じに解く（段 6 までは断っていた）。
     #[test]
     fn nyquist_and_channels_follow_the_rules() {
         use BandType::*;
@@ -1028,7 +1184,10 @@ mod tests {
         }
         let mut lin = p(band(Bell, 1_000.0, 3.0, 1.0));
         lin.phase = Phase::Linear;
-        assert!(resolve(&lin, 48_000, 2).is_err());
+        assert_eq!(
+            resolve(&lin, 48_000, 2).unwrap(),
+            resolve(&p(band(Bell, 1_000.0, 3.0, 1.0)), 48_000, 2).unwrap()
+        );
         // 0 dB のベル・オフのバンドは段を作らない
         let r = resolve(&p(band(Bell, 1_000.0, 0.0, 1.0)), 48_000, 2).unwrap();
         assert!(r.bands.is_empty() && r.warnings.is_empty());
@@ -1153,11 +1312,14 @@ mod tests {
         out
     }
 
-    /// すべての例で、操作の値（表を解いて核で描いたもの）が素朴な参照とビット一致し、警告が推論の扱いのとおり。
+    /// 最小位相のすべての例で、操作の値（表を解いて核で描いたもの）が素朴な参照とビット一致し、警告が推論の扱いのとおり。
     #[test]
     fn examples_match_the_reference() {
         let engine = crate::Engine::new().unwrap();
-        for ex in examples() {
+        for ex in examples()
+            .into_iter()
+            .filter(|ex| ex.params.phase == Phase::Minimum)
+        {
             let input = ex.inputs[0].generate().unwrap();
             let Value::Audio(a) = &input else { panic!() };
             let planes: Vec<Vec<f32>> = (0..a.channels())
