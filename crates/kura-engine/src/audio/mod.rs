@@ -10,6 +10,7 @@
 pub mod biquad;
 pub mod digest;
 pub mod fft;
+pub mod fir;
 pub mod resample;
 pub mod source;
 pub mod spec;

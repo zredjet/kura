@@ -97,8 +97,9 @@ pub fn dest_window(l: u64, m: u64, h: u64, a: u64, b: u64) -> (u64, u64) {
     if first < end { (first, end) } else { (0, 0) }
 }
 
-/// 0 次の第 1 種変形ベッセル関数 I0（級数 Σ ((z/2)^k / k!)²。足しても変わらなくなるまで）。
-fn i0(z: f64) -> f64 {
+/// 0 次の第 1 種変形ベッセル関数 I0（級数 Σ ((z/2)^k / k!)²。足しても変わらなくなるまで）。直線位相の FIR の窓
+/// （`audio::fir`）と分け合う（同じ実装なので値は変わらない）。
+pub(crate) fn i0(z: f64) -> f64 {
     let q = z * z / 4.0;
     let (mut sum, mut term) = (1.0f64, 1.0f64);
     let mut k = 1.0f64;

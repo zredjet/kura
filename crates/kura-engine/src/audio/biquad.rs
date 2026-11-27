@@ -56,6 +56,12 @@ impl Section {
     pub fn power(&self, w: f64) -> f64 {
         let (c1, s1) = (math::cos(w), math::sin(w));
         let (c2, s2) = (math::cos(2.0 * w), math::sin(2.0 * w));
+        self.power_cs(c1, s1, c2, s2)
+    }
+
+    /// [`Self::power`] の cos ω・sin ω・cos 2ω・sin 2ω を呼び手が渡す形（直線位相の FIR の目標を、設計の格子の表で
+    /// 標本化する。M17 段 7）。
+    pub fn power_cs(&self, c1: f64, s1: f64, c2: f64, s2: f64) -> f64 {
         let nr = self.b0 + self.b1 * c1 + self.b2 * c2;
         let ni = self.b1 * s1 + self.b2 * s2;
         let dr = 1.0 + self.a1 * c1 + self.a2 * c2;
