@@ -22,6 +22,7 @@ import {
   type EditDocDeltaDto_Serialize,
   type EditDraftDto,
   type EditEqCurveDto,
+  type EditEqFirDto,
   type EditFormatsDto,
   type EditFrameDto,
   type EditHandleDto,
@@ -86,6 +87,8 @@ export const EDIT_CATALOG: readonly OpDescriptor[] = EDIT_OPS as unknown as read
 
 export type {
   CommitMode,
+  EditEqCurveDto,
+  EditEqFirDto,
   EditAudioLengthDto,
   EditAudioMarksDto,
   EditAudioNodeDto,

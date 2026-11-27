@@ -415,13 +415,15 @@ describe('イコライザのバンドの表とキー（M17 段 5）', () => {
     useAudioStore.setState({ eqBand: null, eqLocal: null, eqAnnounce: '' });
   });
 
-  it('右パネル：「n バンドのうち m が有効」・行（押すと選ぶ）・オンのスイッチ・バンドを足す・選んだバンドの欄。位相の欄は出さない', () => {
+  it('右パネル：「n バンドのうち m が有効」・行（押すと選ぶ）・オンのスイッチ・バンドを足す・選んだバンドの欄・位相の欄（M17 段 7）', () => {
     openState([eqNode([bell(1_000, -5), bell(4_000, 3, false)])]);
     useEditorStore.setState({ selected: 5 });
     render(<Editor />);
     const s = a.spectrum;
     expect(screen.getByText(s.bandCount(2, 1))).toBeInTheDocument();
-    expect(screen.queryByText(t.ops['audio.eq']?.params.phase ?? '位相')).toBeNull();
+    expect(
+      screen.getByRole('group', { name: t.ops['audio.eq']?.params.phase ?? '位相' }),
+    ).toBeInTheDocument();
     const rows = within(screen.getByRole('list', { name: s.bands })).getAllByRole('button');
     expect(rows).toHaveLength(2);
     fireEvent.click(rows[1] as HTMLElement);

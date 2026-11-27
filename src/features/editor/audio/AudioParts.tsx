@@ -16,18 +16,19 @@ import { AUDIO_FORMATS, type AudioCaps, capsOf, lossesFor, type AudioLoss } from
 import { type AudioFace, audioZoom, setAudioFace, useAudioStore, useEqPort } from './audioStore';
 import { freqParts } from './spectrumMath';
 import { EqBandsField } from './EqBandsField';
+import { EqPhaseNote } from './EqPhaseNote';
 import { LoudnessSection } from './LoudnessSection';
 import { timeText } from './timeText';
 
 export { AudioCapsule } from './AudioCapsule';
 
 /**
- * 右パネルの引数の欄の差し込み（M17 段 5）：イコライザのバンドの列はバンドの表、位相の欄は段 7（直線位相）まで出さない
- * （「直線」は推論で断られるので押せるボタンを置かない）。
+ * 右パネルの引数の欄の差し込み（M17 段 5・7）：イコライザのバンドの列はバンドの表、位相の欄（最小｜直線のセグメント）の
+ * 下に直線位相の前のリンギングの一言。
  */
 const EQ_FIELDS: ParamFieldOverrides = {
   eqBands: EqBandsField,
-  hidden: (op, key) => op === 'audio.eq' && key === 'phase',
+  note: EqPhaseNote,
 };
 
 /*

@@ -1,4 +1,12 @@
-import { type ComponentType, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import {
+  type ComponentType,
+  Fragment,
+  type ReactNode,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from 'react';
 
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
 import { ChevronUpIcon } from '../../components/icons/ChevronUpIcon';
@@ -171,11 +179,13 @@ export interface ParamTime {
  */
 /**
  * 引数の欄の差し込み（種類のモジュールが渡す。核は音声のストアを読まない）：`eqBands` はイコライザのバンドの列の欄、
- * `hidden` はその操作のその引数を出さない（段 7 まで押せない「直線位相」の位相の欄など）。
+ * `hidden` はその操作のその引数を出さない、`note` は各欄の下に置く一言（出さないなら null を返す。イコライザの位相の欄の
+ * 下の前のリンギングの一言。M17 段 7）。
  */
 export interface ParamFieldOverrides {
   eqBands?: ComponentType<{ node: number }>;
   hidden?(op: string, key: string): boolean;
+  note?: ComponentType<{ node: number; op: string; param: string }>;
 }
 
 function ParamsPanel({
@@ -207,8 +217,9 @@ function ParamsPanel({
     const basic = shownParams.basic.filter(keep);
     const advanced = shownParams.advanced.filter(keep);
     const EqBands = fields?.eqBands;
+    const Note = fields?.note;
     // ノードと引数で key する（別のノードを選んだら欄を作り直し、前のノードの手元の値を持ち越さない）
-    const field = (spec: (typeof basic)[number]) =>
+    const bare = (spec: (typeof basic)[number]) =>
       spec.kind.type === 'eqBands' && EqBands ? (
         <EqBands key={`${node.id}:${spec.key}`} node={node.id} />
       ) : (
@@ -223,6 +234,15 @@ function ParamsPanel({
           count={node.log?.field === spec.key ? node.log.count : null}
           time={time ? { rate: time.rate(node.id), frames: time.frames(node.id) } : undefined}
         />
+      );
+    const field = (spec: (typeof basic)[number]) =>
+      Note ? (
+        <Fragment key={`${node.id}:${spec.key}`}>
+          {bare(spec)}
+          <Note node={node.id} op={node.op} param={spec.key} />
+        </Fragment>
+      ) : (
+        bare(spec)
       );
     body =
       basic.length + advanced.length === 0 ? (

@@ -1373,6 +1373,14 @@ export const ja = {
       zoomIn: '拡大（⌘+）',
       zoomOut: '縮小（⌘−）',
       viewWidth: '表示の幅',
+      /** 右パネルの位相の欄の下の一言（直線位相のとき。M17 段 7）。`time` は「0.34 秒」「11 ミリ秒」。 */
+      eqPhase: {
+        ringing: (time: string) =>
+          `直線位相：音の前に最大 ${time}の揺れ（前のリンギング）が出ることがあります。遅れは補っています`,
+        capped: '長さの上限に届いたので、低い帯の形が目標から少しずれます',
+        seconds: (s: string) => `${s} 秒`,
+        millis: (ms: number) => `${ms} ミリ秒`,
+      },
       // スペクトルの面（M17 段 5）
       faces: '表示',
       faceNames: { wave: '波形', spectrum: 'スペクトル' },
